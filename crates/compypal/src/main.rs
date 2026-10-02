@@ -2,10 +2,15 @@
 
 mod store;
 
+use std::rc::Rc;
+
 use compypal_core::cleanup::grid_ticks;
 use compypal_core::{Id, Project, gm};
 use rinch::prelude::*;
-use store::{ROW, Store};
+use store::{ROW, Slot, Store};
+
+/// Width of the key labels down the left of the roll.
+const KEYS: f64 = 64.0;
 
 const CSS: &str = include_str!("style.css");
 
@@ -81,6 +86,11 @@ fn Transport() -> NodeHandle {
                 "Quantize 1/16"
             }
             Button { size: "xs",
+                variant: {|| if store.roman.get() { "filled" } else { "default" }},
+                onclick: move || store.roman.update(|v| *v = !*v),
+                "Roman"
+            }
+            Button { size: "xs",
                 variant: {|| if store.show_raw.get() { "filled" } else { "default" }},
                 onclick: move || store.show_raw.update(|v| *v = !*v),
                 "Show raw take"
@@ -109,7 +119,10 @@ fn Sidebar() -> NodeHandle {
                     },
                     onclick: {
                         let id = t.id;
-                        move || store.selected_track.set(Some(id))
+                        move || {
+                            store.close_editor();
+                            store.selected_track.set(Some(id));
+                        }
                     },
                     div { class: "track-name", {t.name.clone()} }
                     div { class: "track-detail",
@@ -140,6 +153,7 @@ fn PianoRoll() -> NodeHandle {
             div {
                 class: "roll",
                 style: {|| { let r = roll.get(); format!("width: {}px; height: {}px;", r.width + 64.0, r.height + 20.0) }},
+                FigureLane {}
                 div { class: "ruler",
                     for b in roll.get().bars {
                         div { key: b.key.clone(), class: "bar-number",
@@ -177,6 +191,123 @@ fn PianoRoll() -> NodeHandle {
             }
         }
     }
+}
+
+/// One box per figure, labelled with its chord, above the roll. Click one to
+/// retype its chord; click "+" to continue the music with a new chord.
+#[component]
+fn FigureLane() -> NodeHandle {
+    let store = use_store::<Store>();
+    let lane = Memo::new(move || store.lane());
+    rsx! {
+        div { class: "lane",
+            div { class: "lane-label", "Figures" }
+            for item in lane.get().items {
+                div {
+                    key: item.key.clone(),
+                    class: {
+                        let i = item.index;
+                        let unsure = item.unsure;
+                        move || {
+                            let mut c = String::from("figure");
+                            if store.editing.get() == Some(Slot::Figure(i)) { c.push_str(" editing"); }
+                            if unsure { c.push_str(" unsure"); }
+                            c
+                        }
+                    },
+                    style: {format!("left: {}px; width: {}px;", item.left + KEYS, item.width - 2.0)},
+                    onclick: {
+                        let i = item.index;
+                        move || store.open_editor(Slot::Figure(i))
+                    },
+                    span { class: "figure-chord", {item.label.clone()} }
+                    span { class: "figure-kind", {item.kind} }
+                }
+            }
+            div {
+                class: {|| if store.editing.get() == Some(Slot::Append) { "figure add editing" } else { "figure add" }},
+                style: {|| format!("left: {}px;", lane.get().append_left + KEYS)},
+                onclick: move || store.open_editor(Slot::Append),
+                "+"
+            }
+            if store.editing.get().is_some() {
+                ChordEditor {}
+            }
+        }
+    }
+}
+
+/// Typeahead for a chord symbol or Roman numeral. Enter applies, Tab
+/// applies and moves on, arrows pick a suggestion, Escape cancels.
+#[component]
+fn ChordEditor() -> NodeHandle {
+    let store = use_store::<Store>();
+    let input = rsx! {
+        input {
+            class: "chord-input",
+            placeholder: "Am7, V/V, F/A…",
+            value: {|| store.draft.get()},
+            oninput: move |v: String| {
+                store.draft.set(v);
+                store.highlight.set(0);
+            },
+        }
+    };
+    let root = rsx! {
+        div {
+            class: "chord-editor",
+            style: {|| format!("left: {}px;", store.lane().editor_left.unwrap_or(0.0) + KEYS)},
+            {input.clone()}
+            div { class: "suggestions",
+                for (i, chord) in store.suggestions().into_iter().enumerate() {
+                    div {
+                        key: format!("{i}:{}", chord.name(compypal_core::theory::Spelling::Sharps)),
+                        class: {move || if store.highlight.get() == i { "suggestion active" } else { "suggestion" }},
+                        onclick: move || {
+                            store.highlight.set(i);
+                            store.commit(false);
+                        },
+                        span { class: "suggestion-chord", {store.chord_label(&chord)} }
+                        span { class: "suggestion-alt", {store.other_label(&chord)} }
+                    }
+                }
+            }
+            div { class: "editor-hint", "Enter apply · Tab next · Esc cancel" }
+        }
+    };
+    overlay_dismiss::arm_keys_while_open(
+        __scope,
+        &root,
+        Rc::new(|| true),
+        Rc::new(move |k: &rinch::core::KeyEventData| match k.key.as_str() {
+            "Enter" => {
+                store.commit(false);
+                true
+            }
+            "Tab" => {
+                store.commit(true);
+                true
+            }
+            "Escape" => {
+                store.close_editor();
+                true
+            }
+            "ArrowDown" => {
+                store.move_highlight(1);
+                true
+            }
+            "ArrowUp" => {
+                store.move_highlight(-1);
+                true
+            }
+            _ => false,
+        }),
+        Rc::new(move || store.close_editor()),
+    );
+    // Typing should go straight into the field: the editor opens because
+    // someone wants to type a chord.
+    input.focus();
+    root
 }
 
 #[component]

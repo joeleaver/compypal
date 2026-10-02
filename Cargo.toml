@@ -31,3 +31,7 @@ winit-common = { git = "https://github.com/joeleaver/winit-fork", branch = "rinc
 winit-wayland = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
 winit-x11 = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
 dpi = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+
+# Analysis (and later, synthesis) runs on every edit; keep it fast in dev builds.
+[profile.dev.package.compypal-core]
+opt-level = 2

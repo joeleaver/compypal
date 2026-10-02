@@ -9,7 +9,7 @@ with a built-in synth; export MIDI and ABC.
 
 | Crate | What it holds |
 |---|---|
-| `compypal-core` | Project model (ticks, `PPQ = 960`), raw `Session`s (seconds), cleanup ops, snapshot undo, GM names, demo project. No I/O, no UI. |
+| `compypal-core` | Project model (ticks, `PPQ = 960`), raw `Session`s (seconds), cleanup ops, snapshot undo, GM names, `theory` (chords, Roman numerals, keys), `figure` (musical units), demo project. No I/O, no UI. |
 | `compypal-io` | SMF import/export (`midly`), ABC export. |
 | `compypal` | The rinch desktop app. `store.rs` is all app state; every project edit goes through `Store::edit` so UI and agent share undo. |
 
@@ -23,6 +23,25 @@ with a built-in synth; export MIDI and ABC.
   agent can compose them, inspect `timing_report`, and retry. Add new ones
   in the same style rather than one big "fix it" function.
 - Clip note times are relative to the clip start.
+
+## Figures
+
+A figure is the unit you'd talk about: "a C arpeggio, then a run into G".
+It has a chord and a shape (block, arpeggio, run, melody, note, mixed).
+`figure::analyze` derives figures from notes; they are never stored.
+
+- Onsets within `chord_window` are one event (human spread).
+- A DP splits events into figures: chord misfit (duration-weighted) plus a
+  per-figure cost that is cheapest on barlines. Passing tones (stepwise in
+  and out) count a quarter. Rests past `split_gap` always split.
+- `revoice` maps each note to its role in the new chord, near its old
+  pitch, keeping the contour. A new chord's tones that no note plays take a
+  doubled note (top root, then fifth), so typing G7 over a G triad works.
+- `set_chord`, `continue_with` ("and then X": copy the shape onto a new
+  chord) and `describe` (one line per figure) are the API the UI uses and
+  the MCP tools should use too.
+- The lane above the piano roll is the UI: click a figure, type a chord
+  or numeral, Tab moves on, and "+" appends.
 
 ## Building
 
@@ -44,6 +63,10 @@ with a built-in synth; export MIDI and ABC.
   include the geometry, so a moved or zoomed note gets a new key.
 - `Memo` has no `.with()`; use `.get()`.
 - Global CSS lives in `src/style.css`, injected via `style { {CSS} }`.
+- `autofocus` only works inside Modal/Popover. Elsewhere, build the input as
+  its own node and call `.focus()` on it.
+- Keyboard handling for a popup: `overlay_dismiss::arm_keys_while_open`
+  (it gets keys only while focus is inside the owner).
 
 ## Roadmap
 
@@ -56,6 +79,7 @@ with a built-in synth; export MIDI and ABC.
    `~/.claude/ide/` that `/ide` discovers). Check the current lockfile and
    auth format against Claude Code before implementing. Tools: read the
    project/session (JSON and ABC), `timing_report`, import + cleanup ops,
+   figures (`describe`, `set_chord`, `continue_with`, `theory::suggest`),
    write clip notes, sections/arrangement, transport, and the user's current
    piano-roll selection as context. All edits go through `Store::edit`
    (from the MCP thread via `Signal::send`/`update_send`).

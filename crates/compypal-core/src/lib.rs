@@ -3,10 +3,12 @@
 
 pub mod cleanup;
 pub mod demo;
+pub mod figure;
 pub mod gm;
 pub mod history;
 pub mod model;
 pub mod session;
+pub mod theory;
 
 pub use history::History;
 pub use model::*;

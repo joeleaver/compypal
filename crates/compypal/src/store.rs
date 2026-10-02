@@ -4,8 +4,18 @@
 use std::path::PathBuf;
 
 use compypal_core::cleanup::{self, Quantize};
+use compypal_core::figure::{self, Figure, FigureSettings};
+use compypal_core::theory::{self, Chord, Spelling};
 use compypal_core::{History, Id, Note, PPQ, Project, Tick};
 use rinch::prelude::*;
+
+/// Where the chord editor is open: on a figure, or on the slot after the
+/// last one, where typing a chord continues the music.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Slot {
+    Figure(usize),
+    Append,
+}
 
 #[derive(Clone, Copy)]
 pub struct Store {
@@ -17,19 +27,148 @@ pub struct Store {
     /// Horizontal zoom in pixels per quarter note.
     pub zoom: Signal<f64>,
     pub status: Signal<String>,
+    /// Figures on the selected track, re-derived whenever notes change.
+    pub figures: Memo<Vec<Figure>>,
+    pub editing: Signal<Option<Slot>>,
+    /// What's typed in the chord editor.
+    pub draft: Signal<String>,
+    /// Which suggestion Enter would pick.
+    pub highlight: Signal<usize>,
+    /// Label figures with Roman numerals instead of chord symbols.
+    pub roman: Signal<bool>,
 }
 
 impl Store {
     pub fn new(project: Project) -> Self {
         let first = project.tracks.first().map(|t| t.id);
+        let project = Signal::new(project);
+        let selected_track = Signal::new(first);
+        let figures = Memo::new(move || {
+            let track = selected_track.get();
+            project.with(|p| {
+                let Some(t) = track.and_then(|id| p.track(id)) else { return Vec::new() };
+                figure::analyze(&t.absolute_notes(), &p.meter_at(0), &FigureSettings::default())
+            })
+        });
         Self {
-            project: Signal::new(project),
+            project,
             history: Signal::new(History::default()),
-            selected_track: Signal::new(first),
+            selected_track,
             show_raw: Signal::new(true),
             zoom: Signal::new(96.0),
             status: Signal::new(String::new()),
+            figures,
+            editing: Signal::new(None),
+            draft: Signal::new(String::new()),
+            highlight: Signal::new(0),
+            roman: Signal::new(false),
         }
+    }
+
+    /// A chord as the lane shows it, in the current notation.
+    pub fn chord_label(self, chord: &Chord) -> String {
+        let key = self.project.with(|p| p.key);
+        if self.roman.get() { chord.roman(key) } else { chord.name(Spelling::for_key(key)) }
+    }
+
+    /// The chord in whichever notation the lane is not showing.
+    pub fn other_label(self, chord: &Chord) -> String {
+        let key = self.project.with(|p| p.key);
+        if self.roman.get() { chord.name(Spelling::for_key(key)) } else { chord.roman(key) }
+    }
+
+    pub fn open_editor(self, slot: Slot) {
+        self.editing.set(Some(slot));
+        self.draft.set(String::new());
+        self.highlight.set(0);
+    }
+
+    pub fn close_editor(self) {
+        self.editing.set(None);
+    }
+
+    /// What the editor offers for the current draft, best first.
+    pub fn suggestions(self) -> Vec<Chord> {
+        let key = self.project.with(|p| p.key);
+        let context: Vec<Chord> = match self.editing.get() {
+            Some(Slot::Figure(i)) => self
+                .figures
+                .get()
+                .get(i)
+                .map(|f| std::iter::once(f.chord).chain(f.alternatives.iter().copied()).collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        theory::suggest(&self.draft.get(), key, &context, 8)
+    }
+
+    pub fn move_highlight(self, delta: i64) {
+        let n = self.suggestions().len() as i64;
+        if n > 0 {
+            self.highlight.update(|h| *h = (*h as i64 + delta).rem_euclid(n) as usize);
+        }
+    }
+
+    /// Applies the highlighted suggestion (or the draft, if nothing is
+    /// suggested). With `advance`, moves the editor to the next slot so
+    /// a progression can be typed chord, Tab, chord, Tab.
+    pub fn commit(self, advance: bool) {
+        let Some(slot) = self.editing.get() else { return };
+        let Some(track) = self.selected_track.get() else { return };
+        let key = self.project.with(|p| p.key);
+        let chord = self
+            .suggestions()
+            .get(self.highlight.get())
+            .copied()
+            .or_else(|| theory::parse_chord_or_roman(&self.draft.get(), key).ok());
+        let figures = self.figures.get();
+        let next = match slot {
+            Slot::Figure(i) if i + 1 < figures.len() => Slot::Figure(i + 1),
+            _ => Slot::Append,
+        };
+        match chord {
+            Some(chord) => self.apply_chord(track, slot, &chord, &figures),
+            None if !self.draft.get().trim().is_empty() => {
+                self.status.set(format!("Not a chord: {}", self.draft.get()));
+                return;
+            }
+            None => {}
+        }
+        if advance { self.open_editor(next) } else { self.close_editor() }
+    }
+
+    fn apply_chord(self, track: Id, slot: Slot, chord: &Chord, figures: &[Figure]) {
+        let s = FigureSettings::default();
+        let label = self.chord_label(chord);
+        let result = match slot {
+            Slot::Figure(i) if figures.get(i).is_some_and(|f| f.chord == *chord) => return,
+            Slot::Figure(i) => {
+                let mut r = Ok(());
+                self.edit(&format!("chord {label}"), |p| r = figure::set_chord(p, track, i, chord, &s));
+                r
+            }
+            Slot::Append if figures.is_empty() => {
+                let mut r = Ok(());
+                self.edit(&format!("add {label}"), |p| {
+                    let bar = p.meter_at(0).ticks_per_bar();
+                    r = figure::add_block(p, track, 0, bar, chord);
+                });
+                r
+            }
+            Slot::Append => {
+                let mut r = Ok(());
+                let last = figures.len() - 1;
+                self.edit(&format!("then {label}"), |p| r = figure::continue_with(p, track, last, chord, &s));
+                r
+            }
+        };
+        self.status.set(match result {
+            Ok(()) => match slot {
+                Slot::Figure(_) => format!("Re-voiced to {label}"),
+                Slot::Append => format!("Continued with {label}"),
+            },
+            Err(e) => e.to_string(),
+        });
     }
 
     /// Applies an undoable edit.
@@ -94,6 +233,37 @@ impl Store {
         });
     }
 
+    /// The figure lane above the piano roll, in the roll's coordinates.
+    pub fn lane(self) -> Lane {
+        let px = self.zoom.get() / PPQ as f64;
+        let figures = self.figures.get();
+        let items: Vec<LaneItem> = figures
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let until = figures.get(i + 1).map_or(f.end, |n| n.start);
+                let (left, width) = (f.start as f64 * px, ((until - f.start) as f64 * px).max(24.0));
+                let label = self.chord_label(&f.chord);
+                LaneItem {
+                    key: format!("{i}:{left}:{width}:{label}:{}", f.kind.label()),
+                    index: i,
+                    left,
+                    width,
+                    label,
+                    kind: f.kind.label(),
+                    unsure: f.confidence < 0.6,
+                }
+            })
+            .collect();
+        let append_left = items.last().map_or(0.0, |l| l.left + l.width);
+        let editor_left = match self.editing.get() {
+            Some(Slot::Figure(i)) => items.get(i).map(|l| l.left),
+            Some(Slot::Append) => Some(append_left),
+            None => None,
+        };
+        Lane { items, append_left, editor_left }
+    }
+
     /// The piano roll's contents for the selected track.
     pub fn roll(self) -> Roll {
         let zoom = self.zoom.get();
@@ -114,6 +284,25 @@ fn write_export(name: &str, ext: &str, bytes: &[u8]) -> Result<PathBuf, String> 
 }
 
 pub const ROW: f64 = 12.0;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LaneItem {
+    pub key: String,
+    pub index: usize,
+    pub left: f64,
+    pub width: f64,
+    pub label: String,
+    pub kind: &'static str,
+    /// The chord reading is a guess.
+    pub unsure: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Lane {
+    pub items: Vec<LaneItem>,
+    pub append_left: f64,
+    pub editor_left: Option<f64>,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RollNote {

@@ -126,3 +126,84 @@
     border-top: 1px solid var(--rinch-color-dark-4);
     background: var(--rinch-color-dark-7);
 }
+
+.lane {
+    position: relative;
+    height: 40px;
+    background: var(--rinch-color-dark-8);
+    border-bottom: 1px solid var(--rinch-color-dark-4);
+}
+.lane-label {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 64px;
+    height: 100%;
+    padding: 13px 6px;
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--rinch-color-dimmed);
+    background: var(--rinch-color-dark-7);
+    border-right: 1px solid var(--rinch-color-dark-4);
+}
+.figure {
+    position: absolute;
+    top: 4px;
+    height: 32px;
+    padding: 3px 7px;
+    border-radius: 4px;
+    background: var(--rinch-color-dark-5);
+    border: 1px solid var(--rinch-color-dark-4);
+    cursor: pointer;
+    overflow: hidden;
+    white-space: nowrap;
+}
+.figure:hover { border-color: var(--rinch-color-violet-6); }
+.figure.editing { border-color: var(--rinch-color-violet-4); background: var(--rinch-color-dark-4); }
+.figure.unsure .figure-chord { color: var(--rinch-color-dimmed); font-style: italic; }
+.figure-chord { display: block; font-weight: 600; font-size: 13px; line-height: 14px; }
+.figure-kind { display: block; font-size: 9px; line-height: 11px; color: var(--rinch-color-dimmed); }
+.figure.add {
+    width: 32px;
+    padding: 6px 0;
+    text-align: center;
+    font-size: 15px;
+    color: var(--rinch-color-dimmed);
+    border-style: dashed;
+    background: transparent;
+}
+
+.chord-editor {
+    position: absolute;
+    top: 38px;
+    width: 220px;
+    z-index: 10;
+    padding: 6px;
+    border-radius: 6px;
+    background: var(--rinch-color-dark-6);
+    border: 1px solid var(--rinch-color-dark-3);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+.chord-input {
+    width: 100%;
+    padding: 6px 8px;
+    border-radius: 4px;
+    border: 1px solid var(--rinch-color-violet-6);
+    background: var(--rinch-color-dark-8);
+    color: var(--rinch-color-text);
+    font-size: 14px;
+}
+.suggestions { margin-top: 4px; }
+.suggestion {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 8px;
+    border-radius: 3px;
+    cursor: pointer;
+}
+.suggestion:hover { background: var(--rinch-color-dark-5); }
+.suggestion.active { background: var(--rinch-color-violet-8); }
+.suggestion-chord { font-weight: 600; }
+.suggestion-alt { color: var(--rinch-color-dimmed); font-size: 11px; }
+.editor-hint { margin-top: 4px; padding: 0 4px; font-size: 10px; color: var(--rinch-color-dimmed); }
