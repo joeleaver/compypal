@@ -36,7 +36,7 @@ with a built-in synth; export MIDI and ABC.
   `[patch."https://github.com/joeleaver/rinch"] rinch = { path = "../dev/rinch/crates/rinch" }`
   and don't commit it.
 - The app enables rinch's `debug` feature, so a running app can be driven by
-  the rinch MCP server (`/home/joe/dev/rinch/target/release/rinch-mcp-server`).
+  the rinch MCP server (`rinch-mcp-server`, built from the rinch repo).
 
 ## rinch gotchas hit so far
 
