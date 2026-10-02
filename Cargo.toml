@@ -9,7 +9,7 @@ edition = "2024"
 [workspace.dependencies]
 compypal-core = { path = "crates/compypal-core" }
 compypal-io = { path = "crates/compypal-io" }
-rinch = { path = "../dev/rinch/crates/rinch", default-features = false }
+rinch = { git = "https://github.com/joeleaver/rinch", branch = "main", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 midly = "0.5"

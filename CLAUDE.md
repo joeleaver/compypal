@@ -26,11 +26,15 @@ with a built-in synth; export MIDI and ABC.
 
 ## Building
 
-- rinch is a path dependency on `../dev/rinch`. Our root `Cargo.toml` copies
-  rinch's `[patch.crates-io]` section (winit/wgpu forks), because patches
-  don't propagate to dependent workspaces. If rinch changes its patches,
-  copy them again. If the build fails inside rinch's winit code, re-seed
-  `Cargo.lock` from `../dev/rinch/Cargo.lock`.
+- rinch comes from GitHub (`joeleaver/rinch`, branch `main`); `Cargo.lock`
+  pins the commit. Pull a newer rinch with `cargo update -p rinch`. Our root
+  `Cargo.toml` copies rinch's `[patch.crates-io]` section (winit/wgpu forks),
+  because patches don't propagate to dependent workspaces. If rinch changes
+  its patches, copy them again. If the build fails inside rinch's winit code,
+  the lockfile has drifted from rinch's: re-seed it from rinch's `Cargo.lock`.
+- To hack on rinch and compypal together locally, temporarily add
+  `[patch."https://github.com/joeleaver/rinch"] rinch = { path = "../dev/rinch/crates/rinch" }`
+  and don't commit it.
 - The app enables rinch's `debug` feature, so a running app can be driven by
   the rinch MCP server (`/home/joe/dev/rinch/target/release/rinch-mcp-server`).
 
