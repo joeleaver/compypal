@@ -1,0 +1,9 @@
+[package]
+name = "compypal-io"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+compypal-core.workspace = true
+midly.workspace = true
+thiserror.workspace = true

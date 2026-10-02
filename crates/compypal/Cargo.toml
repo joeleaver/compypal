@@ -1,0 +1,9 @@
+[package]
+name = "compypal"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+compypal-core.workspace = true
+compypal-io.workspace = true
+rinch = { workspace = true, features = ["desktop", "components", "theme", "debug"] }
