@@ -207,3 +207,20 @@
 .suggestion-chord { font-weight: 600; }
 .suggestion-alt { color: var(--rinch-color-dimmed); font-size: 11px; }
 .editor-hint { margin-top: 4px; padding: 0 4px; font-size: 10px; color: var(--rinch-color-dimmed); }
+
+.position { min-width: 64px; color: var(--rinch-color-text); }
+.ruler { cursor: pointer; }
+.cursor-line, .playhead {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    margin-left: -1px;
+    pointer-events: none;
+    z-index: 5;
+}
+.cursor-line { background: var(--rinch-color-violet-6); opacity: 0.5; width: 1px; }
+.playhead { background: var(--rinch-color-green-5); }
+.key-label { cursor: pointer; }
+.statusbar { display: flex; justify-content: space-between; }
+.audio-status { color: var(--rinch-color-dimmed); }

@@ -6,4 +6,5 @@ edition.workspace = true
 [dependencies]
 compypal-core.workspace = true
 compypal-io.workspace = true
+compypal-audio.workspace = true
 rinch = { workspace = true, features = ["desktop", "components", "theme", "debug"] }

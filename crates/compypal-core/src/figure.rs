@@ -440,11 +440,8 @@ pub fn continue_with(
     s: &FigureSettings,
 ) -> Result<(), FigureError> {
     let figs = track_figures(p, track, s)?;
-    let f = figure_at(&figs, index)?;
-    let len = span(&figs, index, &p.meter_at(f.start));
-    let at = f.start + len;
-    let moved: Vec<Note> = f.notes.iter().map(|n| Note { start: n.start + len, ..*n }).collect();
-    let new = revoice(&moved, &f.chord, chord, p.key);
+    figure_at(&figs, index)?;
+    let (at, len, new) = continued(&figs, index, chord, p);
     let displaced: Vec<Note> = p
         .track(track)
         .unwrap()
@@ -454,6 +451,15 @@ pub fn continue_with(
         .collect();
     p.replace_notes(track, &displaced, &new);
     Ok(())
+}
+
+/// What [`continue_with`] would write, without writing it: where the new
+/// figure starts, how long its slot is, and its notes.
+pub fn continued(figs: &[Figure], index: usize, chord: &Chord, p: &Project) -> (Tick, Tick, Vec<Note>) {
+    let f = &figs[index];
+    let len = span(figs, index, &p.meter_at(f.start));
+    let moved: Vec<Note> = f.notes.iter().map(|n| Note { start: n.start + len, ..*n }).collect();
+    (f.start + len, len, revoice(&moved, &f.chord, chord, p.key))
 }
 
 /// Appends a block chord in close position at `at`, for starting from an

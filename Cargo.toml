@@ -9,6 +9,7 @@ edition = "2024"
 [workspace.dependencies]
 compypal-core = { path = "crates/compypal-core" }
 compypal-io = { path = "crates/compypal-io" }
+compypal-audio = { path = "crates/compypal-audio" }
 rinch = { git = "https://github.com/joeleaver/rinch", branch = "main", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
@@ -35,3 +36,10 @@ dpi = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" 
 # Analysis (and later, synthesis) runs on every edit; keep it fast in dev builds.
 [profile.dev.package.compypal-core]
 opt-level = 2
+
+# The synth renders in the audio callback; unoptimized it can't keep up.
+[profile.dev.package.compypal-audio]
+opt-level = 3
+
+[profile.dev.package.rustysynth]
+opt-level = 3

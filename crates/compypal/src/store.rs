@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use compypal_core::cleanup::{self, Quantize};
 use compypal_core::figure::{self, Figure, FigureSettings};
 use compypal_core::theory::{self, Chord, Spelling};
+use compypal_audio::{Engine, Schedule, ScheduleOptions, schedule};
 use compypal_core::{History, Id, Note, PPQ, Project, Tick};
 use rinch::prelude::*;
 
@@ -36,10 +37,20 @@ pub struct Store {
     pub highlight: Signal<usize>,
     /// Label figures with Roman numerals instead of chord symbols.
     pub roman: Signal<bool>,
+    /// `None` when there is no audio device; the app still works, silently.
+    pub engine: Option<&'static Engine>,
+    /// Transport position in seconds while playing.
+    pub playhead: Signal<Option<f64>>,
+    /// Where Play starts from.
+    pub cursor: Signal<Tick>,
+    pub looping: Signal<bool>,
+    pub metronome: Signal<bool>,
+    /// What the engine is playing through.
+    pub audio_status: Signal<String>,
 }
 
 impl Store {
-    pub fn new(project: Project) -> Self {
+    pub fn new(project: Project, engine: Option<&'static Engine>) -> Self {
         let first = project.tracks.first().map(|t| t.id);
         let project = Signal::new(project);
         let selected_track = Signal::new(first);
@@ -62,6 +73,84 @@ impl Store {
             draft: Signal::new(String::new()),
             highlight: Signal::new(0),
             roman: Signal::new(false),
+            engine,
+            playhead: Signal::new(None),
+            cursor: Signal::new(0),
+            looping: Signal::new(true),
+            metronome: Signal::new(false),
+            audio_status: Signal::new(match engine {
+                Some(e) => e.status(),
+                None => "No audio output".into(),
+            }),
+        }
+    }
+
+    pub fn schedule(self) -> Schedule {
+        let opts = ScheduleOptions { metronome: self.metronome.get() };
+        self.project.with(|p| schedule::build(p, opts))
+    }
+
+    pub fn is_playing(self) -> bool {
+        self.playhead.get().is_some()
+    }
+
+    pub fn toggle_play(self) {
+        let Some(engine) = self.engine else { return };
+        if untracked(|| self.playhead.get()).is_some() {
+            engine.stop();
+            self.playhead.set(None);
+        } else {
+            let from = self.project.with(|p| p.tempo.tick_to_seconds(self.cursor.get() as f64));
+            engine.play(self.schedule(), from, self.looping.get());
+            // Show the playhead right away rather than on the next poll.
+            self.playhead.set(Some(from));
+        }
+    }
+
+    /// Moves the play cursor, and the music too if it's playing.
+    pub fn seek(self, tick: Tick) {
+        self.cursor.set(tick);
+        if let (Some(engine), true) = (self.engine, untracked(|| self.playhead.get()).is_some()) {
+            let from = self.project.with(|p| p.tempo.tick_to_seconds(tick as f64));
+            engine.play(self.schedule(), from, self.looping.get());
+        }
+    }
+
+    pub fn toggle_looping(self) {
+        self.looping.update(|l| *l = !*l);
+        if let Some(e) = self.engine {
+            e.set_looping(self.looping.get());
+        }
+    }
+
+    /// Plays `notes` on `track`'s instrument, now.
+    pub fn audition(self, track: Id, notes: &[Note]) {
+        let Some(engine) = self.engine else { return };
+        let sched = self.project.with(|p| {
+            let t = p.track(track)?;
+            Some(schedule::audition(notes, t.channel, t.program, p))
+        });
+        if let Some(s) = sched {
+            engine.audition(s);
+        }
+    }
+
+    /// Plays what the editor's slot would sound like with `chord`.
+    fn preview(self, chord: &Chord) {
+        let Some(track) = self.selected_track.get() else { return };
+        let figures = self.figures.get();
+        let notes = self.project.with(|p| match self.editing.get()? {
+            Slot::Figure(i) => {
+                let f = figures.get(i)?;
+                Some(figure::revoice(&f.notes, &f.chord, chord, p.key))
+            }
+            Slot::Append if !figures.is_empty() => Some(figure::continued(&figures, figures.len() - 1, chord, p).2),
+            Slot::Append => Some(
+                chord.voicing(55).into_iter().map(|pitch| Note { pitch, velocity: 90, start: 0, duration: PPQ as Tick * 2 }).collect(),
+            ),
+        });
+        if let Some(n) = notes {
+            self.audition(track, &n);
         }
     }
 
@@ -81,6 +170,11 @@ impl Store {
         self.editing.set(Some(slot));
         self.draft.set(String::new());
         self.highlight.set(0);
+        if let (Slot::Figure(i), Some(track)) = (slot, self.selected_track.get())
+            && let Some(f) = self.figures.get().get(i)
+        {
+            self.audition(track, &f.notes);
+        }
     }
 
     pub fn close_editor(self) {
@@ -106,6 +200,9 @@ impl Store {
         let n = self.suggestions().len() as i64;
         if n > 0 {
             self.highlight.update(|h| *h = (*h as i64 + delta).rem_euclid(n) as usize);
+            if let Some(c) = self.suggestions().get(self.highlight.get()) {
+                self.preview(c);
+            }
         }
     }
 
@@ -162,6 +259,17 @@ impl Store {
                 r
             }
         };
+        if result.is_ok() {
+            // Hear what was just written.
+            let figures = self.figures.get();
+            let written = match slot {
+                Slot::Figure(i) => figures.get(i),
+                Slot::Append => figures.last(),
+            };
+            if let Some(f) = written {
+                self.audition(track, &f.notes);
+            }
+        }
         self.status.set(match result {
             Ok(()) => match slot {
                 Slot::Figure(_) => format!("Re-voiced to {label}"),

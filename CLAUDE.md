@@ -11,6 +11,7 @@ with a built-in synth; export MIDI and ABC.
 |---|---|
 | `compypal-core` | Project model (ticks, `PPQ = 960`), raw `Session`s (seconds), cleanup ops, snapshot undo, GM names, `theory` (chords, Roman numerals, keys), `figure` (musical units), demo project. No I/O, no UI. |
 | `compypal-io` | SMF import/export (`midly`), ABC export. |
+| `compypal-audio` | `Engine` (cpal output on its own thread), `Synth` trait with SoundFont (`rustysynth`) and built-in fallback, pure `schedule::build` from a project, realtime `Player`. |
 | `compypal` | The rinch desktop app. `store.rs` is all app state; every project edit goes through `Store::edit` so UI and agent share undo. |
 
 ## Model rules
@@ -43,6 +44,22 @@ It has a chord and a shape (block, arpeggio, run, melody, note, mixed).
 - The lane above the piano roll is the UI: click a figure, type a chord
   or numeral, Tab moves on, and "+" appends.
 
+## Audio
+
+- The engine starts on `BasicSynth` and swaps to a GM SoundFont once it has
+  loaded in the background (`COMPYPAL_SOUNDFONT`, else the usual system
+  paths; FluidR3_GM on this machine).
+- The audio thread only receives `Cmd`s over a channel and publishes the
+  position through atomics. The UI polls it from a plain thread and
+  `send()`s into signals. Never lock or allocate in `Player::process` beyond
+  what is there.
+- Any project change while playing rebuilds the schedule and sends
+  `Cmd::Update`, which keeps the position (an Effect in `app`).
+- `compypal-audio` and `rustysynth` build at opt-level 3 even in dev;
+  unoptimized, the synth can't keep up with the callback.
+- `cargo run -p compypal-audio --example play_demo` checks the device
+  without the UI.
+
 ## Building
 
 - rinch comes from GitHub (`joeleaver/rinch`, branch `main`); `Cargo.lock`
@@ -70,8 +87,7 @@ It has a chord and a shape (block, arpeggio, run, melody, note, mixed).
 
 ## Roadmap
 
-1. **Audio**: `compypal-audio` crate with a cpal output stream, `rustysynth`
-   SoundFont playback (GM), a transport/sequencer, and a metronome.
+1. ~~Audio~~ (done). Follow-ups: playhead auto-scroll, a loop range.
 2. **Recording**: `midir` input into a new `Session`, with click, count-in, and
    live display. The session stores `downbeat_offset` and `click_bpm`.
 3. **Agent / music IDE**: an MCP server embedded in the app on localhost,

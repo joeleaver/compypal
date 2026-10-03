@@ -69,6 +69,32 @@ fn Transport() -> NodeHandle {
                     format!("{:.0} BPM  ·  {}/{}  ·  {}", p.tempo.bpm_at(0), m.numerator, m.denominator, p.key.name())
                 })}
             }
+            div { class: "divider" }
+            Button { size: "xs",
+                variant: {|| if store.is_playing() { "filled" } else { "light" }},
+                disabled: store.engine.is_none(),
+                onclick: move || store.toggle_play(),
+                {|| if store.is_playing() { "■ Stop" } else { "▶ Play" }}
+            }
+            Button { size: "xs",
+                variant: {|| if store.looping.get() { "filled" } else { "default" }},
+                onclick: move || store.toggle_looping(),
+                "Loop"
+            }
+            Button { size: "xs",
+                variant: {|| if store.metronome.get() { "filled" } else { "default" }},
+                onclick: move || store.metronome.update(|m| *m = !*m),
+                "Click"
+            }
+            span { class: "readout position",
+                {|| {
+                    let tick = match store.playhead.get() {
+                        Some(secs) => store.project.with(|p| p.tempo.seconds_to_tick(secs).max(0.0) as u64),
+                        None => store.cursor.get(),
+                    };
+                    store.project.with(|p| compypal_core::cleanup::bar_beat_tick(tick, &p.meter_at(0)))
+                }}
+            }
             div { class: "spacer" }
             Button { size: "xs", variant: "default",
                 disabled: {|| store.history.with(|h| h.undo_label().is_none())},
@@ -154,7 +180,17 @@ fn PianoRoll() -> NodeHandle {
                 class: "roll",
                 style: {|| { let r = roll.get(); format!("width: {}px; height: {}px;", r.width + 64.0, r.height + 20.0) }},
                 FigureLane {}
-                div { class: "ruler",
+                div {
+                    class: "ruler",
+                    onclick: move || {
+                        let c = get_click_context();
+                        let x = (c.mouse_x - c.element_x) as f64 - KEYS;
+                        let px = store.zoom.get() / compypal_core::PPQ as f64;
+                        // Snap to the beat: you'd count in from a beat, not a tick.
+                        let beat = compypal_core::PPQ as f64;
+                        let tick = ((x / px) / beat).round().max(0.0) * beat;
+                        store.seek(tick as u64);
+                    },
                     for b in roll.get().bars {
                         div { key: b.key.clone(), class: "bar-number",
                             style: {format!("left: {}px;", b.left + 64.0)},
@@ -167,7 +203,19 @@ fn PianoRoll() -> NodeHandle {
                         div { key: row.key.clone(),
                             class: {if row.black { "row black" } else { "row" }},
                             style: {format!("top: {}px; height: {ROW}px;", row.top)},
-                            span { class: "key-label", {row.label.clone()} }
+                            span {
+                                class: "key-label",
+                                onclick: {
+                                    let pitch = row.pitch;
+                                    move || {
+                                        if let Some(t) = store.selected_track.get() {
+                                            let q = compypal_core::PPQ as u64;
+                                            store.audition(t, &[compypal_core::Note { pitch, velocity: 100, start: 0, duration: q }]);
+                                        }
+                                    }
+                                },
+                                {row.label.clone()}
+                            }
                         }
                     }
                     for b in roll.get().bars {
@@ -180,6 +228,20 @@ fn PianoRoll() -> NodeHandle {
                             style: {format!("left: {}px; top: {}px; width: {}px; height: {}px; opacity: {:.2};",
                                 n.left + 64.0, n.top + 1.0, n.width, ROW - 2.0, 0.45 + n.velocity as f64 / 127.0 * 0.55)},
                         }
+                    }
+                    div {
+                        class: "cursor-line",
+                        style: {|| format!("left: {}px;", store.cursor.get() as f64 * store.zoom.get() / compypal_core::PPQ as f64 + KEYS)},
+                    }
+                    div {
+                        class: "playhead",
+                        style: {|| match store.playhead.get() {
+                            Some(secs) => {
+                                let tick = store.project.with(|p| p.tempo.seconds_to_tick(secs));
+                                format!("left: {}px;", tick * store.zoom.get() / compypal_core::PPQ as f64 + KEYS)
+                            }
+                            None => "display: none;".into(),
+                        }},
                     }
                     for n in roll.get().raw {
                         div { key: n.key.clone(), class: "note raw",
@@ -312,7 +374,52 @@ fn ChordEditor() -> NodeHandle {
 
 #[component]
 fn app() -> NodeHandle {
-    let store = create_store(Store::new(compypal_core::demo::project()));
+    let engine: Option<&'static compypal_audio::Engine> = match compypal_audio::Engine::start() {
+        Ok(e) => Some(Box::leak(Box::new(e))),
+        Err(e) => {
+            eprintln!("audio disabled: {e}");
+            None
+        }
+    };
+    let store = create_store(Store::new(compypal_core::demo::project(), engine));
+
+    // Edits while playing are heard on the next pass, without stopping.
+    rinch::core::Effect::new(move || {
+        let schedule = store.schedule();
+        if let (Some(e), true) = (store.engine, untracked(|| store.playhead.get()).is_some()) {
+            e.update(schedule);
+        }
+    });
+
+    // The audio thread can't touch signals; poll it from a plain thread and
+    // send() the results across.
+    if let Some(engine) = engine {
+        let (playhead, audio_status) = (store.playhead, store.audio_status);
+        std::thread::spawn(move || {
+            let mut last = (None, String::new());
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(33));
+                let now = (engine.position(), engine.status());
+                if now.0 != last.0 {
+                    playhead.send(now.0);
+                }
+                if now.1 != last.1 {
+                    audio_status.send(now.1.clone());
+                }
+                last = now;
+            }
+        });
+    }
+
+    // Space plays and stops, unless someone is typing.
+    rinch::core::set_keyboard_interceptor(move |k| {
+        if k.is_space() && k.is_down() && store.editing.get().is_none() {
+            store.toggle_play();
+            return true;
+        }
+        false
+    });
+
     rsx! {
         div { class: "app",
             style { {CSS} }
@@ -321,7 +428,10 @@ fn app() -> NodeHandle {
                 Sidebar {}
                 PianoRoll {}
             }
-            div { class: "statusbar", {|| store.status.get()} }
+            div { class: "statusbar",
+                span { {|| store.status.get()} }
+                span { class: "audio-status", {|| format!("♪ {}", store.audio_status.get())} }
+            }
         }
     }
 }
