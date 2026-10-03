@@ -60,6 +60,31 @@ It has a chord and a shape (block, arpeggio, run, melody, note, mixed).
 - `cargo run -p compypal-audio --example play_demo` checks the device
   without the UI.
 
+## Recording
+
+- `input::MidiIn` (midir) connects at launch to `COMPYPAL_MIDI_IN` (a
+  substring) or else the first port that isn't a DAW/loopback port. Its
+  callback timestamps with `Instant`, monitors through the engine on the
+  selected track's channel, and appends to the running take.
+- Rec plays one bar of count-in, then the song from the cursor with an
+  open end (`Schedule::length = INFINITY`). The session records
+  `downbeat_offset` (the count-in) and `start_tick` (the cursor), which is
+  all `import_session` needs to put the take back on the timeline.
+- On stop: the session is kept, and a clip is laid down as played
+  (sounding durations, so pedalled piano sounds right). "Tidy" re-derives
+  it with `cleanup::tidy`; the agent is meant to do better.
+- No hardware needed for testing: `cargo run -p compypal-audio --example
+  fake_keys -- 10` opens a virtual port and plays an arpeggio after 10s;
+  run the app with `COMPYPAL_MIDI_IN=compypal-fake-keys`.
+- Not yet: latency compensation (takes may sit a few ms late), the KeyLab's
+  DAW-port transport buttons, free-time recording with tempo detection.
+
+## Persistence
+
+The project autosaves to `$XDG_DATA_HOME/compypal/autosave.json` on every
+change and loads from there at launch (demo project if absent). Delete the
+file to get the demo back.
+
 ## Building
 
 - rinch comes from GitHub (`joeleaver/rinch`, branch `main`); `Cargo.lock`
@@ -80,6 +105,12 @@ It has a chord and a shape (block, arpeggio, run, melody, note, mixed).
   include the geometry, so a moved or zoomed note gets a new key.
 - `Memo` has no `.with()`; use `.get()`.
 - Global CSS lives in `src/style.css`, injected via `style { {CSS} }`.
+- In `rsx!`, attribute values and `class`/`style` blocks become `move`
+  closures, and a `for` item's `key:` does too: they move whatever
+  non-`Copy` value they touch. Give loop items a `Copy` key, and use only
+  `Copy` data in attribute closures.
+- A `Vec<NodeHandle>` child is wrapped in a `display: contents` box, so
+  `<option>`s built that way are not seen by a native `<select>`.
 - `autofocus` only works inside Modal/Popover. Elsewhere, build the input as
   its own node and call `.focus()` on it.
 - Keyboard handling for a popup: `overlay_dismiss::arm_keys_while_open`
@@ -88,8 +119,7 @@ It has a chord and a shape (block, arpeggio, run, melody, note, mixed).
 ## Roadmap
 
 1. ~~Audio~~ (done). Follow-ups: playhead auto-scroll, a loop range.
-2. **Recording**: `midir` input into a new `Session`, with click, count-in, and
-   live display. The session stores `downbeat_offset` and `click_bpm`.
+2. ~~Recording~~ (done). Follow-ups listed under Recording.
 3. **Agent / music IDE**: an MCP server embedded in the app on localhost,
    advertised to Claude Code the way editor extensions are (a lockfile in
    `~/.claude/ide/` that `/ide` discovers). Check the current lockfile and

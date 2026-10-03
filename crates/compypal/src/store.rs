@@ -6,8 +6,9 @@ use std::path::PathBuf;
 use compypal_core::cleanup::{self, Quantize};
 use compypal_core::figure::{self, Figure, FigureSettings};
 use compypal_core::theory::{self, Chord, Spelling};
+use compypal_audio::input::MidiIn;
 use compypal_audio::{Engine, Schedule, ScheduleOptions, schedule};
-use compypal_core::{History, Id, Note, PPQ, Project, Tick};
+use compypal_core::{Clip, History, Id, MeterChange, Note, PPQ, Project, RawEvent, Session, Tick};
 use rinch::prelude::*;
 
 /// Where the chord editor is open: on a figure, or on the slot after the
@@ -47,10 +48,49 @@ pub struct Store {
     pub metronome: Signal<bool>,
     /// What the engine is playing through.
     pub audio_status: Signal<String>,
+    pub midi: Option<&'static MidiIn>,
+    /// The connected input port.
+    pub midi_port: Signal<Option<String>>,
+    pub recording: Signal<Option<Recording>>,
+    /// The running take so far, for drawing as it's played.
+    pub live_take: Signal<Vec<RawEvent>>,
+    /// Engine time minus song time: nonzero while recording, where the
+    /// engine's clock starts at the count-in rather than at the song.
+    pub play_offset: Signal<f64>,
+}
+
+/// A take in progress.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Recording {
+    pub track: Id,
+    /// Where on the timeline the take's first downbeat lands.
+    pub start_tick: Tick,
+    /// Count-in length in seconds: time zero of the take is the first click.
+    pub lead: f64,
+    pub bpm: f64,
+    pub meter: MeterChange,
+}
+
+impl Recording {
+    /// The take as a session, for drawing or keeping.
+    pub fn session(&self, id: Id, name: String, events: Vec<RawEvent>) -> Session {
+        Session {
+            id,
+            name,
+            recorded_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            click_bpm: Some(self.bpm),
+            meter: self.meter,
+            downbeat_offset: self.lead,
+            start_tick: self.start_tick,
+            events,
+        }
+    }
 }
 
 impl Store {
-    pub fn new(project: Project, engine: Option<&'static Engine>) -> Self {
+    pub fn new(project: Project, engine: Option<&'static Engine>, midi: Option<&'static MidiIn>) -> Self {
         let first = project.tracks.first().map(|t| t.id);
         let project = Signal::new(project);
         let selected_track = Signal::new(first);
@@ -82,11 +122,205 @@ impl Store {
                 Some(e) => e.status(),
                 None => "No audio output".into(),
             }),
+            midi,
+            midi_port: Signal::new(midi.and_then(|m| m.connected())),
+            recording: Signal::new(None),
+            live_take: Signal::new(Vec::new()),
+            play_offset: Signal::new(0.0),
         }
     }
 
+    /// Adds a piano track and selects it, ready to record into.
+    pub fn add_track(self) {
+        let mut id = None;
+        self.edit("add track", |p| {
+            let name = format!("Track {}", p.tracks.len() + 1);
+            id = Some(p.add_track(name, 0));
+        });
+        if let Some(id) = id {
+            self.select_track(id);
+        }
+    }
+
+    /// Starts over with an empty project (undoable).
+    pub fn new_project(self) {
+        if let Some(e) = self.engine {
+            e.stop();
+        }
+        self.playhead.set(None);
+        self.edit("new project", |p| {
+            *p = Project::new("Untitled");
+            p.add_track("Piano", 0);
+        });
+        self.cursor.set(0);
+        let first = self.project.with(|p| p.tracks.first().map(|t| t.id));
+        if let Some(id) = first {
+            self.select_track(id);
+        }
+    }
+
+    /// Selects a track, and plays live input through its instrument.
+    pub fn select_track(self, id: Id) {
+        self.close_editor();
+        self.selected_track.set(Some(id));
+        self.monitor_selected();
+    }
+
+    fn monitor_selected(self) {
+        let Some((ch, program, drums)) = self.selected_track.get().and_then(|id| {
+            self.project.with(|p| p.track(id).map(|t| (t.channel, t.program, t.is_drums())))
+        }) else {
+            return;
+        };
+        if let Some(m) = self.midi {
+            m.set_monitor_channel(ch);
+        }
+        if let (Some(e), false) = (self.engine, drums) {
+            e.midi([0xc0 | ch, program, 0]);
+        }
+    }
+
+    pub fn connect_midi(self, port: &str) {
+        let Some(m) = self.midi else { return };
+        if port.is_empty() {
+            m.disconnect();
+            self.midi_port.set(None);
+            return;
+        }
+        match m.connect(port) {
+            Ok(()) => {
+                self.midi_port.set(Some(port.to_string()));
+                self.monitor_selected();
+                self.status.set(format!("Listening to {port}"));
+            }
+            Err(e) => self.status.set(e.to_string()),
+        }
+    }
+
+    /// Which of `input::ports()` is connected.
+    pub fn midi_port_index(self) -> Option<usize> {
+        let current = self.midi_port.get()?;
+        compypal_audio::input::ports().iter().position(|p| *p == current)
+    }
+
+    /// Connects port `index` of `input::ports()`, or disconnects it if it
+    /// is the one connected.
+    pub fn toggle_port(self, index: usize) {
+        if self.midi_port_index() == Some(index) {
+            self.connect_midi("");
+        } else if let Some(name) = compypal_audio::input::ports().get(index) {
+            self.connect_midi(name);
+        }
+    }
+
+    /// Song position in seconds, from the engine's position.
+    pub fn song_seconds(self) -> Option<f64> {
+        self.playhead.get().map(|s| s - self.play_offset.get())
+    }
+
+    pub fn is_recording(self) -> bool {
+        self.recording.with(|r| r.is_some())
+    }
+
+    /// Starts a take on the selected track from the cursor: a bar of
+    /// count-in, then the song plays (with the click, if on) while
+    /// everything played on the controller is captured.
+    pub fn record(self) {
+        let (Some(engine), Some(midi)) = (self.engine, self.midi) else {
+            self.status.set("Recording needs audio output and a MIDI input".into());
+            return;
+        };
+        if midi.connected().is_none() {
+            self.status.set("Connect a MIDI input to record".into());
+            return;
+        }
+        let Some(track) = self.selected_track.get() else { return };
+        engine.stop();
+        let start_tick = self.cursor.get();
+        let (song, from, bpm, meter) = self.project.with(|p| {
+            let until = start_tick + 256 * PPQ as Tick * 4;
+            let opts = ScheduleOptions { metronome: self.metronome.get(), until };
+            (schedule::build(p, opts), p.tempo.tick_to_seconds(start_tick as f64), p.tempo.bpm_at(start_tick), p.meter_at(start_tick))
+        });
+        let beat = 60.0 / bpm * 4.0 / meter.denominator as f64;
+        let mut take = schedule::with_count_in(&song, from, meter.numerator, beat);
+        // Keep going until stopped, however short the song is.
+        take.length = f64::INFINITY;
+        let lead = meter.numerator as f64 * beat;
+        self.monitor_selected();
+        midi.start_take(std::time::Instant::now());
+        engine.play(take, 0.0, false);
+        self.play_offset.set(lead - from);
+        self.playhead.set(Some(0.0));
+        self.recording.set(Some(Recording { track, start_tick, lead, bpm, meter }));
+        self.status.set("Recording… (Space or Rec to stop)".into());
+    }
+
+    /// Ends the take: keeps it as a session and lays it down as a clip on
+    /// the track it was recorded on, as played.
+    pub fn stop_recording(self) {
+        let Some(rec) = self.recording.get() else { return };
+        if let Some(e) = self.engine {
+            e.stop();
+        }
+        self.playhead.set(None);
+        self.play_offset.set(0.0);
+        self.recording.set(None);
+        self.live_take.set(Vec::new());
+        let events = self.midi.map(|m| m.finish_take()).unwrap_or_default();
+        if !events.iter().any(|e| matches!(e.msg, compypal_core::RawMsg::NoteOn { .. })) {
+            self.status.set("Nothing recorded".into());
+            return;
+        }
+        let mut summary = String::new();
+        self.edit("record", |p| {
+            let id = p.alloc_id();
+            let name = format!("Take {}", p.sessions.len() + 1);
+            let session = rec.session(id, name.clone(), events);
+            let imported = cleanup::import_session(&session, &p.tempo, true);
+            let bar = rec.meter.ticks_per_bar();
+            let start = rec.start_tick.saturating_sub(imported.pickup_bars as Tick * bar);
+            let end = imported.notes.iter().map(|n| n.end()).max().unwrap_or(0);
+            let clip_id = p.alloc_id();
+            summary = format!("{name}: {} notes", imported.notes.len());
+            if let Some(t) = p.track_mut(rec.track) {
+                t.clips.push(Clip {
+                    id: clip_id,
+                    name: name.clone(),
+                    start,
+                    length: end.div_ceil(bar).max(1) * bar,
+                    notes: imported.notes,
+                    source_session: Some(id),
+                });
+                t.clips.sort_by_key(|c| c.start);
+            }
+            p.sessions.push(session);
+        });
+        self.status.set(format!("Recorded {summary}. Tidy it from the session list, or ask the agent."));
+    }
+
+    /// Re-derives every clip made from `session` with the default cleanup.
+    pub fn tidy_session(self, session: Id) {
+        let mut report = cleanup::TidyReport::default();
+        self.edit("tidy take", |p| {
+            let Some(s) = p.session(session).cloned() else { return };
+            let fresh = cleanup::import_session(&s, &p.tempo, true).notes;
+            for t in &mut p.tracks {
+                for c in t.clips.iter_mut().filter(|c| c.source_session == Some(session)) {
+                    let mut notes = fresh.clone();
+                    report = cleanup::tidy(&mut notes);
+                    c.notes = notes;
+                }
+            }
+        });
+        self.status.set(format!(
+            "Tidied: {} ghost notes and {} slips removed, {} double strikes merged, {} notes nudged toward 1/16",
+            report.ghosts_removed, report.slips_removed, report.double_strikes_merged, report.quantized
+        ));
+    }
+
     pub fn schedule(self) -> Schedule {
-        let opts = ScheduleOptions { metronome: self.metronome.get() };
+        let opts = ScheduleOptions { metronome: self.metronome.get(), ..Default::default() };
         self.project.with(|p| schedule::build(p, opts))
     }
 
@@ -96,6 +330,11 @@ impl Store {
 
     pub fn toggle_play(self) {
         let Some(engine) = self.engine else { return };
+        if untracked(|| self.is_recording()) {
+            self.stop_recording();
+            return;
+        }
+        self.play_offset.set(0.0);
         if untracked(|| self.playhead.get()).is_some() {
             engine.stop();
             self.playhead.set(None);
@@ -110,7 +349,9 @@ impl Store {
     /// Moves the play cursor, and the music too if it's playing.
     pub fn seek(self, tick: Tick) {
         self.cursor.set(tick);
-        if let (Some(engine), true) = (self.engine, untracked(|| self.playhead.get()).is_some()) {
+        if let (Some(engine), true, false) =
+            (self.engine, untracked(|| self.playhead.get()).is_some(), untracked(|| self.is_recording()))
+        {
             let from = self.project.with(|p| p.tempo.tick_to_seconds(tick as f64));
             engine.play(self.schedule(), from, self.looping.get());
         }
@@ -377,7 +618,15 @@ impl Store {
         let zoom = self.zoom.get();
         let show_raw = self.show_raw.get();
         let selected = self.selected_track.get();
-        self.project.with(|p| Roll::build(p, selected, zoom, show_raw))
+        let live = self.recording.get().filter(|r| Some(r.track) == selected).map(|r| {
+            let mut events = self.live_take.get();
+            // Notes still held are drawn up to now.
+            if let Some(now) = self.playhead.get() {
+                events.push(RawEvent { t: now, channel: 0, msg: compypal_core::RawMsg::Cc { controller: 119, value: 0 } });
+            }
+            r.session(Id(0), String::new(), events)
+        });
+        self.project.with(|p| Roll::build(p, selected, zoom, show_raw, live.as_ref()))
     }
 }
 
@@ -446,10 +695,12 @@ pub struct Roll {
     pub notes: Vec<RollNote>,
     /// Notes exactly as played, before cleanup.
     pub raw: Vec<RollNote>,
+    /// The take being recorded.
+    pub live: Vec<RollNote>,
 }
 
 impl Roll {
-    fn build(p: &Project, track: Option<Id>, zoom: f64, show_raw: bool) -> Self {
+    fn build(p: &Project, track: Option<Id>, zoom: f64, show_raw: bool, live: Option<&Session>) -> Self {
         let Some(t) = track.and_then(|id| p.track(id)) else {
             return Self::default();
         };
@@ -459,7 +710,7 @@ impl Roll {
                 .iter()
                 .filter_map(|c| {
                     let s = p.session(c.source_session?)?;
-                    let mut ns = cleanup::import_session(s, &p.tempo, false).notes;
+                    let mut ns = cleanup::import_session(s, &p.tempo, true).notes;
                     cleanup::shift(&mut ns, c.start as i64);
                     Some(ns)
                 })
@@ -469,7 +720,17 @@ impl Roll {
             Vec::new()
         };
 
-        let pitches = notes.iter().chain(&raw).map(|n| n.pitch);
+        let live: Vec<Note> = live
+            .map(|s| {
+                let imp = cleanup::import_session(s, &p.tempo, true);
+                let shift = s.start_tick as i64 - (imp.pickup_bars as u64 * s.meter.ticks_per_bar()) as i64;
+                let mut ns = imp.notes;
+                cleanup::shift(&mut ns, shift);
+                ns
+            })
+            .unwrap_or_default();
+
+        let pitches = notes.iter().chain(&raw).chain(&live).map(|n| n.pitch);
         let (lo, hi) = pitches.fold((127u8, 0u8), |(lo, hi), p| (lo.min(p), hi.max(p)));
         let (lo, hi) = if lo > hi { (48, 72) } else { (lo.saturating_sub(3), (hi + 3).min(127)) };
         // At least two octaves, centred on what's there.
@@ -477,7 +738,8 @@ impl Roll {
         let (lo, hi) = (lo.saturating_sub(pad), (hi + pad).min(127));
 
         let px = zoom / PPQ as f64;
-        let end = p.end_tick().max(PPQ as Tick * 16) + PPQ as Tick * 4;
+        let live_end = live.iter().map(|n| n.end()).max().unwrap_or(0);
+        let end = p.end_tick().max(live_end).max(PPQ as Tick * 16) + PPQ as Tick * 4;
         // Keys carry the geometry: keyed rows that match are not rebuilt,
         // so a note that moves must get a new key.
         let place = |n: &Note, tag: &str| {
@@ -526,6 +788,7 @@ impl Roll {
             bars,
             notes: notes.iter().map(|n| place(n, "n")).collect(),
             raw: raw.iter().map(|n| place(n, "r")).collect(),
+            live: live.iter().map(|n| place(n, "l")).collect(),
         }
     }
 }

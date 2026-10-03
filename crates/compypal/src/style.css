@@ -22,6 +22,7 @@
 }
 .project-name { font-weight: 600; font-size: 14px; margin-right: 12px; }
 .readout {
+    white-space: nowrap;
     font-family: var(--rinch-font-family-monospace);
     color: var(--rinch-color-dimmed);
     font-size: 12px;
@@ -224,3 +225,17 @@
 .key-label { cursor: pointer; }
 .statusbar { display: flex; justify-content: space-between; }
 .audio-status { color: var(--rinch-color-dimmed); }
+
+.note.live { background: var(--rinch-color-red-5); border-color: var(--rinch-color-red-8); }
+.session-head { display: flex; justify-content: space-between; align-items: center; }
+.port-row {
+    padding: 5px 12px;
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+    border-left: 3px solid transparent;
+    cursor: pointer;
+}
+.port-row:hover { background: var(--rinch-color-dark-6); }
+.port-row.selected { color: var(--rinch-color-text); border-left-color: var(--rinch-color-green-5); }
+
+.heading-row { display: flex; justify-content: space-between; align-items: center; padding-top: 10px; }

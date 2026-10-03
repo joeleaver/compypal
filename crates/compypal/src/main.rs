@@ -1,5 +1,6 @@
 //! compypal: a MIDI composer and arranger built to work alongside an agent.
 
+mod autosave;
 mod store;
 
 use std::rc::Rc;
@@ -57,6 +58,26 @@ fn session_rows(p: &Project) -> Vec<SessionRow> {
         .collect()
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct PortRow {
+    index: usize,
+    name: String,
+}
+
+fn port_rows() -> Vec<PortRow> {
+    compypal_audio::input::ports().into_iter().enumerate().map(|(index, name)| PortRow { index, name }).collect()
+}
+
+/// "KeyLab mkII 49:KeyLab mkII 49 MIDI 32:0" reads better as
+/// "KeyLab mkII 49 MIDI": ALSA names are "client:port id:id".
+fn short_port_name(name: &str) -> String {
+    let port = name.split_once(':').map_or(name, |(_, p)| p);
+    match port.rsplit_once(' ') {
+        Some((p, ids)) if ids.contains(':') => p.to_string(),
+        _ => port.to_string(),
+    }
+}
+
 #[component]
 fn Transport() -> NodeHandle {
     let store = use_store::<Store>();
@@ -77,6 +98,13 @@ fn Transport() -> NodeHandle {
                 {|| if store.is_playing() { "■ Stop" } else { "▶ Play" }}
             }
             Button { size: "xs",
+                color: "red",
+                variant: {|| if store.is_recording() { "filled" } else { "light" }},
+                disabled: store.engine.is_none() || store.midi.is_none(),
+                onclick: move || if store.is_recording() { store.stop_recording() } else { store.record() },
+                {|| if store.is_recording() { "■ Stop rec" } else { "● Rec" }}
+            }
+            Button { size: "xs",
                 variant: {|| if store.looping.get() { "filled" } else { "default" }},
                 onclick: move || store.toggle_looping(),
                 "Loop"
@@ -88,7 +116,7 @@ fn Transport() -> NodeHandle {
             }
             span { class: "readout position",
                 {|| {
-                    let tick = match store.playhead.get() {
+                    let tick = match store.song_seconds() {
                         Some(secs) => store.project.with(|p| p.tempo.seconds_to_tick(secs).max(0.0) as u64),
                         None => store.cursor.get(),
                     };
@@ -124,6 +152,7 @@ fn Transport() -> NodeHandle {
             Button { size: "xs", variant: "default", onclick: move || store.zoom.update(|z| *z = (*z / 1.5).max(8.0)), "−" }
             Button { size: "xs", variant: "default", onclick: move || store.zoom.update(|z| *z = (*z * 1.5).min(400.0)), "+" }
             div { class: "divider" }
+            Button { size: "xs", variant: "default", onclick: move || store.new_project(), "New" }
             Button { size: "xs", variant: "light", onclick: move || store.export_midi(), "Export MIDI" }
             Button { size: "xs", variant: "light", onclick: move || store.export_abc(), "Export ABC" }
         }
@@ -135,7 +164,10 @@ fn Sidebar() -> NodeHandle {
     let store = use_store::<Store>();
     rsx! {
         div { class: "sidebar",
-            div { class: "sidebar-heading", "Tracks" }
+            div { class: "sidebar-heading heading-row",
+                span { "Tracks" }
+                Button { size: "xs", variant: "subtle", onclick: move || store.add_track(), "+ Track" }
+            }
             for t in store.project.with(track_rows) {
                 div {
                     key: t.id.0,
@@ -145,10 +177,7 @@ fn Sidebar() -> NodeHandle {
                     },
                     onclick: {
                         let id = t.id;
-                        move || {
-                            store.close_editor();
-                            store.selected_track.set(Some(id));
-                        }
+                        move || store.select_track(id)
                     },
                     div { class: "track-name", {t.name.clone()} }
                     div { class: "track-detail",
@@ -159,12 +188,36 @@ fn Sidebar() -> NodeHandle {
             div { class: "sidebar-heading", "Sessions" }
             for s in store.project.with(session_rows) {
                 div { key: s.id.0, class: "session-row",
-                    div { class: "track-name", {s.name.clone()} }
+                    div { class: "session-head",
+                        div { class: "track-name", {s.name.clone()} }
+                        Button { size: "xs", variant: "subtle",
+                            onclick: {
+                                let id = s.id;
+                                move || store.tidy_session(id)
+                            },
+                            "Tidy"
+                        }
+                    }
                     div { class: "track-detail", {s.detail.clone()} }
                 }
             }
             if store.project.with(|p| p.sessions.is_empty()) {
                 div { class: "empty", "No recordings yet" }
+            }
+            div { class: "sidebar-heading", "MIDI input" }
+            for port in port_rows() {
+                div {
+                    key: port.index,
+                    class: {
+                        let i = port.index;
+                        move || if store.midi_port_index() == Some(i) { "port-row selected" } else { "port-row" }
+                    },
+                    onclick: {
+                        let i = port.index;
+                        move || store.toggle_port(i)
+                    },
+                    {short_port_name(&port.name)}
+                }
             }
         }
     }
@@ -235,13 +288,19 @@ fn PianoRoll() -> NodeHandle {
                     }
                     div {
                         class: "playhead",
-                        style: {|| match store.playhead.get() {
+                        style: {|| match store.song_seconds() {
                             Some(secs) => {
                                 let tick = store.project.with(|p| p.tempo.seconds_to_tick(secs));
                                 format!("left: {}px;", tick * store.zoom.get() / compypal_core::PPQ as f64 + KEYS)
                             }
                             None => "display: none;".into(),
                         }},
+                    }
+                    for n in roll.get().live {
+                        div { key: n.key.clone(), class: "note live",
+                            style: {format!("left: {}px; top: {}px; width: {}px; height: {}px;",
+                                n.left + KEYS, n.top + 1.0, n.width, ROW - 2.0)},
+                        }
                     }
                     for n in roll.get().raw {
                         div { key: n.key.clone(), class: "note raw",
@@ -381,12 +440,34 @@ fn app() -> NodeHandle {
             None
         }
     };
-    let store = create_store(Store::new(compypal_core::demo::project(), engine));
+    let midi: &'static compypal_audio::input::MidiIn =
+        Box::leak(Box::new(compypal_audio::input::MidiIn::new(engine)));
+    match compypal_audio::input::default_port() {
+        Some(port) => match midi.connect(&port) {
+            Ok(()) => eprintln!("MIDI input: {port}"),
+            Err(e) => eprintln!("MIDI input: {e}"),
+        },
+        None => eprintln!("MIDI input: none found"),
+    }
+    let project = autosave::load().unwrap_or_else(compypal_core::demo::project);
+    let store = create_store(Store::new(project, engine, Some(midi)));
+    store.select_track(store.selected_track.get().unwrap_or_default());
+
+    // Every change is saved, so a take is never lost to a crash or a quit.
+    rinch::core::Effect::new(move || {
+        store.project.with(|p| {
+            if let Err(e) = autosave::save(p) {
+                eprintln!("autosave failed: {e}");
+            }
+        });
+    });
 
     // Edits while playing are heard on the next pass, without stopping.
     rinch::core::Effect::new(move || {
         let schedule = store.schedule();
-        if let (Some(e), true) = (store.engine, untracked(|| store.playhead.get()).is_some()) {
+        let playing = untracked(|| store.playhead.get()).is_some();
+        // A take has its own schedule (count-in, open end); leave it be.
+        if let (Some(e), true, false) = (store.engine, playing, untracked(|| store.is_recording())) {
             e.update(schedule);
         }
     });
@@ -394,9 +475,11 @@ fn app() -> NodeHandle {
     // The audio thread can't touch signals; poll it from a plain thread and
     // send() the results across.
     if let Some(engine) = engine {
-        let (playhead, audio_status) = (store.playhead, store.audio_status);
+        let (playhead, audio_status, live_take) = (store.playhead, store.audio_status, store.live_take);
+        let capture = midi.capture();
         std::thread::spawn(move || {
             let mut last = (None, String::new());
+            let mut last_take = 0;
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(33));
                 let now = (engine.position(), engine.status());
@@ -407,6 +490,14 @@ fn app() -> NodeHandle {
                     audio_status.send(now.1.clone());
                 }
                 last = now;
+                if let Some(events) = capture.snapshot()
+                    && events.len() != last_take
+                {
+                    last_take = events.len();
+                    live_take.send(events);
+                } else if capture.elapsed().is_none() {
+                    last_take = 0;
+                }
             }
         });
     }
@@ -414,6 +505,7 @@ fn app() -> NodeHandle {
     // Space plays and stops, unless someone is typing.
     rinch::core::set_keyboard_interceptor(move |k| {
         if k.is_space() && k.is_down() && store.editing.get().is_none() {
+            // Space ends a take too: the same key that starts things stops them.
             store.toggle_play();
             return true;
         }

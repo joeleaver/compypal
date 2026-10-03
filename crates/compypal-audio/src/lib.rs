@@ -5,6 +5,7 @@
 //! It plays through [`synth::BasicSynth`] until a General MIDI SoundFont has
 //! loaded in the background, then switches over.
 
+pub mod input;
 pub mod player;
 pub mod schedule;
 pub mod synth;

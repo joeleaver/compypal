@@ -21,6 +21,10 @@ pub struct Session {
     /// Seconds from the start of the take to the first downbeat of the
     /// click. Zero when there was no count-in.
     pub downbeat_offset: f64,
+    /// The project tick that first downbeat landed on: where recording
+    /// started on the timeline.
+    #[serde(default)]
+    pub start_tick: crate::model::Tick,
     pub events: Vec<RawEvent>,
 }
 
@@ -175,6 +179,7 @@ mod tests {
             click_bpm: Some(120.0),
             meter: MeterChange { tick: 0, numerator: 4, denominator: 4 },
             downbeat_offset: 0.0,
+            start_tick: 0,
             events,
         }
     }

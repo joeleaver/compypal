@@ -19,17 +19,19 @@ pub struct Imported {
 }
 
 /// Places a session's notes on the timeline: `downbeat_offset` seconds into
-/// the take becomes tick 0, and the rest follows `tempo`. With `sounding`
-/// set, durations include the sustain pedal.
+/// the take lands on `start_tick`, and the rest follows `tempo`. Ticks come
+/// back relative to `start_tick` (plus any pickup bars), ready to be a
+/// clip's notes. With `sounding` set, durations include the sustain pedal.
 pub fn import_session(session: &Session, tempo: &TempoMap, sounding: bool) -> Imported {
     let raw = session.notes();
+    let origin_secs = tempo.tick_to_seconds(session.start_tick as f64);
+    let origin = session.start_tick as f64;
+    let at = |t: f64| tempo.seconds_to_tick(origin_secs + t - session.downbeat_offset) - origin;
     let ticks: Vec<(f64, f64, u8, u8)> = raw
         .iter()
         .map(|n| {
-            let start = tempo.seconds_to_tick(n.start - session.downbeat_offset);
             let len = if sounding { n.sounding } else { n.held };
-            let end = tempo.seconds_to_tick(n.start + len - session.downbeat_offset);
-            (start, end, n.pitch, n.velocity)
+            (at(n.start), at(n.start + len), n.pitch, n.velocity)
         })
         .collect();
 
@@ -52,6 +54,31 @@ pub fn import_session(session: &Session, tempo: &TempoMap, sounding: bool) -> Im
 
 pub fn sort(notes: &mut [Note]) {
     notes.sort_by_key(|n| (n.start, n.pitch));
+}
+
+/// What [`tidy`] did, for reporting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct TidyReport {
+    pub ghosts_removed: usize,
+    pub slips_removed: usize,
+    pub double_strikes_merged: usize,
+    pub quantized: usize,
+    pub overlaps_fixed: usize,
+}
+
+/// A conservative first pass over a fresh take: drop ghost and grazed
+/// notes, merge double strikes, pull timing most of the way to a sixteenth
+/// grid while leaving deliberate pushes alone, and untangle overlaps. Meant
+/// as a starting point; an agent or the player refines from there.
+pub fn tidy(notes: &mut Vec<Note>) -> TidyReport {
+    let q = PPQ as Tick;
+    TidyReport {
+        ghosts_removed: remove_quiet(notes, 20),
+        slips_removed: remove_short(notes, q / 32),
+        double_strikes_merged: merge_double_strikes(notes, q / 16),
+        quantized: quantize(notes, &Quantize { strength: 0.8, window: 0.5, ends: false, ..Quantize::new(q / 4) }),
+        overlaps_fixed: fix_overlaps(notes),
+    }
 }
 
 /// Grid sizes by name, for tools and UI. Triplet grids end in `t`.
@@ -345,6 +372,7 @@ mod tests {
             click_bpm: Some(120.0),
             meter: MeterChange { tick: 0, numerator: 4, denominator: 4 },
             downbeat_offset: 2.0,
+            start_tick: 0,
             events: vec![
                 // A beat before the downbeat.
                 RawEvent { t: 1.5, channel: 0, msg: RawMsg::NoteOn { pitch: 60, velocity: 90 } },
@@ -354,6 +382,27 @@ mod tests {
         let imp = import_session(&s, &TempoMap::constant(120.0), false);
         assert_eq!(imp.pickup_bars, 1);
         assert_eq!(imp.notes, vec![Note { pitch: 60, velocity: 90, start: 2880, duration: 960 }]);
+    }
+
+    #[test]
+    fn import_from_later_in_the_song() {
+        // Recording from bar 3 (tick 7680) at 120 BPM, with a 2s count-in:
+        // a note 2.5s into the take is a beat after the downbeat.
+        let s = Session {
+            id: Id(1),
+            name: "t".into(),
+            recorded_at: 0,
+            click_bpm: Some(120.0),
+            meter: MeterChange { tick: 0, numerator: 4, denominator: 4 },
+            downbeat_offset: 2.0,
+            start_tick: 7680,
+            events: vec![
+                RawEvent { t: 2.5, channel: 0, msg: RawMsg::NoteOn { pitch: 60, velocity: 90 } },
+                RawEvent { t: 3.0, channel: 0, msg: RawMsg::NoteOff { pitch: 60 } },
+            ],
+        };
+        let imp = import_session(&s, &TempoMap::constant(120.0), false);
+        assert_eq!(imp.notes, vec![Note { pitch: 60, velocity: 90, start: 960, duration: 960 }]);
     }
 
     #[test]

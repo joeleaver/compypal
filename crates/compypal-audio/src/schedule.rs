@@ -31,6 +31,9 @@ pub struct Schedule {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScheduleOptions {
     pub metronome: bool,
+    /// Keep going (clicking, if the metronome is on) to at least here,
+    /// past the last note: room to record into.
+    pub until: Tick,
 }
 
 /// GM percussion: high and low wood block for the click.
@@ -56,7 +59,7 @@ pub fn build(project: &Project, opts: ScheduleOptions) -> Schedule {
     }
 
     // Round the end up to a whole bar, so a loop comes round in time.
-    let end = project.end_tick();
+    let end = project.end_tick().max(opts.until);
     let mut bar_end = 0;
     while bar_end < end.max(1) {
         bar_end += project.meter_at(bar_end).ticks_per_bar();
@@ -79,6 +82,28 @@ pub fn build(project: &Project, opts: ScheduleOptions) -> Schedule {
 
     sort(&mut events);
     Schedule { events, length: secs(bar_end) }
+}
+
+/// What plays while recording from `from` seconds: `beats` count-in clicks
+/// of `beat` seconds each, then the song from that point. Time zero is the
+/// first count-in click; the song's `from` lands at `beats * beat`.
+pub fn with_count_in(song: &Schedule, from: f64, beats: u8, beat: f64) -> Schedule {
+    let lead = beats as f64 * beat;
+    let mut events: Vec<Timed> = song
+        .events
+        .iter()
+        .filter(|e| !e.is_note() && e.t <= from)
+        .map(|e| Timed { t: 0.0, ..*e })
+        .collect();
+    for i in 0..beats {
+        let (key, vel) = if i == 0 { (CLICK_ACCENT, 110) } else { (CLICK, 80) };
+        let t = i as f64 * beat;
+        events.push(Timed { t, msg: [0x90 | DRUM_CHANNEL, key, vel] });
+        events.push(Timed { t: t + 0.05, msg: [0x80 | DRUM_CHANNEL, key, 0] });
+    }
+    events.extend(song.events.iter().filter(|e| e.t >= from).map(|e| Timed { t: e.t - from + lead, ..*e }));
+    sort(&mut events);
+    Schedule { events, length: (song.length - from).max(0.0) + lead }
 }
 
 /// A one-off phrase to hear right now: notes for one instrument, starting
@@ -131,10 +156,23 @@ mod tests {
     }
 
     #[test]
+    fn count_in_then_the_song_from_the_cursor() {
+        let p = demo::project();
+        let song = build(&p, ScheduleOptions::default());
+        // From bar 3 (4.8s at 100 BPM), four 0.6s beats of count-in.
+        let rec = with_count_in(&song, 4.8, 4, 0.6);
+        assert!((rec.length - (9.6 - 4.8 + 2.4)).abs() < 1e-9);
+        let first_note = rec.events.iter().find(|e| e.is_note_on() && e.msg[0] & 0x0f != DRUM_CHANNEL).unwrap();
+        assert!((first_note.t - 2.4).abs() < 0.05, "{first_note:?}");
+        let clicks = rec.events.iter().filter(|e| e.is_note_on() && e.t < 2.4 && e.msg[0] & 0x0f == DRUM_CHANNEL).count();
+        assert_eq!(clicks, 4);
+    }
+
+    #[test]
     fn mute_solo_and_metronome() {
         let mut p = demo::project();
         p.tracks[1].solo = true;
-        let s = build(&p, ScheduleOptions { metronome: true });
+        let s = build(&p, ScheduleOptions { metronome: true, ..Default::default() });
         let channels: std::collections::BTreeSet<u8> =
             s.events.iter().filter(|e| e.is_note_on()).map(|e| e.msg[0] & 0x0f).collect();
         // The soloed bass, plus the click on the drum channel.

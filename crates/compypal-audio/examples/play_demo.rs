@@ -13,7 +13,7 @@ fn main() {
     }
     println!("{} after {:?}", engine.status(), t.elapsed());
     let p = compypal_core::demo::project();
-    engine.play(schedule::build(&p, ScheduleOptions { metronome: true }), 0.0, false);
+    engine.play(schedule::build(&p, ScheduleOptions { metronome: true, ..Default::default() }), 0.0, false);
     for _ in 0..5 {
         std::thread::sleep(Duration::from_millis(500));
         println!("position {:?}", engine.position());
