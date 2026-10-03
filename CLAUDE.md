@@ -44,6 +44,12 @@ It has a chord and a shape (block, arpeggio, run, melody, note, mixed).
   the MCP tools should use too.
 - The lane above the piano roll is the UI: click a figure, type a chord
   or numeral, Tab moves on, and "+" appends.
+- Song harmony: `figure::harmony` reads chords from every pitched track
+  together; `figure::set_harmony` re-voices all of them in a span from that
+  song chord (so the bass's role is judged against the band, not alone).
+  The "All tracks" view stacks every roll under a song chord lane that uses
+  it; the agent has `get_harmony`/`set_harmony` (one chord, or a list for a
+  section: `["vi","IV","I","V"]`).
 
 ## Audio
 

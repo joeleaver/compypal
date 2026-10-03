@@ -25,6 +25,8 @@ pub enum View {
 pub enum Slot {
     Figure(usize),
     Append,
+    /// A chord in the song lane: changing it re-voices every track.
+    Song(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -80,6 +82,10 @@ pub struct Store {
     pub instrument_draft: Signal<String>,
     /// The section-name popover is open.
     pub section_edit: Signal<bool>,
+    /// Show every track's piano roll at once, under the song's chords.
+    pub stacked: Signal<bool>,
+    /// The song's chords, from all pitched tracks together.
+    pub harmony: Memo<Vec<Figure>>,
 }
 
 /// A take in progress.
@@ -117,6 +123,7 @@ impl Store {
         let first = project.tracks.first().map(|t| t.id);
         let project = Signal::new(project);
         let selected_track = Signal::new(first);
+        let harmony = Memo::new(move || project.with(|p| figure::harmony(p, &FigureSettings::default())));
         let figures = Memo::new(move || {
             let track = selected_track.get();
             project.with(|p| {
@@ -159,6 +166,8 @@ impl Store {
             instrument_edit: Signal::new(None),
             instrument_draft: Signal::new(String::new()),
             section_edit: Signal::new(false),
+            stacked: Signal::new(false),
+            harmony,
         }
     }
 
@@ -527,17 +536,40 @@ impl Store {
         }
     }
 
+    /// Plays ticks `from..to` of the song, every track.
+    pub fn audition_span(self, from: Tick, to: Tick) {
+        let p = self.project.get();
+        self.audition_project(&p, from, to);
+    }
+
+    fn audition_project(self, p: &Project, from: Tick, to: Tick) {
+        let Some(engine) = self.engine else { return };
+        let song = schedule::build(p, ScheduleOptions::default());
+        let (a, b) = (p.tempo.tick_to_seconds(from as f64), p.tempo.tick_to_seconds(to as f64));
+        engine.audition(schedule::excerpt(&song, a, b));
+    }
+
     /// Plays what the editor's slot would sound like with `chord`.
     fn preview(self, chord: &Chord) {
         let Some(track) = self.selected_track.get() else { return };
         let figures = self.figures.get();
         let slot = self.editing.get();
+        if let Some(Slot::Song(i)) = slot {
+            let song = self.harmony.get();
+            let Some(f) = song.get(i) else { return };
+            let (from, to) = (f.start, song.get(i + 1).map_or(f.end, |n| n.start));
+            let mut p = self.project.get();
+            figure::set_harmony(&mut p, from, to, chord);
+            self.audition_project(&p, from, to);
+            return;
+        }
         let notes = self.project.with(|p| match slot? {
             Slot::Figure(i) => {
                 let f = figures.get(i)?;
                 Some(figure::revoice(&f.notes, &f.chord, chord, p.key))
             }
             Slot::Append if !figures.is_empty() => Some(figure::continued(&figures, figures.len() - 1, chord, p).2),
+            Slot::Song(_) => None,
             Slot::Append => Some(
                 chord.voicing(55).into_iter().map(|pitch| Note { pitch, velocity: 90, start: 0, duration: PPQ as Tick * 2 }).collect(),
             ),
@@ -563,6 +595,17 @@ impl Store {
         self.editing.set(Some(slot));
         self.draft.set(String::new());
         self.highlight.set(0);
+        if let Slot::Song(i) = slot {
+            let song = self.harmony.get();
+            if let Some(f) = song.get(i) {
+                let (from, to) = (f.start, song.get(i + 1).map_or(f.end, |n| n.start));
+                self.audition_span(from, to);
+                let section = self.project.with(|p| {
+                    p.sections.iter().find(|s| s.start <= from && from < s.start + s.length).map(|s| s.name.clone())
+                });
+                self.selection.set(Some(compypal_mcp::Selection { track: None, start: from, end: to, figure: None, section }));
+            }
+        }
         if let (Slot::Figure(i), Some(track)) = (slot, self.selected_track.get())
             && let Some(f) = self.figures.get().get(i)
         {
@@ -585,6 +628,12 @@ impl Store {
         let context: Vec<Chord> = match self.editing.get() {
             Some(Slot::Figure(i)) => self
                 .figures
+                .get()
+                .get(i)
+                .map(|f| std::iter::once(f.chord).chain(f.alternatives.iter().copied()).collect())
+                .unwrap_or_default(),
+            Some(Slot::Song(i)) => self
+                .harmony
                 .get()
                 .get(i)
                 .map(|f| std::iter::once(f.chord).chain(f.alternatives.iter().copied()).collect())
@@ -619,6 +668,15 @@ impl Store {
         let figures = self.figures.get();
         let next = match slot {
             Slot::Figure(i) if i + 1 < figures.len() => Slot::Figure(i + 1),
+            Slot::Song(i) if i + 1 < self.harmony.get().len() => Slot::Song(i + 1),
+            Slot::Song(_) => {
+                // The end of the song lane: nothing further to type into.
+                if let Some(chord) = chord {
+                    self.apply_chord(track, slot, &chord, &figures);
+                }
+                self.close_editor();
+                return;
+            }
             _ => Slot::Append,
         };
         match chord {
@@ -635,7 +693,22 @@ impl Store {
     fn apply_chord(self, track: Id, slot: Slot, chord: &Chord, figures: &[Figure]) {
         let s = FigureSettings::default();
         let label = self.chord_label(chord);
+        if let Slot::Song(i) = slot {
+            let song = self.harmony.get();
+            let Some(f) = song.get(i) else { return };
+            if f.chord == *chord {
+                return;
+            }
+            let (from, to) = (f.start, song.get(i + 1).map_or(f.end, |n| n.start));
+            let mut moved = 0;
+            self.edit(&format!("harmony {label}"), |p| moved = figure::set_harmony(p, from, to, chord));
+            self.audition_span(from, to);
+            self.status.set(format!("{label} across {moved} track(s)"));
+            return;
+        }
         let result = match slot {
+            // Handled above.
+            Slot::Song(_) => return,
             Slot::Figure(i) if figures.get(i).is_some_and(|f| f.chord == *chord) => return,
             Slot::Figure(i) => {
                 let mut r = Ok(());
@@ -662,7 +735,7 @@ impl Store {
             let figures = self.figures.get();
             let written = match slot {
                 Slot::Figure(i) => figures.get(i),
-                Slot::Append => figures.last(),
+                _ => figures.last(),
             };
             if let Some(f) = written {
                 self.audition(track, &f.notes);
@@ -670,8 +743,8 @@ impl Store {
         }
         self.status.set(match result {
             Ok(()) => match slot {
-                Slot::Figure(_) => format!("Re-voiced to {label}"),
                 Slot::Append => format!("Continued with {label}"),
+                _ => format!("Re-voiced to {label}"),
             },
             Err(e) => e.to_string(),
         });
@@ -766,9 +839,78 @@ impl Store {
         let editor_left = match self.editing.get() {
             Some(Slot::Figure(i)) => items.get(i).map(|l| l.left),
             Some(Slot::Append) => Some(append_left),
-            None => None,
+            Some(Slot::Song(_)) | None => None,
         };
         Lane { items, append_left, editor_left }
+    }
+
+    /// The song chord lane, in the roll's coordinates.
+    pub fn song_lane(self) -> Lane {
+        let px = self.zoom.get() / PPQ as f64;
+        let figures = self.harmony.get();
+        let items: Vec<LaneItem> = figures
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let until = figures.get(i + 1).map_or(f.end, |n| n.start);
+                let (left, width) = (f.start as f64 * px, ((until - f.start) as f64 * px).max(24.0));
+                let label = self.chord_label(&f.chord);
+                LaneItem {
+                    key: format!("s{i}:{left}:{width}:{label}"),
+                    index: i,
+                    left,
+                    width,
+                    label,
+                    kind: "",
+                    unsure: f.confidence < 0.6,
+                }
+            })
+            .collect();
+        let editor_left = match self.editing.get() {
+            Some(Slot::Song(i)) => items.get(i).map(|l| l.left),
+            _ => None,
+        };
+        Lane { items, append_left: 0.0, editor_left }
+    }
+
+    /// Every track's notes, stacked, in the roll's coordinates.
+    pub fn stack(self) -> Vec<StackRow> {
+        let px = self.zoom.get() / PPQ as f64;
+        let selected = self.selected_track.get();
+        self.project.with(|p| {
+            p.tracks
+                .iter()
+                .map(|t| {
+                    let notes = t.absolute_notes();
+                    let (lo, hi) = notes.iter().fold((127u8, 0u8), |(lo, hi), n| (lo.min(n.pitch), hi.max(n.pitch)));
+                    let (lo, hi) = if lo > hi { (60, 67) } else { (lo.saturating_sub(1), (hi + 1).min(127)) };
+                    let (lo, hi) = if hi - lo < 8 { (lo.saturating_sub((8 - (hi - lo)) / 2), hi.max(lo + 8)) } else { (lo, hi) };
+                    let instrument = if t.is_drums() { "Drums".to_string() } else { compypal_core::gm::program_name(t.program).to_string() };
+                    StackRow {
+                        key: format!("{}:{}:{instrument}:{}:{}:{lo}:{hi}:{px}", t.id, t.name, notes.len(), selected == Some(t.id)),
+                        track: t.id,
+                        name: t.name.clone(),
+                        instrument,
+                        height: (hi - lo + 1) as f64 * STACK_ROW,
+                        notes: notes
+                            .iter()
+                            .map(|n| {
+                                let (left, top, width) =
+                                    (n.start as f64 * px, (hi - n.pitch) as f64 * STACK_ROW, (n.duration as f64 * px).max(2.0));
+                                RollNote { key: format!("{left}:{top}:{width}:{}", n.velocity), left, top, width, velocity: n.velocity }
+                            })
+                            .collect(),
+                        c_lines: (lo..=hi).filter(|p| p % 12 == 0).map(|p| (hi - p) as f64 * STACK_ROW).collect(),
+                    }
+                })
+                .collect()
+        })
+    }
+
+    /// Sections in the roll's coordinates.
+    pub fn roll_sections(self) -> Vec<ArrSection> {
+        let px = self.zoom.get() / PPQ as f64;
+        self.project.with(|p| Arrangement::build(p, px).sections)
     }
 
     /// The piano roll's contents for the selected track.
@@ -952,6 +1094,19 @@ impl Roll {
 }
 
 pub const ARR_ROW: f64 = 44.0;
+pub const STACK_ROW: f64 = 5.0;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StackRow {
+    pub key: String,
+    pub track: Id,
+    pub name: String,
+    pub instrument: String,
+    pub height: f64,
+    pub notes: Vec<RollNote>,
+    /// Where each C sits, for orientation.
+    pub c_lines: Vec<f64>,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArrNote {

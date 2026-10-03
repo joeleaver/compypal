@@ -21,6 +21,8 @@ Early. Working today:
 - A piano roll that overlays the original take on the cleaned notes
 
 - Chord lane: figures (arpeggios, runs, stabs) labelled with chords; retype a chord to re-voice, or continue a shape onto new chords
+- All-tracks view: every piano roll stacked under the song's chords; change a chord there and every part follows
+- Arranger: sections and clips across tracks; duplicate, insert or delete bars song-wide
 - Playback through a General MIDI SoundFont, metronome, looping
 - Recording from a MIDI controller into raw sessions, with live display
 - Claude Code integration: MCP tools for reading, cleaning, composing and arranging, and `/ide` for sharing what you've selected

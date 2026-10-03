@@ -106,6 +106,25 @@ pub fn with_count_in(song: &Schedule, from: f64, beats: u8, beat: f64) -> Schedu
     Schedule { events, length: (song.length - from).max(0.0) + lead }
 }
 
+/// `from..to` seconds of a schedule, moved to start at zero, with the
+/// channel setup from before it. For hearing one passage of the song.
+pub fn excerpt(song: &Schedule, from: f64, to: f64) -> Schedule {
+    let mut events: Vec<Timed> =
+        song.events.iter().filter(|e| !e.is_note() && e.t <= from).map(|e| Timed { t: 0.0, ..*e }).collect();
+    events.extend(song.events.iter().filter(|e| e.is_note_on() && e.t >= from && e.t < to).map(|e| Timed { t: e.t - from, ..*e }));
+    // Every note started here ends, at its own end or the excerpt's.
+    for on in song.events.iter().filter(|e| e.is_note_on() && e.t >= from && e.t < to) {
+        let off = song
+            .events
+            .iter()
+            .find(|e| e.t >= on.t && e.is_note() && !e.is_note_on() && e.msg[0] & 0x0f == on.msg[0] & 0x0f && e.msg[1] == on.msg[1])
+            .map_or(to, |e| e.t.min(to));
+        events.push(Timed { t: off - from, msg: [0x80 | (on.msg[0] & 0x0f), on.msg[1], 0] });
+    }
+    sort(&mut events);
+    Schedule { events, length: to - from }
+}
+
 /// A one-off phrase to hear right now: notes for one instrument, starting
 /// at zero.
 pub fn audition(notes: &[Note], channel: u8, program: u8, project: &Project) -> Schedule {

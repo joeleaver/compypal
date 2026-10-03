@@ -333,8 +333,20 @@ fn PianoRoll() -> NodeHandle {
     rsx! {
         div { class: "editor",
             div { class: "view-toolbar",
+                Button { size: "xs",
+                    variant: {|| if store.stacked.get() { "filled" } else { "default" }},
+                    onclick: move || {
+                        store.close_editor();
+                        store.stacked.update(|v| *v = !*v);
+                    },
+                    "All tracks"
+                }
                 span { class: "view-title",
-                    {|| store.selected_track.get().and_then(|id| store.project.with(|p| p.track(id).map(|t| t.name.clone()))).unwrap_or_default()}
+                    {|| if store.stacked.get() {
+                        "Every track, under the song's chords".to_string()
+                    } else {
+                        store.selected_track.get().and_then(|id| store.project.with(|p| p.track(id).map(|t| t.name.clone()))).unwrap_or_default()
+                    }}
                 }
                 Button { size: "xs", variant: "light",
                     onclick: move || store.quantize_selected(grid_ticks("1/16").unwrap()),
@@ -353,9 +365,113 @@ fn PianoRoll() -> NodeHandle {
                 Button { size: "xs", variant: "default", onclick: move || store.zoom.update(|z| *z = (*z / 1.5).max(8.0)), "−" }
                 Button { size: "xs", variant: "default", onclick: move || store.zoom.update(|z| *z = (*z * 1.5).min(400.0)), "+" }
             }
-            {root}
+            if store.stacked.get() {
+                StackedRolls {}
+            } else {
+                {root.clone()}
+            }
         }
     }
+}
+
+/// Every track's piano roll stacked under one chord lane for the song.
+/// Changing a chord there re-voices all the parts at once.
+#[component]
+fn StackedRolls() -> NodeHandle {
+    let store = use_store::<Store>();
+    let song = Memo::new(move || store.song_lane());
+    let stack = Memo::new(move || store.stack());
+    let roll = Memo::new(move || store.roll());
+    let root = rsx! {
+        div { class: "roll-scroll stacked",
+            div { class: "roll", style: {|| format!("width: {}px;", roll.get().width + KEYS)},
+                for b in roll.get().bars {
+                    div { key: b.key.clone(), class: "bar-line", style: {format!("left: {}px;", b.left + KEYS)} }
+                }
+                div { class: "lane song-lane",
+                    div { class: "lane-label", "Song" }
+                    for item in song.get().items {
+                        div {
+                            key: item.key.clone(),
+                            class: {
+                                let i = item.index;
+                                let unsure = item.unsure;
+                                move || {
+                                    let mut c = String::from("figure");
+                                    if store.editing.get() == Some(Slot::Song(i)) { c.push_str(" editing"); }
+                                    if unsure { c.push_str(" unsure"); }
+                                    c
+                                }
+                            },
+                            style: {format!("left: {}px; width: {}px;", item.left + KEYS, item.width - 2.0)},
+                            onclick: {
+                                let i = item.index;
+                                move || store.open_editor(Slot::Song(i))
+                            },
+                            span { class: "figure-chord", {item.label.clone()} }
+                            span { class: "figure-kind", "all tracks" }
+                        }
+                    }
+                    if store.editing.get().is_some_and(|s| matches!(s, Slot::Song(_))) {
+                        ChordEditor {}
+                    }
+                }
+                div { class: "stack-sections",
+                    div { class: "lane-label", "Sections" }
+                    for sec in store.roll_sections() {
+                        div {
+                            key: sec.key.clone(),
+                            class: "arr-section",
+                            style: {format!("left: {}px; width: {}px;", sec.left + KEYS, sec.width - 2.0)},
+                            onclick: {
+                                let (a, b) = (sec.first, sec.last);
+                                move || store.select_bars(a, b)
+                            },
+                            {sec.name.clone()}
+                        }
+                    }
+                }
+                for row in stack.get() {
+                    div { key: row.key.clone(), class: "stack-track",
+                        div {
+                            class: {
+                                let id = row.track;
+                                move || if store.selected_track.get() == Some(id) { "stack-head selected" } else { "stack-head" }
+                            },
+                            onclick: {
+                                let id = row.track;
+                                move || store.select_track(id)
+                            },
+                            {format!("{}  ·  {}", row.name, row.instrument)}
+                        }
+                        div { class: "stack-roll", style: {format!("height: {}px;", row.height)},
+                            for y in row.c_lines.clone() {
+                                div { key: y.to_string(), class: "stack-c", style: {format!("top: {y}px;")} }
+                            }
+                            for n in row.notes.clone() {
+                                div { key: n.key.clone(), class: "note stack-note",
+                                    style: {format!("left: {}px; top: {}px; width: {}px; opacity: {:.2};",
+                                        n.left + KEYS, n.top, n.width, 0.45 + n.velocity as f64 / 127.0 * 0.55)},
+                                }
+                            }
+                        }
+                    }
+                }
+                div {
+                    class: "playhead",
+                    style: {|| match store.song_seconds() {
+                        Some(secs) => {
+                            let tick = store.project.with(|p| p.tempo.seconds_to_tick(secs));
+                            format!("left: {}px;", tick * store.zoom.get() / compypal_core::PPQ as f64 + KEYS)
+                        }
+                        None => "display: none;".into(),
+                    }},
+                }
+            }
+        }
+    };
+    follow_playhead(&root, store, move || store.zoom.get() / compypal_core::PPQ as f64, KEYS);
+    root
 }
 
 /// Keeps the playhead in view while playing, scrolling a page at a time.
@@ -663,7 +779,7 @@ fn FigureLane() -> NodeHandle {
                 onclick: move || store.open_editor(Slot::Append),
                 "+"
             }
-            if store.editing.get().is_some() {
+            if store.editing.get().is_some_and(|s| !matches!(s, Slot::Song(_))) {
                 ChordEditor {}
             }
         }
@@ -689,7 +805,13 @@ fn ChordEditor() -> NodeHandle {
     let root = rsx! {
         div {
             class: "chord-editor",
-            style: {|| format!("left: {}px;", store.lane().editor_left.unwrap_or(0.0) + KEYS)},
+            style: {|| {
+                let left = match store.editing.get() {
+                    Some(Slot::Song(_)) => store.song_lane().editor_left,
+                    _ => store.lane().editor_left,
+                };
+                format!("left: {}px;", left.unwrap_or(0.0) + KEYS)
+            }},
             {input.clone()}
             div { class: "suggestions",
                 for (i, chord) in store.suggestions().into_iter().enumerate() {

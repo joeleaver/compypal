@@ -429,6 +429,43 @@ pub fn set_chord(
     Ok(())
 }
 
+/// The song's harmony: figures over every pitched track's notes together,
+/// so a chord reads from the bass and the comping at once.
+pub fn harmony(p: &Project, s: &FigureSettings) -> Vec<Figure> {
+    let notes: Vec<Note> = p.tracks.iter().filter(|t| !t.is_drums()).flat_map(|t| t.absolute_notes()).collect();
+    analyze(&notes, &p.meter_at(0), s)
+}
+
+/// Re-voices the whole band in `from..to` to `chord`: every pitched
+/// track's notes there move by their role in the song's chord (read from
+/// all the parts together), so the bass's A is the root of the band's Am,
+/// whatever the bass alone might suggest. Each part keeps its own shape.
+/// Returns how many tracks changed.
+pub fn set_harmony(p: &mut Project, from: Tick, to: Tick, chord: &Chord) -> usize {
+    let key = p.key;
+    let in_span = |n: &Note| n.start >= from && n.start < to;
+    let all: Vec<Note> = p
+        .tracks
+        .iter()
+        .filter(|t| !t.is_drums())
+        .flat_map(|t| t.absolute_notes())
+        .filter(in_span)
+        .collect();
+    let Some(current) = theory::identify(&all).first().map(|f| f.chord) else { return 0 };
+    let ids: Vec<Id> = p.tracks.iter().filter(|t| !t.is_drums()).map(|t| t.id).collect();
+    let mut changed = 0;
+    for id in ids {
+        let old: Vec<Note> = p.track(id).unwrap().absolute_notes().into_iter().filter(in_span).collect();
+        if old.is_empty() {
+            continue;
+        }
+        let new = revoice(&old, &current, chord, key);
+        p.replace_notes(id, &old, &new);
+        changed += 1;
+    }
+    changed
+}
+
 /// Plays figure `index` again right after itself, re-voiced to `chord`,
 /// replacing whatever starts in that slot. This is "and then": type the
 /// next chord and the shape carries on.
@@ -701,6 +738,23 @@ mod tests {
         assert_eq!(figs.len(), 64);
         // Generous, for unoptimized test builds.
         assert!(took.as_millis() < 2000, "{took:?}");
+    }
+
+    #[test]
+    fn harmony_reads_and_changes_the_band() {
+        let mut p = demo::project();
+        let s = FigureSettings::default();
+        let song = harmony(&p, &s);
+        assert_eq!(names(&song), ["C", "Am", "F", "G"]);
+        // Bar 2 becomes Em on keys and bass at once.
+        let bar = 4 * PPQ as Tick;
+        let moved = set_harmony(&mut p, bar, 2 * bar, &Chord::parse("Em").unwrap());
+        assert_eq!(moved, 2, "keys and bass");
+        assert_eq!(names(&harmony(&p, &s))[1], "Em");
+        let bass: Vec<u8> = p.tracks[1].absolute_notes().iter().filter(|n| n.start >= bar && n.start < 2 * bar).map(|n| n.pitch % 12).collect();
+        assert!(bass.iter().all(|pc| [4, 7, 11].contains(pc)), "{bass:?}");
+        // Drums are left alone.
+        assert_eq!(p.tracks[2].absolute_notes().len(), 48);
     }
 
     #[test]

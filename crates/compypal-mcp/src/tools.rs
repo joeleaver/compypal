@@ -153,6 +153,23 @@ pub fn list() -> Value {
             }}
         },
         {
+            "name": "get_harmony",
+            "description": "The song's chords, read from every pitched track together (bass and comping as one): index, position, chord (Roman numeral), confidence. These indexes are what set_harmony takes. Limit with section, selection or bars.",
+            "inputSchema": {"type": "object", "properties": {
+                "from_bar": bar("First bar."), "to_bar": bar("Last bar."), "section": section, "selection": selection
+            }}
+        },
+        {
+            "name": "set_harmony",
+            "description": "Changes chords for the whole band: every pitched track's notes in the span move to the new chord, each part keeping its shape (the bass stays a bass line, the arpeggio stays an arpeggio). Give one chord with a harmony index, bars, a section or the selection; or give chords: a list applied in order to the harmony figures in the range, e.g. section \"Chorus\" with [\"vi\", \"IV\", \"I\", \"V\"].",
+            "inputSchema": {"type": "object", "properties": {
+                "chord": {"type": "string"},
+                "chords": {"type": "array", "items": {"type": "string"}},
+                "index": {"type": "integer", "description": "A harmony index from get_harmony."},
+                "from_bar": bar("First bar."), "to_bar": bar("Last bar."), "section": section, "selection": selection
+            }}
+        },
+        {
             "name": "set_chord",
             "description": "Re-voices one figure to a new chord, keeping its shape: every note keeps its role (root, third, fifth, seventh, passing tone) and stays near where it was. Accepts chord symbols (Am7, F/A, Bbmaj7, Dø) or Roman numerals in the project key (vi, V7, bVII, V/V).",
             "inputSchema": {"type": "object", "properties": {
@@ -280,6 +297,8 @@ pub fn call(app: &mut dyn App, name: &str, args: &Value) -> ToolResult {
         "set_notes" => set_notes(app, args),
         "transform" => transform(app, args),
         "set_chord" => set_chord(app, args),
+        "get_harmony" => get_harmony(app, args),
+        "set_harmony" => set_harmony(app, args),
         "continue_with" => continue_with(app, args),
         "suggest_chords" => suggest_chords(app, args),
         "analyze_key" => analyze_key(app, args),
@@ -820,6 +839,84 @@ fn transform(app: &mut dyn App, args: &Value) -> ToolResult {
     Ok(format!("{} notes: {}.", old.len(), did.join(", ")))
 }
 
+fn harmony_text(p: &Project, figs: &[figure::Figure], from: Tick, to: Tick) -> String {
+    let meter = p.meter_at(0);
+    figs.iter()
+        .enumerate()
+        .filter(|(_, f)| f.start + PPQ as Tick / 8 >= from && f.start < to)
+        .map(|(i, f)| {
+            format!(
+                "{i}  {}  {} ({})  {:.2}",
+                compypal_core::cleanup::bar_beat_tick(f.start, &meter),
+                f.chord.name(spell(p)),
+                f.chord.roman(p.key),
+                f.confidence
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn get_harmony(app: &mut dyn App, args: &Value) -> ToolResult {
+    let p = app.project();
+    let (from, to) = range_arg(app, &p, args)?;
+    let figs = figure::harmony(&p, &FigureSettings::default());
+    if figs.is_empty() {
+        return Ok("No pitched notes yet.".into());
+    }
+    Ok(format!("index  start  chord (numeral in {})  confidence\n{}", p.key.name(), harmony_text(&p, &figs, from, to)))
+}
+
+fn set_harmony(app: &mut dyn App, args: &Value) -> ToolResult {
+    let p = app.project();
+    let figs = figure::harmony(&p, &FigureSettings::default());
+    // Each harmony figure spans from its start to the next one's.
+    let span = |i: usize| (figs[i].start, figs.get(i + 1).map_or(figs[i].end, |n| n.start));
+    let mut targets: Vec<(Tick, Tick, Chord)> = Vec::new();
+    if let Some(list) = args.get("chords").and_then(Value::as_array) {
+        let (from, to) = range_arg(app, &p, args)?;
+        let in_range: Vec<usize> =
+            (0..figs.len()).filter(|&i| figs[i].start + PPQ as Tick / 8 >= from && figs[i].start < to).collect();
+        if in_range.len() != list.len() {
+            return Err(format!(
+                "that range has {} chords and you gave {}; the chords there are:\n{}",
+                in_range.len(),
+                list.len(),
+                harmony_text(&p, &figs, from, to)
+            ));
+        }
+        for (i, c) in in_range.into_iter().zip(list) {
+            let (a, b) = span(i);
+            targets.push((a, b, chord_arg(&p, c.as_str().unwrap_or_default())?));
+        }
+    } else {
+        let chord = chord_arg(&p, opt_str(args, "chord").ok_or("give chord, or chords")?)?;
+        let (a, b) = match args.get("index").and_then(Value::as_u64) {
+            Some(i) if (i as usize) < figs.len() => span(i as usize),
+            Some(i) => return Err(format!("no harmony figure {i}; there are {}", figs.len())),
+            None => {
+                let (a, b) = range_arg(app, &p, args)?;
+                if b == Tick::MAX {
+                    return Err("say where: index, from_bar/to_bar, section or selection".into());
+                }
+                (a, b)
+            }
+        };
+        targets.push((a, b, chord));
+    }
+    let names: Vec<String> = targets.iter().map(|t| t.2.name(spell(&p))).collect();
+    app.edit(&format!("harmony {}", names.join(" ")), &mut |p| {
+        for (a, b, c) in &targets {
+            figure::set_harmony(p, *a, *b, c);
+        }
+        Ok(())
+    })?;
+    let p = app.project();
+    let figs = figure::harmony(&p, &FigureSettings::default());
+    let (from, to) = (targets.first().unwrap().0, targets.last().unwrap().1);
+    Ok(format!("Harmony there is now:\n{}", harmony_text(&p, &figs, from, to)))
+}
+
 fn set_chord(app: &mut dyn App, args: &Value) -> ToolResult {
     let p = app.project();
     let track = track_arg(app, &p, args)?;
@@ -1267,6 +1364,18 @@ mod tests {
         assert!(r.contains("Removed bars 5-6"), "{r}");
         let e = call(&mut app, "get_notes", &json!({"section": "Bridge"})).unwrap_err();
         assert!(e.contains("\"Verse\", \"Chorus\""), "{e}");
+    }
+
+    #[test]
+    fn band_wide_harmony() {
+        let mut app = demo();
+        let h = run(&mut app, "get_harmony", json!({}));
+        assert!(h.contains("C (I)") && h.contains("G (V)"), "{h}");
+        let r = run(&mut app, "set_harmony", json!({"section": "Intro", "chords": ["vi", "IV", "I", "V"]}));
+        let chords: Vec<&str> = r.lines().skip(1).map(|l| l.split("  ").nth(2).unwrap()).collect();
+        assert_eq!(chords, ["Am (vi)", "F (IV)", "C (I)", "G (V)"], "{r}");
+        let e = call(&mut app, "set_harmony", &json!({"section": "Intro", "chords": ["I"]})).unwrap_err();
+        assert!(e.contains("has 4 chords and you gave 1"), "{e}");
     }
 
     #[test]
