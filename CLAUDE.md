@@ -147,9 +147,13 @@ in the 2.1.x binary):
 
 ## Persistence
 
-The project autosaves to `$XDG_DATA_HOME/compypal/autosave.json` on every
-change and loads from there at launch (demo project if absent). Delete the
-file to get the demo back.
+Each project is `$XDG_DATA_HOME/compypal/projects/<stem>.json`, written on
+every change (atomic rename). `settings.json` remembers the open project
+(`current`) and whether the journal is listening. The old single
+`autosave.json` is migrated into the projects folder on first launch
+(kept as `autosave.json.migrated`). Switching projects resets undo. The
+projects popover (click the project name) opens, renames, duplicates and
+creates projects; the agent has `list_projects` and `open_project`.
 
 ## Building
 

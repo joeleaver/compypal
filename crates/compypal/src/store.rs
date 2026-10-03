@@ -98,6 +98,12 @@ pub struct Store {
     pub snap: Signal<Tick>,
     /// The length new notes get: the last one drawn or resized.
     pub last_len: Signal<Tick>,
+    /// The open project's file, by stem.
+    pub project_file: Signal<String>,
+    /// The projects popover is open.
+    pub projects_open: Signal<bool>,
+    pub project_list: Signal<Vec<crate::autosave::ProjectInfo>>,
+    pub rename_draft: Signal<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -186,6 +192,7 @@ impl Store {
         engine: Option<&'static Engine>,
         midi: Option<&'static MidiIn>,
         journal: Option<&'static compypal_audio::journal::Journal>,
+        project_file: String,
     ) -> Self {
         let first = project.tracks.first().map(|t| t.id);
         let project = Signal::new(project);
@@ -242,6 +249,10 @@ impl Store {
             note_drag: Signal::new(None),
             snap: Signal::new(PPQ as Tick / 4),
             last_len: Signal::new(PPQ as Tick / 2),
+            project_file: Signal::new(project_file),
+            projects_open: Signal::new(false),
+            project_list: Signal::new(Vec::new()),
+            rename_draft: Signal::new(String::new()),
         }
     }
 
@@ -402,7 +413,7 @@ impl Store {
         let on = !j.listening();
         j.set_listening(on);
         self.listening.set(on);
-        crate::autosave::save_settings(&crate::autosave::Settings { listening: on });
+        crate::autosave::update_settings(|s| s.listening = on);
         self.status.set(if on {
             "Listening: everything you play is kept in the journal, and jams show up in the sidebar".into()
         } else {
@@ -413,7 +424,10 @@ impl Store {
     /// Whether a text field has the keyboard, so shortcuts stand aside. Every
     /// text field lives in a popover, so this is "is one open".
     pub fn is_typing(self) -> bool {
-        self.editing.get().is_some() || self.instrument_edit.get().is_some() || self.section_edit.get()
+        self.editing.get().is_some()
+            || self.instrument_edit.get().is_some()
+            || self.section_edit.get()
+            || self.projects_open.get()
     }
 
     // --- arranging ----------------------------------------------------------
@@ -538,20 +552,93 @@ impl Store {
         }
     }
 
-    /// Starts over with an empty project (undoable).
-    pub fn new_project(self) {
+    // --- projects ----------------------------------------------------------------
+
+    pub fn toggle_projects(self) {
+        let open = !self.projects_open.get();
+        if open {
+            self.project_list.set(crate::autosave::list_projects());
+            self.rename_draft.set(self.project.with(|p| p.name.clone()));
+        }
+        self.projects_open.set(open);
+    }
+
+    /// Switches to `project`, stored as `stem`: the old one is already
+    /// saved, and undo starts afresh for the new one.
+    fn switch_to(self, project: Project, stem: String) {
+        if self.is_recording() {
+            self.stop_recording();
+        }
         if let Some(e) = self.engine {
             e.stop();
         }
         self.playhead.set(None);
-        self.edit("new project", |p| {
-            *p = Project::new("Untitled");
-            p.add_track("Piano", 0);
-        });
+        self.close_editor();
+        self.note_sel.set(Vec::new());
+        self.bar_sel.set(None);
         self.cursor.set(0);
-        let first = self.project.with(|p| p.tracks.first().map(|t| t.id));
+        self.project_file.set(stem.clone());
+        let name = project.name.clone();
+        let first = project.tracks.first().map(|t| t.id);
+        self.project.set(project);
+        self.history.set(History::default());
         if let Some(id) = first {
             self.select_track(id);
+        }
+        crate::autosave::update_settings(|s| s.current = Some(stem));
+        self.projects_open.set(false);
+        self.status.set(format!("Opened {name}"));
+    }
+
+    pub fn open_project(self, stem: &str) -> Result<(), String> {
+        if stem == self.project_file.get() {
+            self.projects_open.set(false);
+            return Ok(());
+        }
+        let p = crate::autosave::load_project(stem).ok_or_else(|| format!("can't open project {stem:?}"))?;
+        self.switch_to(p, stem.to_string());
+        Ok(())
+    }
+
+    /// A new, empty project with a piano track, in a file of its own.
+    pub fn new_project(self) {
+        let names = crate::autosave::list_projects();
+        let name = (1..)
+            .map(|i| if i == 1 { "Untitled".to_string() } else { format!("Untitled {i}") })
+            .find(|n| !names.iter().any(|p| &p.name == n))
+            .unwrap();
+        let mut p = Project::new(name.clone());
+        p.add_track("Piano", 0);
+        let stem = crate::autosave::unique_stem(&name);
+        let _ = crate::autosave::save_project(&stem, &p);
+        self.switch_to(p, stem);
+    }
+
+    /// Renames the project, and its file to match.
+    pub fn rename_project(self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() || self.project.with(|p| p.name == name) {
+            return;
+        }
+        let old = self.project_file.get();
+        let stem = crate::autosave::unique_stem(name);
+        if crate::autosave::move_project(&old, &stem).is_err() {
+            self.status.set("Couldn't rename the project file".into());
+            return;
+        }
+        self.project_file.set(stem.clone());
+        crate::autosave::update_settings(|s| s.current = Some(stem));
+        self.edit("rename project", |p| p.name = name.to_string());
+        self.project_list.set(crate::autosave::list_projects());
+    }
+
+    /// Saves a copy under a new name and switches to it.
+    pub fn duplicate_project(self) {
+        let mut p = self.project.get();
+        p.name = format!("{} copy", p.name);
+        let stem = crate::autosave::unique_stem(&p.name);
+        if crate::autosave::save_project(&stem, &p).is_ok() {
+            self.switch_to(p, stem);
         }
     }
 

@@ -91,7 +91,16 @@ fn Transport() -> NodeHandle {
     let store = use_store::<Store>();
     rsx! {
         div { class: "transport",
-            span { class: "project-name", {|| store.project.with(|p| p.name.clone())} }
+            div { class: "project-anchor",
+                span {
+                    class: "project-name",
+                    onclick: move || store.toggle_projects(),
+                    {|| format!("{} ▾", store.project.with(|p| p.name.clone()))}
+                }
+                if store.projects_open.get() {
+                    ProjectsPanel {}
+                }
+            }
             div { class: "view-switch",
                 Button { size: "xs",
                     variant: {|| if store.view.get() == View::Arrange { "filled" } else { "default" }},
@@ -166,7 +175,6 @@ fn Transport() -> NodeHandle {
                 "Redo"
             }
             div { class: "divider" }
-            Button { size: "xs", variant: "default", onclick: move || store.new_project(), "New" }
             Button { size: "xs", variant: "light", onclick: move || { let _ = store.export_midi(); }, "Export MIDI" }
             Button { size: "xs", variant: "light", onclick: move || { let _ = store.export_abc(); }, "Export ABC" }
         }
@@ -782,6 +790,98 @@ fn SectionNamer() -> NodeHandle {
     root
 }
 
+/// The projects popover: open one, or rename, duplicate or start anew.
+#[component]
+fn ProjectsPanel() -> NodeHandle {
+    let store = use_store::<Store>();
+    let input = rsx! {
+        input {
+            class: "chord-input",
+            placeholder: "Project name",
+            value: {|| store.rename_draft.get()},
+            oninput: move |v: String| store.rename_draft.set(v),
+        }
+    };
+    let now = compypal_audio::journal::now();
+    let rows: Vec<ProjectRow> = store
+        .project_list
+        .get()
+        .into_iter()
+        .enumerate()
+        .map(|(index, p)| ProjectRow {
+            index,
+            current: p.stem == store.project_file.get(),
+            name: p.name.clone(),
+            detail: format!(
+                "{} · {} track(s) · {} notes{}",
+                compypal_mcp::tools::when(p.modified, now),
+                p.tracks,
+                p.notes,
+                if p.sessions > 0 { format!(" · {} take(s)", p.sessions) } else { String::new() }
+            ),
+        })
+        .collect();
+    let root = rsx! {
+        div { class: "projects-panel",
+            div { class: "rename-row",
+                {input.clone()}
+                Button { size: "xs", variant: "light",
+                    onclick: move || store.rename_project(&store.rename_draft.get()),
+                    "Rename"
+                }
+            }
+            div { class: "project-actions",
+                Button { size: "xs", variant: "light", onclick: move || store.new_project(), "New project" }
+                Button { size: "xs", variant: "default", onclick: move || store.duplicate_project(), "Duplicate" }
+            }
+            div { class: "project-list",
+                for row in rows.clone() {
+                    div {
+                        key: row.index,
+                        class: {if row.current { "project-row current" } else { "project-row" }},
+                        onclick: move || {
+                            let stem = store.project_list.with(|l| l.get(row.index).map(|p| p.stem.clone()));
+                            if let Some(stem) = stem
+                                && let Err(e) = store.open_project(&stem)
+                            {
+                                store.status.set(e);
+                            }
+                        },
+                        div { class: "track-name", {row.name.clone()} }
+                        div { class: "track-detail", {row.detail.clone()} }
+                    }
+                }
+            }
+        }
+    };
+    overlay_dismiss::arm_keys_while_open(
+        __scope,
+        &root,
+        Rc::new(|| true),
+        Rc::new(move |k: &rinch::core::KeyEventData| match k.key.as_str() {
+            "Enter" => {
+                store.rename_project(&store.rename_draft.get());
+                true
+            }
+            "Escape" => {
+                store.projects_open.set(false);
+                true
+            }
+            _ => false,
+        }),
+        Rc::new(move || store.projects_open.set(false)),
+    );
+    root
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ProjectRow {
+    index: usize,
+    current: bool,
+    name: String,
+    detail: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct InstrumentRow {
     program: u8,
@@ -997,8 +1097,8 @@ fn app() -> NodeHandle {
         },
         None => eprintln!("MIDI input: none found"),
     }
-    let project = autosave::load().unwrap_or_else(compypal_core::demo::project);
-    let store = create_store(Store::new(project, engine, Some(midi), journal.map(|j| &**j)));
+    let (project, stem) = autosave::open_initial();
+    let store = create_store(Store::new(project, engine, Some(midi), journal.map(|j| &**j), stem));
     store.select_track(store.selected_track.get().unwrap_or_default());
     agent::start(store);
 
@@ -1040,8 +1140,9 @@ fn app() -> NodeHandle {
 
     // Every change is saved, so a take is never lost to a crash or a quit.
     rinch::core::Effect::new(move || {
+        let stem = untracked(|| store.project_file.get());
         store.project.with(|p| {
-            if let Err(e) = autosave::save(p) {
+            if let Err(e) = autosave::save_project(&stem, p) {
                 eprintln!("autosave failed: {e}");
             }
         });

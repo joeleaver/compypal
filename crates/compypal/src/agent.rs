@@ -100,6 +100,24 @@ impl App for StoreApp {
         compypal_audio::journal::now()
     }
 
+    fn projects(&self) -> Vec<(String, String, f64, String)> {
+        crate::autosave::list_projects()
+            .into_iter()
+            .map(|p| {
+                let what = format!("{} track(s), {} notes, {} take(s)", p.tracks, p.notes, p.sessions);
+                (p.stem, p.name, p.modified, what)
+            })
+            .collect()
+    }
+
+    fn current_project(&self) -> String {
+        self.0.project_file.get()
+    }
+
+    fn open_project(&mut self, stem: &str) -> Result<(), String> {
+        self.0.open_project(stem)
+    }
+
     fn export(&mut self, format: &str) -> Result<String, String> {
         let path = match format {
             "abc" => self.0.export_abc(),

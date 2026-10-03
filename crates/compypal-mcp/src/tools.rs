@@ -72,6 +72,13 @@ pub trait App {
     fn play_raw(&mut self, events: &[RawEvent]) -> Result<(), String>;
     /// Unix seconds now.
     fn now(&self) -> f64;
+    /// Saved projects, most recent first: (file stem, name, last change in
+    /// unix seconds, a few words about what's in it). The open one is
+    /// `current_project`.
+    fn projects(&self) -> Vec<(String, String, f64, String)>;
+    fn current_project(&self) -> String;
+    /// Switches to another project. The open one is already saved.
+    fn open_project(&mut self, stem: &str) -> Result<(), String>;
 }
 
 type ToolResult = Result<String, String>;
@@ -96,6 +103,16 @@ pub fn list() -> Value {
     let jam_ref = json!({"type": ["string", "integer"], "description": "A jam id from list_jams, or \"latest\" (the default)."});
     let secs = |what: &str| json!({"type": "number", "description": what});
     json!([
+        {
+            "name": "list_projects",
+            "description": "The user's saved songs, most recently changed first, marking the open one. Every project autosaves.",
+            "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
+            "name": "open_project",
+            "description": "Switches the app to another project, by name or file stem from list_projects. Only do this when the user asks for a different song: it changes what they are looking at.",
+            "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}}, "required": ["project"]}
+        },
         {
             "name": "list_jams",
             "description": "Jams from the always-on journal: while listening is on, everything the user plays is logged and cut into jams at silences. Newest first, one line each: id, when, length, notes, tempo guess, key, the chords it moved through. Use this when the user says they played something earlier.",
@@ -344,6 +361,30 @@ pub fn call(app: &mut dyn App, name: &str, args: &Value) -> ToolResult {
         "get_session" => get_session(app, args),
         "get_selection" => get_selection(app),
         "list_jams" => list_jams(app, args),
+        "list_projects" => {
+            let now = app.now();
+            let current = app.current_project();
+            let list: Vec<String> = app
+                .projects()
+                .into_iter()
+                .map(|(stem, name, modified, what)| {
+                    format!("{}{name:?} ({stem}), changed {}, {what}", if stem == current { "* " } else { "  " }, when(modified, now))
+                })
+                .collect();
+            Ok(if list.is_empty() { "No saved projects.".into() } else { format!("* is open.\n{}", list.join("\n")) })
+        }
+        "open_project" => {
+            let want = opt_str(args, "project").ok_or("project is required")?.to_lowercase();
+            let projects = app.projects();
+            let found = projects
+                .iter()
+                .find(|(stem, name, ..)| stem.to_lowercase() == want || name.to_lowercase() == want)
+                .or_else(|| projects.iter().find(|(_, name, ..)| name.to_lowercase().contains(&want)))
+                .map(|(stem, name, ..)| (stem.clone(), name.clone()))
+                .ok_or_else(|| format!("no project matches {want:?}; see list_projects"))?;
+            app.open_project(&found.0)?;
+            Ok(format!("Opened {:?}.", found.1))
+        }
         "get_jam" => get_jam(app, args),
         "audition_jam" => audition_jam(app, args),
         "keep_jam" => keep_jam(app, args),
@@ -1559,6 +1600,15 @@ impl App for MemoryApp {
     }
     fn now(&self) -> f64 {
         self.clock
+    }
+    fn projects(&self) -> Vec<(String, String, f64, String)> {
+        Vec::new()
+    }
+    fn current_project(&self) -> String {
+        String::new()
+    }
+    fn open_project(&mut self, _: &str) -> Result<(), String> {
+        Err("no other projects here".into())
     }
 }
 
