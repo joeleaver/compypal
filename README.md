@@ -20,9 +20,30 @@ Early. Working today:
 - MIDI import and export, and ABC export
 - A piano roll that overlays the original take on the cleaned notes
 
-Not built yet: audio playback, controller recording, the MCP/agent
-integration, the arranger view, and the custom synth. See `CLAUDE.md` for
+- Chord lane: figures (arpeggios, runs, stabs) labelled with chords; retype a chord to re-voice, or continue a shape onto new chords
+- Playback through a General MIDI SoundFont, metronome, looping
+- Recording from a MIDI controller into raw sessions, with live display
+- Claude Code integration: MCP tools for reading, cleaning, composing and arranging, and `/ide` for sharing what you've selected
+
+Not built yet: an arranger view and the custom synth. See `CLAUDE.md` for
 the roadmap.
+
+## Using it with Claude Code
+
+Start compypal, then run `claude` in the same directory:
+
+1. Approve the `compypal` MCP server when asked (it comes from `.mcp.json`).
+   That gives Claude the tools: `get_project`, `get_session`, `clean_take`,
+   `get_figures`, `set_chord`, `continue_with`, `copy_bars`, `play`, and more.
+2. Type `/ide` and pick **compypal**. Now whatever you click in the app (a
+   figure, a track) is shared, so "clean this up" or "make this a ii-V"
+   means what you're looking at.
+
+To use the tools from another directory:
+
+```bash
+claude mcp add --transport http -s user compypal http://127.0.0.1:7766/mcp
+```
 
 ## Building
 

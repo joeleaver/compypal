@@ -239,3 +239,7 @@
 .port-row.selected { color: var(--rinch-color-text); border-left-color: var(--rinch-color-green-5); }
 
 .heading-row { display: flex; justify-content: space-between; align-items: center; padding-top: 10px; }
+
+.right-status { display: flex; gap: 16px; }
+.agent-status { color: var(--rinch-color-dimmed); }
+.agent-status.on { color: var(--rinch-color-green-5); }

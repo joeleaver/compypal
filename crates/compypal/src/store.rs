@@ -57,6 +57,10 @@ pub struct Store {
     /// Engine time minus song time: nonzero while recording, where the
     /// engine's clock starts at the count-in rather than at the song.
     pub play_offset: Signal<f64>,
+    /// What the user is pointing at, shared with the agent.
+    pub selection: Signal<Option<compypal_mcp::Selection>>,
+    /// Claude Code sessions attached through /ide.
+    pub agents: Signal<usize>,
 }
 
 /// A take in progress.
@@ -127,6 +131,8 @@ impl Store {
             recording: Signal::new(None),
             live_take: Signal::new(Vec::new()),
             play_offset: Signal::new(0.0),
+            selection: Signal::new(None),
+            agents: Signal::new(0),
         }
     }
 
@@ -164,6 +170,8 @@ impl Store {
         self.close_editor();
         self.selected_track.set(Some(id));
         self.monitor_selected();
+        // The whole track, however long it grows.
+        self.selection.set(Some(compypal_mcp::Selection { track: id, start: 0, end: Tick::MAX, figure: None }));
     }
 
     fn monitor_selected(self) {
@@ -414,6 +422,11 @@ impl Store {
         if let (Slot::Figure(i), Some(track)) = (slot, self.selected_track.get())
             && let Some(f) = self.figures.get().get(i)
         {
+            self.selection.set(Some(compypal_mcp::Selection { track, start: f.start, end: f.end, figure: Some(i) }));
+        }
+        if let (Slot::Figure(i), Some(track)) = (slot, self.selected_track.get())
+            && let Some(f) = self.figures.get().get(i)
+        {
             self.audition(track, &f.notes);
         }
     }
@@ -527,14 +540,14 @@ impl Store {
         self.history.update(|h| h.push(label, before));
     }
 
-    pub fn undo(self) {
+    pub fn undo(self) -> Option<String> {
         let mut p = self.project.get();
         let mut h = self.history.get();
-        if let Some(label) = h.undo(&mut p) {
-            self.project.set(p);
-            self.history.set(h);
-            self.status.set(format!("Undid {label}"));
-        }
+        let label = h.undo(&mut p)?;
+        self.project.set(p);
+        self.history.set(h);
+        self.status.set(format!("Undid {label}"));
+        Some(label)
     }
 
     pub fn redo(self) {
@@ -561,25 +574,26 @@ impl Store {
         self.status.set(format!("Quantized {moved} notes"));
     }
 
-    pub fn export_midi(self) {
+    pub fn export_midi(self) -> Result<PathBuf, String> {
         let p = self.project.get();
         let result = compypal_io::midi::export(&p)
             .map_err(|e| e.to_string())
             .and_then(|bytes| write_export(&p.name, "mid", &bytes));
-        self.report_export(result);
+        self.report_export(result)
     }
 
-    pub fn export_abc(self) {
+    pub fn export_abc(self) -> Result<PathBuf, String> {
         let p = self.project.get();
         let abc = compypal_io::abc::export(&p, &Default::default());
-        self.report_export(write_export(&p.name, "abc", abc.as_bytes()));
+        self.report_export(write_export(&p.name, "abc", abc.as_bytes()))
     }
 
-    fn report_export(self, result: Result<PathBuf, String>) {
-        self.status.set(match result {
+    fn report_export(self, result: Result<PathBuf, String>) -> Result<PathBuf, String> {
+        self.status.set(match &result {
             Ok(path) => format!("Exported {}", path.display()),
             Err(e) => format!("Export failed: {e}"),
         });
+        result
     }
 
     /// The figure lane above the piano roll, in the roll's coordinates.

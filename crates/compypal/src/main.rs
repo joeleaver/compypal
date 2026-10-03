@@ -1,5 +1,6 @@
 //! compypal: a MIDI composer and arranger built to work alongside an agent.
 
+mod agent;
 mod autosave;
 mod store;
 
@@ -126,7 +127,7 @@ fn Transport() -> NodeHandle {
             div { class: "spacer" }
             Button { size: "xs", variant: "default",
                 disabled: {|| store.history.with(|h| h.undo_label().is_none())},
-                onclick: move || store.undo(),
+                onclick: move || { store.undo(); },
                 "Undo"
             }
             Button { size: "xs", variant: "default",
@@ -153,8 +154,8 @@ fn Transport() -> NodeHandle {
             Button { size: "xs", variant: "default", onclick: move || store.zoom.update(|z| *z = (*z * 1.5).min(400.0)), "+" }
             div { class: "divider" }
             Button { size: "xs", variant: "default", onclick: move || store.new_project(), "New" }
-            Button { size: "xs", variant: "light", onclick: move || store.export_midi(), "Export MIDI" }
-            Button { size: "xs", variant: "light", onclick: move || store.export_abc(), "Export ABC" }
+            Button { size: "xs", variant: "light", onclick: move || { let _ = store.export_midi(); }, "Export MIDI" }
+            Button { size: "xs", variant: "light", onclick: move || { let _ = store.export_abc(); }, "Export ABC" }
         }
     }
 }
@@ -452,6 +453,7 @@ fn app() -> NodeHandle {
     let project = autosave::load().unwrap_or_else(compypal_core::demo::project);
     let store = create_store(Store::new(project, engine, Some(midi)));
     store.select_track(store.selected_track.get().unwrap_or_default());
+    agent::start(store);
 
     // Every change is saved, so a take is never lost to a crash or a quit.
     rinch::core::Effect::new(move || {
@@ -522,7 +524,12 @@ fn app() -> NodeHandle {
             }
             div { class: "statusbar",
                 span { {|| store.status.get()} }
-                span { class: "audio-status", {|| format!("♪ {}", store.audio_status.get())} }
+                span { class: "right-status",
+                    span { class: {|| if store.agents.get() > 0 { "agent-status on" } else { "agent-status" }},
+                        {|| agent::status_text(store.agents.get())}
+                    }
+                    span { class: "audio-status", {|| format!("♪ {}", store.audio_status.get())} }
+                }
             }
         }
     }
@@ -538,4 +545,5 @@ fn main() {
             ..Default::default()
         })
         .run();
+    agent::shutdown();
 }

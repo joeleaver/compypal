@@ -8,6 +8,7 @@ pub mod gm;
 pub mod history;
 pub mod model;
 pub mod session;
+pub mod text;
 pub mod theory;
 
 pub use history::History;

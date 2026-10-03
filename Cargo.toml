@@ -10,6 +10,7 @@ edition = "2024"
 compypal-core = { path = "crates/compypal-core" }
 compypal-io = { path = "crates/compypal-io" }
 compypal-audio = { path = "crates/compypal-audio" }
+compypal-mcp = { path = "crates/compypal-mcp" }
 rinch = { git = "https://github.com/joeleaver/rinch", branch = "main", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }

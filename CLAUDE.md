@@ -11,6 +11,7 @@ with a built-in synth; export MIDI and ABC.
 |---|---|
 | `compypal-core` | Project model (ticks, `PPQ = 960`), raw `Session`s (seconds), cleanup ops, snapshot undo, GM names, `theory` (chords, Roman numerals, keys), `figure` (musical units), demo project. No I/O, no UI. |
 | `compypal-io` | SMF import/export (`midly`), ABC export. |
+| `compypal-mcp` | The agent interface: MCP tools over an `App` trait (`tools.rs`, testable on `MemoryApp`), JSON-RPC handling, an HTTP server for tools and the Claude Code IDE WebSocket link. |
 | `compypal-audio` | `Engine` (cpal output on its own thread), `Synth` trait with SoundFont (`rustysynth`) and built-in fallback, pure `schedule::build` from a project, realtime `Player`. |
 | `compypal` | The rinch desktop app. `store.rs` is all app state; every project edit goes through `Store::edit` so UI and agent share undo. |
 
@@ -79,6 +80,31 @@ It has a chord and a shape (block, arpeggio, run, melody, note, mixed).
 - Not yet: latency compensation (takes may sit a few ms late), the KeyLab's
   DAW-port transport buttons, free-time recording with tempo detection.
 
+## Agent (MCP)
+
+Two links, because Claude Code hides an IDE connection's tools from the
+model (only `mcp__ide__executeCode`/`getDiagnostics` get through; checked
+in the 2.1.x binary):
+
+- **Tools**: MCP over HTTP at `127.0.0.1:7766/mcp` (`COMPYPAL_MCP_PORT`),
+  registered for this repo by `.mcp.json`. Requests must have a local
+  Host/Origin and a JSON content type (blocks DNS rebinding and CSRF from
+  web pages).
+- **IDE link**: a WebSocket MCP server on a random port, advertised by
+  `~/.claude/ide/<port>.lock` (`pid`, `workspaceFolders` = compypal's cwd,
+  `ideName`, `transport: "ws"`, `authToken`, checked against the
+  `X-Claude-Code-Ide-Authorization` header). `claude` started inside that
+  folder offers it under `/ide`. It carries `selection_changed`
+  notifications: clicking a figure or a track tells the agent what you mean
+  by "this". The lockfile is removed on exit, and stale ones are swept at
+  startup.
+- Tool calls run on the UI thread (`run_on_main_thread` + a thread-local
+  store) through the same `Store::edit` as the UI, so agent edits are
+  undoable and show up live, labelled "agent: ...".
+- Add tools in `compypal-mcp/src/tools.rs`: schema in `list()`, a match arm
+  in `call()`, a test against `MemoryApp`. Keep answers short, positional
+  (`bar.beat.tick`), and in note names.
+
 ## Persistence
 
 The project autosaves to `$XDG_DATA_HOME/compypal/autosave.json` on every
@@ -120,15 +146,8 @@ file to get the demo back.
 
 1. ~~Audio~~ (done). Follow-ups: playhead auto-scroll, a loop range.
 2. ~~Recording~~ (done). Follow-ups listed under Recording.
-3. **Agent / music IDE**: an MCP server embedded in the app on localhost,
-   advertised to Claude Code the way editor extensions are (a lockfile in
-   `~/.claude/ide/` that `/ide` discovers). Check the current lockfile and
-   auth format against Claude Code before implementing. Tools: read the
-   project/session (JSON and ABC), `timing_report`, import + cleanup ops,
-   figures (`describe`, `set_chord`, `continue_with`, `theory::suggest`),
-   write clip notes, sections/arrangement, transport, and the user's current
-   piano-roll selection as context. All edits go through `Store::edit`
-   (from the MCP thread via `Signal::send`/`update_send`).
+3. ~~Agent / music IDE~~ (done). Follow-ups: note-level selection in the
+   piano roll, an in-app terminal running `claude`, MCP resources for ABC.
 4. **Arranger view**: section/clip timeline across tracks.
 5. **Own synth**: a wavetable/mod-matrix synth in the spirit of Vital, to sit
    alongside the SoundFont player.
