@@ -8,8 +8,16 @@ use compypal_core::figure::{self, Figure, FigureSettings};
 use compypal_core::theory::{self, Chord, Spelling};
 use compypal_audio::input::MidiIn;
 use compypal_audio::{Engine, Schedule, ScheduleOptions, schedule};
-use compypal_core::{Clip, History, Id, MeterChange, Note, PPQ, Project, RawEvent, Session, Tick};
+use compypal_core::{Clip, History, Id, MeterChange, Note, PPQ, Project, RawEvent, Session, Tick, arrange, text};
 use rinch::prelude::*;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    /// One track's piano roll, with the chord lane.
+    Edit,
+    /// Every track across the song, with sections.
+    Arrange,
+}
 
 /// Where the chord editor is open: on a figure, or on the slot after the
 /// last one, where typing a chord continues the music.
@@ -61,6 +69,17 @@ pub struct Store {
     pub selection: Signal<Option<compypal_mcp::Selection>>,
     /// Claude Code sessions attached through /ide.
     pub agents: Signal<usize>,
+    pub view: Signal<View>,
+    /// Bars selected in the arranger, first and last, one-based.
+    pub bar_sel: Signal<Option<(u32, u32)>>,
+    pub section_draft: Signal<String>,
+    /// Horizontal zoom of the arranger, pixels per quarter note.
+    pub arr_zoom: Signal<f64>,
+    /// The track whose instrument picker is open.
+    pub instrument_edit: Signal<Option<Id>>,
+    pub instrument_draft: Signal<String>,
+    /// The section-name popover is open.
+    pub section_edit: Signal<bool>,
 }
 
 /// A take in progress.
@@ -133,7 +152,130 @@ impl Store {
             play_offset: Signal::new(0.0),
             selection: Signal::new(None),
             agents: Signal::new(0),
+            view: Signal::new(View::Edit),
+            bar_sel: Signal::new(None),
+            section_draft: Signal::new(String::new()),
+            arr_zoom: Signal::new(24.0),
+            instrument_edit: Signal::new(None),
+            instrument_draft: Signal::new(String::new()),
+            section_edit: Signal::new(false),
         }
+    }
+
+    /// Whether a text field has the keyboard, so shortcuts stand aside. Every
+    /// text field lives in a popover, so this is "is one open".
+    pub fn is_typing(self) -> bool {
+        self.editing.get().is_some() || self.instrument_edit.get().is_some() || self.section_edit.get()
+    }
+
+    // --- arranging ----------------------------------------------------------
+
+    /// Selects bar `bar`, or extends the selection to it.
+    pub fn select_bar(self, bar: u32, extend: bool) {
+        let bar = bar.max(1);
+        let sel = match (self.bar_sel.get(), extend) {
+            (Some((a, b)), true) => (a.min(bar), b.max(bar)),
+            _ => (bar, bar),
+        };
+        self.bar_sel.set(Some(sel));
+        let (from, to, section) = self.project.with(|p| {
+            let (from, to) = (text::bar_start(p, sel.0), text::bar_start(p, sel.1 + 1));
+            let section = p.sections.iter().find(|s| s.start == from && s.start + s.length == to).map(|s| s.name.clone());
+            (from, to, section)
+        });
+        self.section_draft.set(section.clone().unwrap_or_default());
+        // Bars across every track: what "this" means to the agent now.
+        self.selection.set(Some(compypal_mcp::Selection { track: None, start: from, end: to, figure: None, section }));
+        let start = self.project.with(|p| text::bar_start(p, sel.0));
+        self.cursor.set(start);
+    }
+
+    pub fn select_bars(self, first: u32, last: u32) {
+        self.select_bar(first, false);
+        self.select_bar(last, true);
+    }
+
+    /// Duplicates, deletes, or inserts empty bars before, the selection.
+    pub fn bars_action(self, action: &str) {
+        let Some((a, b)) = self.bar_sel.get() else { return };
+        let n = b - a + 1;
+        let (from, to) = self.project.with(|p| (text::bar_start(p, a), text::bar_start(p, b + 1)));
+        match action {
+            "duplicate" => {
+                self.edit(&format!("duplicate bars {a}-{b}"), |p| arrange::duplicate_time(p, from, to - from));
+                self.select_bars(b + 1, b + n);
+                self.status.set(format!("Bars {a}-{b} now repeat as {}-{}", b + 1, b + n));
+            }
+            "delete" => {
+                self.edit(&format!("delete bars {a}-{b}"), |p| arrange::delete_time(p, from, to - from));
+                self.bar_sel.set(None);
+                self.status.set(format!("Removed bars {a}-{b}"));
+            }
+            "insert" => {
+                self.edit(&format!("insert {n} bars"), |p| arrange::insert_time(p, from, to - from));
+                self.status.set(format!("Opened {n} empty bar(s) at bar {a}"));
+            }
+            _ => {}
+        }
+    }
+
+    /// Names the selected bars as a section, replacing any section that
+    /// starts there; an empty name removes it.
+    pub fn name_section(self) {
+        let Some((a, b)) = self.bar_sel.get() else { return };
+        let name = self.section_draft.get().trim().to_string();
+        self.edit("section", |p| {
+            let (from, to) = (text::bar_start(p, a), text::bar_start(p, b + 1));
+            p.sections.retain(|s| s.start != from);
+            if !name.is_empty() {
+                let id = p.alloc_id();
+                p.sections.push(compypal_core::Section { id, name: name.clone(), start: from, length: to - from });
+                p.sections.sort_by_key(|s| s.start);
+            }
+        });
+    }
+
+    pub fn open_clip(self, track: Id, start: Tick) {
+        self.select_track(track);
+        self.cursor.set(start);
+        self.view.set(View::Edit);
+    }
+
+    // --- instruments ----------------------------------------------------------
+
+    pub fn instrument_suggestions(self) -> Vec<(u8, &'static str)> {
+        let q = self.instrument_draft.get().to_lowercase();
+        compypal_core::gm::PROGRAMS
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| q.is_empty() || n.to_lowercase().contains(&q))
+            .take(10)
+            .map(|(i, n)| (i as u8, *n))
+            .collect()
+    }
+
+    pub fn set_instrument(self, track: Id, program: u8) {
+        self.instrument_edit.set(None);
+        self.edit("instrument", |p| {
+            if let Some(t) = p.track_mut(track) {
+                t.program = program;
+            }
+        });
+        if self.selected_track.get() == Some(track) {
+            self.monitor_selected();
+        }
+        // Let them hear it: a chord on the new instrument.
+        let notes: Vec<Note> = [60u8, 64, 67]
+            .iter()
+            .map(|&pitch| Note { pitch, velocity: 90, start: 0, duration: PPQ as Tick * 2 })
+            .collect();
+        self.audition(track, &notes);
+    }
+
+    /// The arranger's contents.
+    pub fn arrangement(self) -> Arrangement {
+        let px = self.arr_zoom.get() / PPQ as f64;
+        self.project.with(|p| Arrangement::build(p, px))
     }
 
     /// Adds a piano track and selects it, ready to record into.
@@ -171,7 +313,7 @@ impl Store {
         self.selected_track.set(Some(id));
         self.monitor_selected();
         // The whole track, however long it grows.
-        self.selection.set(Some(compypal_mcp::Selection { track: id, start: 0, end: Tick::MAX, figure: None }));
+        self.selection.set(Some(compypal_mcp::Selection { track: Some(id), start: 0, end: Tick::MAX, figure: None, section: None }));
     }
 
     fn monitor_selected(self) {
@@ -347,7 +489,8 @@ impl Store {
             engine.stop();
             self.playhead.set(None);
         } else {
-            let from = self.project.with(|p| p.tempo.tick_to_seconds(self.cursor.get() as f64));
+            let cursor = self.cursor.get();
+            let from = self.project.with(|p| p.tempo.tick_to_seconds(cursor as f64));
             engine.play(self.schedule(), from, self.looping.get());
             // Show the playhead right away rather than on the next poll.
             self.playhead.set(Some(from));
@@ -388,7 +531,8 @@ impl Store {
     fn preview(self, chord: &Chord) {
         let Some(track) = self.selected_track.get() else { return };
         let figures = self.figures.get();
-        let notes = self.project.with(|p| match self.editing.get()? {
+        let slot = self.editing.get();
+        let notes = self.project.with(|p| match slot? {
             Slot::Figure(i) => {
                 let f = figures.get(i)?;
                 Some(figure::revoice(&f.notes, &f.chord, chord, p.key))
@@ -422,7 +566,7 @@ impl Store {
         if let (Slot::Figure(i), Some(track)) = (slot, self.selected_track.get())
             && let Some(f) = self.figures.get().get(i)
         {
-            self.selection.set(Some(compypal_mcp::Selection { track, start: f.start, end: f.end, figure: Some(i) }));
+            self.selection.set(Some(compypal_mcp::Selection { track: Some(track), start: f.start, end: f.end, figure: Some(i), section: None }));
         }
         if let (Slot::Figure(i), Some(track)) = (slot, self.selected_track.get())
             && let Some(f) = self.figures.get().get(i)
@@ -804,5 +948,128 @@ impl Roll {
             raw: raw.iter().map(|n| place(n, "r")).collect(),
             live: live.iter().map(|n| place(n, "l")).collect(),
         }
+    }
+}
+
+pub const ARR_ROW: f64 = 44.0;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArrNote {
+    pub key: String,
+    pub left: f64,
+    pub top: f64,
+    pub width: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArrClip {
+    pub key: String,
+    pub track: Id,
+    pub start: Tick,
+    pub left: f64,
+    pub width: f64,
+    pub name: String,
+    pub recorded: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArrRow {
+    pub key: String,
+    pub track: Id,
+    pub name: String,
+    pub instrument: String,
+    pub muted: bool,
+    pub clips: Vec<ArrClip>,
+    pub notes: Vec<ArrNote>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArrSection {
+    pub key: String,
+    pub name: String,
+    pub left: f64,
+    pub width: f64,
+    pub first: u32,
+    pub last: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Arrangement {
+    pub width: f64,
+    pub px: f64,
+    pub bars: Vec<RollBar>,
+    pub sections: Vec<ArrSection>,
+    pub rows: Vec<ArrRow>,
+}
+
+impl Arrangement {
+    fn build(p: &Project, px: f64) -> Self {
+        let end = p.end_tick().max(PPQ as Tick * 4 * 16) + PPQ as Tick * 4 * 4;
+        let mut bars = Vec::new();
+        let mut tick = 0;
+        while tick < end {
+            let left = tick as f64 * px;
+            bars.push(RollBar { key: format!("{}:{left}", bars.len()), number: bars.len() as u64 + 1, left });
+            tick += p.meter_at(tick).ticks_per_bar();
+        }
+        let sections = p
+            .sections
+            .iter()
+            .map(|s| {
+                let (left, width) = (s.start as f64 * px, s.length as f64 * px);
+                ArrSection {
+                    key: format!("{}:{left}:{width}:{}", s.id, s.name),
+                    name: s.name.clone(),
+                    left,
+                    width,
+                    first: text::bar_of(p, s.start),
+                    last: text::bar_of(p, (s.start + s.length).saturating_sub(1)),
+                }
+            })
+            .collect();
+        let rows = p
+            .tracks
+            .iter()
+            .map(|t| {
+                let notes = t.absolute_notes();
+                let (lo, hi) = notes.iter().fold((127u8, 0u8), |(lo, hi), n| (lo.min(n.pitch), hi.max(n.pitch)));
+                let span = (hi.saturating_sub(lo)).max(12) as f64;
+                let inner = ARR_ROW - 12.0;
+                let instrument =
+                    if t.is_drums() { "Drums".to_string() } else { compypal_core::gm::program_name(t.program).to_string() };
+                ArrRow {
+                    key: format!("{}:{}:{}:{}:{}", t.id, t.name, instrument, t.muted, notes.len()),
+                    track: t.id,
+                    name: t.name.clone(),
+                    instrument,
+                    muted: t.muted,
+                    clips: t
+                        .clips
+                        .iter()
+                        .map(|c| {
+                            let (left, width) = (c.start as f64 * px, (c.length as f64 * px).max(4.0));
+                            ArrClip {
+                                key: format!("{}:{left}:{width}", c.id),
+                                track: t.id,
+                                start: c.start,
+                                left,
+                                width,
+                                name: c.name.clone(),
+                                recorded: c.source_session.is_some(),
+                            }
+                        })
+                        .collect(),
+                    notes: notes
+                        .iter()
+                        .map(|n| {
+                            let (left, width) = (n.start as f64 * px, (n.duration as f64 * px).max(1.5));
+                            let top = 6.0 + (hi.saturating_sub(n.pitch)) as f64 / span * (inner - 2.0);
+                            ArrNote { key: format!("{left}:{top}:{width}"), left, top, width }
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        Self { width: end as f64 * px, px, bars, sections, rows }
     }
 }

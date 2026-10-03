@@ -12,13 +12,36 @@ use compypal_core::theory::{self, Chord, Spelling};
 use compypal_core::{Id, KeySignature, MeterChange, Note, PPQ, Project, Session, Tick, gm};
 use serde_json::{Value, json};
 
-/// What the user is pointing at in the UI.
+/// What the user is pointing at in the UI: a track, a figure on a track,
+/// or a range of bars across every track (possibly a named section).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Selection {
-    pub track: Id,
+    /// `None` when the selection spans all tracks.
+    pub track: Option<Id>,
     pub start: Tick,
+    /// `Tick::MAX` for "to the end".
     pub end: Tick,
     pub figure: Option<usize>,
+    pub section: Option<String>,
+}
+
+impl Selection {
+    /// Says what's selected in a phrase: `bars 5-8 (section "Chorus")`.
+    pub fn describe(&self, p: &Project) -> String {
+        let end = if self.end == Tick::MAX { p.end_tick().max(self.start + 1) } else { self.end };
+        let bars = {
+            let (a, b) = (bar_of(p, self.start), bar_of(p, end.saturating_sub(1).max(self.start)));
+            if a == b { format!("bar {a}") } else { format!("bars {a}-{b}") }
+        };
+        let track = self.track.and_then(|t| p.track(t)).map(|t| t.name.clone());
+        match (&track, self.figure, &self.section) {
+            (Some(t), Some(f), _) => format!("figure {f} of track {t:?} ({bars})"),
+            (Some(t), None, _) if self.end == Tick::MAX => format!("the whole of track {t:?}"),
+            (Some(t), None, _) => format!("track {t:?}, {bars}"),
+            (None, _, Some(name)) => format!("section {name:?}, {bars}, all tracks"),
+            (None, _, None) => format!("{bars}, all tracks"),
+        }
+    }
 }
 
 /// The app, as tools see it. Implemented by the UI (on its thread) and by
@@ -53,7 +76,14 @@ pub fn list() -> Value {
         },
         "required": ["grid"]
     });
+    let section = json!({"type": "string", "description": "Act on this named section instead of giving bars."});
+    let selection = json!({"type": "boolean", "description": "Act on whatever the user has selected in the app instead of giving bars."});
     json!([
+        {
+            "name": "get_selection",
+            "description": "What the user has selected in the app (a figure, a track, or bars across all tracks, possibly a named section), with the chords and notes in it. When the user says \"this\", \"here\" or \"the selection\", start here.",
+            "inputSchema": {"type": "object", "properties": {}}
+        },
         {
             "name": "get_project",
             "description": "Overview of the project: tempo, meter, key, tracks (with instruments and note counts), recorded sessions, sections, and what the user has selected. Start here.",
@@ -64,13 +94,14 @@ pub fn list() -> Value {
             "description": "A track's notes, one per line as `bar.beat.tick  pitch  vel  duration`, or as ABC notation for the whole project.",
             "inputSchema": {"type": "object", "properties": {
                 "track": track, "from_bar": bar("First bar, inclusive."), "to_bar": bar("Last bar, inclusive."),
+                "section": section, "selection": selection,
                 "format": {"type": "string", "enum": ["list", "abc"], "description": "Default list."}
             }}
         },
         {
             "name": "get_figures",
             "description": "A track divided into figures: the musical units you'd talk about (a C arpeggio, a run into G, stabs on Am). Each line: index, position, chord (Roman numeral), shape, note count, confidence, other readings. Figure indexes are what set_chord and continue_with take.",
-            "inputSchema": {"type": "object", "properties": {"track": track}}
+            "inputSchema": {"type": "object", "properties": {"track": track, "section": section, "selection": selection}}
         },
         {
             "name": "get_session",
@@ -110,6 +141,7 @@ pub fn list() -> Value {
             "description": "Edits the notes in a bar range of a track (all bars if omitted): transpose, shift in time, scale or flatten velocities, quantize, remove quiet or short notes, or delete.",
             "inputSchema": {"type": "object", "properties": {
                 "track": track, "from_bar": bar("First bar."), "to_bar": bar("Last bar, inclusive."),
+                "section": section, "selection": selection,
                 "transpose": {"type": "integer", "description": "Semitones."},
                 "shift": {"type": "string", "description": "Move in time by a note value or ticks; prefix - for earlier, e.g. -1/16."},
                 "velocity_scale": {"type": "number"},
@@ -181,7 +213,28 @@ pub fn list() -> Value {
                 "from_bar": bar("First bar to copy."), "bars": {"type": "integer", "minimum": 1}, "to_bar": bar("Where the copy starts."),
                 "tracks": {"type": "array", "items": {"type": ["string", "integer"]}},
                 "merge": {"type": "boolean"}
-            }, "required": ["from_bar", "bars", "to_bar"]}
+            , "section": section, "selection": selection}, "required": ["to_bar"]}
+        },
+        {
+            "name": "insert_bars",
+            "description": "Arranging: opens empty bars before bar `at`, moving everything after (notes on every track, sections, tempo and meter changes) later.",
+            "inputSchema": {"type": "object", "properties": {
+                "at": bar("The bar the gap opens before."), "bars": {"type": "integer", "minimum": 1}
+            , "section": section, "selection": selection}, "required": []}
+        },
+        {
+            "name": "delete_bars",
+            "description": "Arranging: removes bars from_bar..from_bar+bars-1 from the whole song, closing the gap. Notes held into the cut are shortened.",
+            "inputSchema": {"type": "object", "properties": {
+                "from_bar": bar("First bar to remove."), "bars": {"type": "integer", "minimum": 1}
+            , "section": section, "selection": selection}, "required": []}
+        },
+        {
+            "name": "duplicate_bars",
+            "description": "Arranging: plays bars from_bar..from_bar+bars-1 twice in a row, on every track, pushing the rest of the song later. Sections inside the range are duplicated too. Use for repeating a verse or chorus.",
+            "inputSchema": {"type": "object", "properties": {
+                "from_bar": bar("First bar of the passage."), "bars": {"type": "integer", "minimum": 1}
+            , "section": section, "selection": selection}, "required": []}
         },
         {
             "name": "set_sections",
@@ -201,7 +254,7 @@ pub fn list() -> Value {
         {
             "name": "audition",
             "description": "Plays just one track's bars for the user, once, on its instrument.",
-            "inputSchema": {"type": "object", "properties": {"track": track, "from_bar": bar("First bar."), "to_bar": bar("Last bar.")}}
+            "inputSchema": {"type": "object", "properties": {"track": track, "from_bar": bar("First bar."), "to_bar": bar("Last bar."), "section": section, "selection": selection}}
         },
         {
             "name": "undo",
@@ -222,6 +275,7 @@ pub fn call(app: &mut dyn App, name: &str, args: &Value) -> ToolResult {
         "get_notes" => get_notes(app, args),
         "get_figures" => get_figures(app, args),
         "get_session" => get_session(app, args),
+        "get_selection" => get_selection(app),
         "clean_take" => clean_take(app, args),
         "set_notes" => set_notes(app, args),
         "transform" => transform(app, args),
@@ -234,6 +288,7 @@ pub fn call(app: &mut dyn App, name: &str, args: &Value) -> ToolResult {
         "set_track" => set_track(app, args),
         "copy_bars" => copy_bars(app, args),
         "set_sections" => set_sections(app, args),
+        "insert_bars" | "delete_bars" | "duplicate_bars" => edit_time(app, name, args),
         "play" => {
             let p = app.project();
             let from = opt_u32(args, "from_bar").map(|b| bar_start(&p, b));
@@ -289,17 +344,52 @@ fn track_arg(app: &dyn App, p: &Project, args: &Value) -> Result<Id, String> {
         Some(v) if !v.is_null() => find_track(p, v),
         _ => app
             .selection()
-            .map(|s| s.track)
+            .and_then(|s| s.track)
             .or_else(|| p.tracks.first().map(|t| t.id))
             .ok_or_else(|| "the project has no tracks".to_string()),
     }
 }
 
-/// Bars `from_bar..=to_bar` as a tick range; open-ended when omitted.
-fn bar_range(p: &Project, args: &Value) -> (Tick, Tick) {
+/// The range a tool should act on, as ticks: a named `section`, the UI
+/// `selection`, or bars `from_bar..=to_bar` (open-ended when omitted).
+fn range_arg(app: &dyn App, p: &Project, args: &Value) -> Result<(Tick, Tick), String> {
+    if let Some(name) = opt_str(args, "section") {
+        let s = find_section(p, name)?;
+        return Ok((s.start, s.start + s.length));
+    }
+    if args.get("selection").and_then(Value::as_bool) == Some(true) {
+        let sel = app.selection().ok_or("nothing is selected in the UI")?;
+        return Ok((sel.start, sel.end));
+    }
     let from = opt_u32(args, "from_bar").map_or(0, |b| bar_start(p, b));
     let to = opt_u32(args, "to_bar").map_or(Tick::MAX, |b| bar_start(p, b + 1));
-    (from, to)
+    Ok((from, to))
+}
+
+/// Like [`range_arg`], as first bar and bar count, for whole-bar edits.
+/// Falls back to `first_key` and `bars`.
+fn bars_arg(app: &dyn App, p: &Project, args: &Value, first_key: &str) -> Result<(u32, u32), String> {
+    if opt_str(args, "section").is_some() || args.get("selection").and_then(Value::as_bool) == Some(true) {
+        let (from, to) = range_arg(app, p, args)?;
+        let to = if to == Tick::MAX { p.end_tick().max(from + 1) } else { to };
+        let (a, b) = (bar_of(p, from), bar_of(p, to.saturating_sub(1).max(from)));
+        return Ok((a, b - a + 1));
+    }
+    let first = opt_u32(args, first_key).ok_or_else(|| format!("{first_key} (or section, or selection) is required"))?;
+    let bars = opt_u32(args, "bars").ok_or("bars is required")?.max(1);
+    Ok((first, bars))
+}
+
+fn find_section<'a>(p: &'a Project, name: &str) -> Result<&'a compypal_core::Section, String> {
+    let want = name.trim().to_lowercase();
+    p.sections
+        .iter()
+        .find(|s| s.name.to_lowercase() == want)
+        .or_else(|| p.sections.iter().find(|s| s.name.to_lowercase().contains(&want)))
+        .ok_or_else(|| {
+            let names: Vec<String> = p.sections.iter().map(|s| format!("{:?}", s.name)).collect();
+            format!("no section {name:?}; sections are {}", if names.is_empty() { "none".into() } else { names.join(", ") })
+        })
 }
 
 fn find_session(p: &Project, v: Option<&Value>) -> Result<Session, String> {
@@ -434,13 +524,10 @@ fn get_project(app: &mut dyn App) -> ToolResult {
         }
     }
     if let Some(sel) = app.selection() {
-        let name = p.track(sel.track).map_or("?".into(), |t| t.name.clone());
-        let what = match sel.figure {
-            Some(f) => format!("figure {f}, {} to {}", format_position(&p, sel.start), format_position(&p, sel.end)),
-            None if sel.end == Tick::MAX => "the whole track".to_string(),
-            None => format!("{} to {}", format_position(&p, sel.start), format_position(&p, sel.end)),
-        };
-        out.push_str(&format!("\nSelected in the UI: {name:?}, {what}\n"));
+        out.push_str(&format!(
+            "\nSelected in the UI: {}. Pass selection: true to a tool to act on it.\n",
+            sel.describe(&p)
+        ));
     }
     Ok(out)
 }
@@ -451,7 +538,7 @@ fn get_notes(app: &mut dyn App, args: &Value) -> ToolResult {
         return Ok(compypal_io::abc::export(&p, &Default::default()));
     }
     let track = track_arg(app, &p, args)?;
-    let (from, to) = bar_range(&p, args);
+    let (from, to) = range_arg(app, &p, args)?;
     let notes = notes_in(&p, track, from, to);
     if notes.is_empty() {
         return Ok("No notes in that range.".into());
@@ -462,13 +549,62 @@ fn get_notes(app: &mut dyn App, args: &Value) -> ToolResult {
 fn get_figures(app: &mut dyn App, args: &Value) -> ToolResult {
     let p = app.project();
     let track = track_arg(app, &p, args)?;
+    let (from, to) = range_arg(app, &p, args)?;
     let notes = p.track(track).map(|t| t.absolute_notes()).unwrap_or_default();
     let figs = figure::analyze(&notes, &p.meter_at(0), &FigureSettings::default());
     if figs.is_empty() {
         return Ok("The track is empty.".into());
     }
-    let described = figure::describe(&figs, p.key, &p.meter_at(0));
+    // Indexes stay those of the whole track, so set_chord can use them.
+    let described: String = figure::describe(&figs, p.key, &p.meter_at(0))
+        .lines()
+        .zip(&figs)
+        .filter(|(_, f)| f.start >= from && f.start < to)
+        .map(|(l, _)| format!("{l}\n"))
+        .collect();
     Ok(format!("index  start  chord (numeral in {})  shape  notes  confidence  [alternatives]\n{described}", p.key.name()))
+}
+
+fn get_selection(app: &mut dyn App) -> ToolResult {
+    let p = app.project();
+    let sel = app.selection().ok_or("nothing is selected in the UI")?;
+    Ok(selection_text(&p, &sel))
+}
+
+/// A selection spelled out: what it is, then per track the figures (with
+/// their indexes, for set_chord) and, when there aren't too many, the notes.
+pub fn selection_text(p: &Project, sel: &Selection) -> String {
+    let end = if sel.end == Tick::MAX { p.end_tick() } else { sel.end };
+    let mut out = format!("Selected: {}.\n", sel.describe(p));
+    let tracks: Vec<&compypal_core::Track> = match sel.track {
+        Some(t) => p.track(t).into_iter().collect(),
+        None => p.tracks.iter().collect(),
+    };
+    for t in tracks {
+        let all = t.absolute_notes();
+        let notes: Vec<Note> = all.iter().copied().filter(|n| n.start >= sel.start && n.start < end).collect();
+        out.push_str(&format!("\n{:?}: {} notes", t.name, notes.len()));
+        if notes.is_empty() {
+            out.push('\n');
+            continue;
+        }
+        if !t.is_drums() {
+            let figs = figure::analyze(&all, &p.meter_at(0), &FigureSettings::default());
+            let chords: Vec<String> = figs
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.start + PPQ as Tick / 8 >= sel.start && f.start < end)
+                .map(|(i, f)| format!("[{i}] {} {}", f.chord.name(spell(p)), f.kind.label()))
+                .collect();
+            out.push_str(&format!(", figures: {}", chords.join(", ")));
+        }
+        out.push('\n');
+        if notes.len() <= 64 {
+            out.push_str(&format_notes(p, &notes));
+            out.push('\n');
+        }
+    }
+    out
 }
 
 fn get_session(app: &mut dyn App, args: &Value) -> ToolResult {
@@ -636,7 +772,7 @@ fn set_notes(app: &mut dyn App, args: &Value) -> ToolResult {
 fn transform(app: &mut dyn App, args: &Value) -> ToolResult {
     let p = app.project();
     let track = track_arg(app, &p, args)?;
-    let (from, to) = bar_range(&p, args);
+    let (from, to) = range_arg(app, &p, args)?;
     let old = notes_in(&p, track, from, to);
     let mut notes = old.clone();
     let mut did = Vec::new();
@@ -875,8 +1011,7 @@ fn set_track(app: &mut dyn App, args: &Value) -> ToolResult {
 
 fn copy_bars(app: &mut dyn App, args: &Value) -> ToolResult {
     let p = app.project();
-    let from_bar = opt_u32(args, "from_bar").ok_or("from_bar is required")?;
-    let bars = opt_u32(args, "bars").ok_or("bars is required")?.max(1);
+    let (from_bar, bars) = bars_arg(app, &p, args, "from_bar")?;
     let to_bar = opt_u32(args, "to_bar").ok_or("to_bar is required")?;
     let merge = args.get("merge").and_then(Value::as_bool).unwrap_or(false);
     let tracks: Vec<Id> = match args.get("tracks").and_then(Value::as_array) {
@@ -905,6 +1040,29 @@ fn copy_bars(app: &mut dyn App, args: &Value) -> ToolResult {
     ))
 }
 
+fn edit_time(app: &mut dyn App, name: &str, args: &Value) -> ToolResult {
+    use compypal_core::arrange;
+    let p = app.project();
+    let (first, bars) = bars_arg(app, &p, args, if name == "insert_bars" { "at" } else { "from_bar" })?;
+    let (from, to) = (bar_start(&p, first), bar_start(&p, first + bars));
+    let last = first + bars - 1;
+    let (label, done) = match name {
+        "insert_bars" => (format!("insert {bars} bars"), format!("Opened {bars} empty bar(s) at bar {first}.")),
+        "delete_bars" => (format!("delete bars {first}-{last}"), format!("Removed bars {first}-{last}.")),
+        _ => (format!("duplicate bars {first}-{last}"), format!("Bars {first}-{last} now repeat as bars {}-{}.", last + 1, last + bars)),
+    };
+    app.edit(&label, &mut |p| {
+        match name {
+            "insert_bars" => arrange::insert_time(p, from, to - from),
+            "delete_bars" => arrange::delete_time(p, from, to - from),
+            _ => arrange::duplicate_time(p, from, to - from),
+        }
+        Ok(())
+    })?;
+    let p = app.project();
+    Ok(format!("{done} The song is now {} bars.", bar_of(&p, p.end_tick().saturating_sub(1))))
+}
+
 fn set_sections(app: &mut dyn App, args: &Value) -> ToolResult {
     let p = app.project();
     let list = args.get("sections").and_then(Value::as_array).ok_or("sections must be an array")?;
@@ -931,7 +1089,7 @@ fn set_sections(app: &mut dyn App, args: &Value) -> ToolResult {
 fn audition(app: &mut dyn App, args: &Value) -> ToolResult {
     let p = app.project();
     let track = track_arg(app, &p, args)?;
-    let (from, to) = bar_range(&p, args);
+    let (from, to) = range_arg(app, &p, args)?;
     let notes = notes_in(&p, track, from, to);
     if notes.is_empty() {
         return Err("no notes there to play".into());
@@ -1082,6 +1240,33 @@ mod tests {
         assert!(r.contains("92 BPM") && r.contains("Am"), "{r}");
         let t = run(&mut app, "transform", json!({"track": "Keys", "from_bar": 5, "to_bar": 8, "transpose": -12}));
         assert!(t.contains("transposed -12"), "{t}");
+    }
+
+    #[test]
+    fn editing_time() {
+        let mut app = demo();
+        let r = run(&mut app, "duplicate_bars", json!({"from_bar": 1, "bars": 4}));
+        assert!(r.contains("now 8 bars"), "{r}");
+        run(&mut app, "insert_bars", json!({"at": 5, "bars": 2}));
+        let r = run(&mut app, "delete_bars", json!({"from_bar": 5, "bars": 2}));
+        assert!(r.contains("now 8 bars"), "{r}");
+    }
+
+    #[test]
+    fn sections_and_selection_as_references() {
+        let mut app = demo();
+        run(&mut app, "duplicate_bars", json!({"section": "intro"}));
+        run(&mut app, "set_sections", json!({"sections": [{"name": "Verse", "from_bar": 1, "bars": 4}, {"name": "Chorus", "from_bar": 5, "bars": 4}]}));
+        let n = run(&mut app, "get_notes", json!({"track": "Bass", "section": "chorus"}));
+        assert!(n.starts_with("12 notes") && n.contains("5.1.0"), "{n}");
+        run(&mut app, "transform", json!({"track": "Keys", "section": "Chorus", "transpose": 12}));
+        app.selection = Some(Selection { track: None, start: 4 * 3840, end: 6 * 3840, figure: None, section: None });
+        let s = run(&mut app, "get_selection", json!({}));
+        assert!(s.contains("bars 5-6, all tracks") && s.contains("\"Keys\": 16 notes, figures: [4] C"), "{s}");
+        let r = run(&mut app, "delete_bars", json!({"selection": true}));
+        assert!(r.contains("Removed bars 5-6"), "{r}");
+        let e = call(&mut app, "get_notes", &json!({"section": "Bridge"})).unwrap_err();
+        assert!(e.contains("\"Verse\", \"Chorus\""), "{e}");
     }
 
     #[test]

@@ -101,6 +101,10 @@ in the 2.1.x binary):
 - Tool calls run on the UI thread (`run_on_main_thread` + a thread-local
   store) through the same `Store::edit` as the UI, so agent edits are
   undoable and show up live, labelled "agent: ...".
+- A selection is a track, a figure, or bars across all tracks (maybe a
+  named section). Tools that take bars also take `section: "Chorus"` or
+  `selection: true`; `get_selection` and the `/ide` push share
+  `tools::selection_text`.
 - Add tools in `compypal-mcp/src/tools.rs`: schema in `list()`, a match arm
   in `call()`, a test against `MemoryApp`. Keep answers short, positional
   (`bar.beat.tick`), and in note names.
@@ -137,7 +141,15 @@ file to get the demo back.
   `Copy` data in attribute closures.
 - A `Vec<NodeHandle>` child is wrapped in a `display: contents` box, so
   `<option>`s built that way are not seen by a native `<select>`.
-- `autofocus` only works inside Modal/Popover. Elsewhere, build the input as
+- Never call a `Memo`'s `.get()` inside `Signal::with`: if the memo has to
+  recompute there, rinch panics with "RefCell already borrowed". Read memos
+  first, then borrow.
+- `autofocus` only works inside Modal/Popover.
+- Inline `<span>`s get no layout box, so they can't be clicked: make
+  clickable spans `inline-block`.
+- There are no focus/blur events on raw inputs. Every text field lives in a
+  popover, and `Store::is_typing` (any popover open) keeps shortcuts such
+  as Space out of the way. Elsewhere, build the input as
   its own node and call `.focus()` on it.
 - Keyboard handling for a popup: `overlay_dismiss::arm_keys_while_open`
   (it gets keys only while focus is inside the owner).
@@ -148,6 +160,7 @@ file to get the demo back.
 2. ~~Recording~~ (done). Follow-ups listed under Recording.
 3. ~~Agent / music IDE~~ (done). Follow-ups: note-level selection in the
    piano roll, an in-app terminal running `claude`, MCP resources for ABC.
-4. **Arranger view**: section/clip timeline across tracks.
+4. ~~Arranger view~~ (done): sections, clip rows, bar selection, duplicate /
+   insert / delete bars (`core::arrange`), section naming.
 5. **Own synth**: a wavetable/mod-matrix synth in the spirit of Vital, to sit
    alongside the SoundFont player.

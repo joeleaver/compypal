@@ -243,3 +243,127 @@
 .right-status { display: flex; gap: 16px; }
 .agent-status { color: var(--rinch-color-dimmed); }
 .agent-status.on { color: var(--rinch-color-green-5); }
+
+.view-switch { display: flex; gap: 2px; margin-right: 8px; }
+.instrument-link { display: inline-block; cursor: pointer; text-decoration: underline dotted; }
+.instrument-link:hover { color: var(--rinch-color-text); }
+.track-row { position: relative; }
+.instrument-picker {
+    position: absolute;
+    left: 8px;
+    top: 52px;
+    width: 220px;
+    z-index: 20;
+    padding: 6px;
+    border-radius: 6px;
+    background: var(--rinch-color-dark-6);
+    border: 1px solid var(--rinch-color-dark-3);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+
+.arranger { flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--rinch-color-dark-9); }
+.arr-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    height: 40px;
+    padding: 0 12px;
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+    border-bottom: 1px solid var(--rinch-color-dark-4);
+    flex-shrink: 0;
+}
+.arr-actions { display: flex; align-items: center; gap: 6px; }
+.section-namer-anchor { position: relative; }
+.section-namer {
+    position: absolute;
+    top: 32px;
+    left: 0;
+    width: 230px;
+    z-index: 20;
+    padding: 6px;
+    border-radius: 6px;
+    background: var(--rinch-color-dark-6);
+    border: 1px solid var(--rinch-color-dark-3);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+.arr-body { flex: 1; display: flex; overflow-y: auto; min-height: 0; }
+.arr-heads { width: 170px; flex-shrink: 0; border-right: 1px solid var(--rinch-color-dark-4); background: var(--rinch-color-dark-8); }
+.arr-head-spacer { height: 52px; border-bottom: 1px solid var(--rinch-color-dark-4); }
+.arr-head {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--rinch-color-dark-6);
+    border-left: 3px solid transparent;
+    cursor: pointer;
+    overflow: hidden;
+    white-space: nowrap;
+}
+.arr-head.selected { background: var(--rinch-color-dark-5); border-left-color: var(--rinch-color-violet-5); }
+.arr-scroll { flex: 1; overflow-x: auto; overflow-y: hidden; }
+.arr { position: relative; }
+.arr-sections { position: relative; height: 32px; background: var(--rinch-color-dark-8); }
+.arr-section {
+    position: absolute;
+    top: 4px;
+    height: 24px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--rinch-color-text);
+    background: var(--rinch-color-indigo-9);
+    border: 1px solid var(--rinch-color-indigo-6);
+    cursor: pointer;
+    overflow: hidden;
+    white-space: nowrap;
+}
+.arr-ruler {
+    position: relative;
+    height: 20px;
+    border-top: 1px solid var(--rinch-color-dark-4);
+    border-bottom: 1px solid var(--rinch-color-dark-4);
+    background: var(--rinch-color-dark-7);
+    cursor: pointer;
+}
+.arr-rows { position: relative; }
+.arr-row { position: relative; border-bottom: 1px solid var(--rinch-color-dark-6); }
+.arr-row.muted { opacity: 0.4; }
+.arr-clip {
+    position: absolute;
+    top: 3px;
+    bottom: 3px;
+    border-radius: 4px;
+    background: rgba(132, 94, 247, 0.18);
+    border: 1px solid var(--rinch-color-violet-7);
+    cursor: pointer;
+}
+.arr-clip.recorded { border-color: var(--rinch-color-orange-7); background: rgba(253, 126, 20, 0.12); }
+.arr-clip:hover { background: rgba(132, 94, 247, 0.3); }
+.arr-note {
+    position: absolute;
+    height: 2px;
+    background: var(--rinch-color-violet-3);
+    pointer-events: none;
+}
+.arr-selection {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    background: rgba(255, 255, 255, 0.06);
+    border-left: 1px solid var(--rinch-color-violet-4);
+    border-right: 1px solid var(--rinch-color-violet-4);
+    pointer-events: none;
+    z-index: 4;
+}
+
+.editor { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.view-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 40px;
+    padding: 0 12px;
+    border-bottom: 1px solid var(--rinch-color-dark-4);
+    flex-shrink: 0;
+}
+.view-title { font-weight: 600; margin-right: 12px; }

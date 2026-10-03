@@ -9,7 +9,7 @@ use std::rc::Rc;
 use compypal_core::cleanup::grid_ticks;
 use compypal_core::{Id, Project, gm};
 use rinch::prelude::*;
-use store::{ROW, Slot, Store};
+use store::{ARR_ROW, ROW, Slot, Store, View};
 
 /// Width of the key labels down the left of the roll.
 const KEYS: f64 = 64.0;
@@ -18,6 +18,8 @@ const CSS: &str = include_str!("style.css");
 
 #[derive(Clone, Debug, PartialEq)]
 struct TrackRow {
+    /// Changes whenever anything shown changes, so the row is rebuilt.
+    key: String,
     id: Id,
     name: String,
     instrument: String,
@@ -35,12 +37,17 @@ struct SessionRow {
 fn track_rows(p: &Project) -> Vec<TrackRow> {
     p.tracks
         .iter()
-        .map(|t| TrackRow {
-            id: t.id,
-            name: t.name.clone(),
-            instrument: if t.is_drums() { "Drums".into() } else { gm::program_name(t.program).into() },
-            notes: t.clips.iter().map(|c| c.notes.len()).sum(),
-            channel: t.channel + 1,
+        .map(|t| {
+            let instrument: String = if t.is_drums() { "Drums".into() } else { gm::program_name(t.program).into() };
+            let notes = t.clips.iter().map(|c| c.notes.len()).sum();
+            TrackRow {
+                key: format!("{}:{}:{instrument}:{notes}", t.id, t.name),
+                id: t.id,
+                name: t.name.clone(),
+                instrument,
+                notes,
+                channel: t.channel + 1,
+            }
         })
         .collect()
 }
@@ -85,6 +92,18 @@ fn Transport() -> NodeHandle {
     rsx! {
         div { class: "transport",
             span { class: "project-name", {|| store.project.with(|p| p.name.clone())} }
+            div { class: "view-switch",
+                Button { size: "xs",
+                    variant: {|| if store.view.get() == View::Arrange { "filled" } else { "default" }},
+                    onclick: move || store.view.set(View::Arrange),
+                    "Arrange"
+                }
+                Button { size: "xs",
+                    variant: {|| if store.view.get() == View::Edit { "filled" } else { "default" }},
+                    onclick: move || store.view.set(View::Edit),
+                    "Edit"
+                }
+            }
             span { class: "readout",
                 {|| store.project.with(|p| {
                     let m = p.meter_at(0);
@@ -136,23 +155,6 @@ fn Transport() -> NodeHandle {
                 "Redo"
             }
             div { class: "divider" }
-            Button { size: "xs", variant: "light",
-                onclick: move || store.quantize_selected(grid_ticks("1/16").unwrap()),
-                "Quantize 1/16"
-            }
-            Button { size: "xs",
-                variant: {|| if store.roman.get() { "filled" } else { "default" }},
-                onclick: move || store.roman.update(|v| *v = !*v),
-                "Roman"
-            }
-            Button { size: "xs",
-                variant: {|| if store.show_raw.get() { "filled" } else { "default" }},
-                onclick: move || store.show_raw.update(|v| *v = !*v),
-                "Show raw take"
-            }
-            Button { size: "xs", variant: "default", onclick: move || store.zoom.update(|z| *z = (*z / 1.5).max(8.0)), "−" }
-            Button { size: "xs", variant: "default", onclick: move || store.zoom.update(|z| *z = (*z * 1.5).min(400.0)), "+" }
-            div { class: "divider" }
             Button { size: "xs", variant: "default", onclick: move || store.new_project(), "New" }
             Button { size: "xs", variant: "light", onclick: move || { let _ = store.export_midi(); }, "Export MIDI" }
             Button { size: "xs", variant: "light", onclick: move || { let _ = store.export_abc(); }, "Export ABC" }
@@ -171,7 +173,7 @@ fn Sidebar() -> NodeHandle {
             }
             for t in store.project.with(track_rows) {
                 div {
-                    key: t.id.0,
+                    key: t.key.clone(),
                     class: {
                         let id = t.id;
                         move || if store.selected_track.get() == Some(id) { "track-row selected" } else { "track-row" }
@@ -182,7 +184,21 @@ fn Sidebar() -> NodeHandle {
                     },
                     div { class: "track-name", {t.name.clone()} }
                     div { class: "track-detail",
-                        {format!("{} · ch {} · {} notes", t.instrument, t.channel, t.notes)}
+                        span {
+                            class: "instrument-link",
+                            onclick: {
+                                let id = t.id;
+                                move || {
+                                    store.instrument_draft.set(String::new());
+                                    store.instrument_edit.set(Some(id));
+                                }
+                            },
+                            {t.instrument.clone()}
+                        }
+                        {format!(" · ch {} · {} notes", t.channel, t.notes)}
+                    }
+                    if store.instrument_edit.get() == Some(t.id) {
+                        InstrumentPicker {}
                     }
                 }
             }
@@ -228,7 +244,7 @@ fn Sidebar() -> NodeHandle {
 fn PianoRoll() -> NodeHandle {
     let store = use_store::<Store>();
     let roll = Memo::new(move || store.roll());
-    rsx! {
+    let root = rsx! {
         div { class: "roll-scroll",
             div {
                 class: "roll",
@@ -312,7 +328,302 @@ fn PianoRoll() -> NodeHandle {
                 }
             }
         }
+    };
+    follow_playhead(&root, store, move || store.zoom.get() / compypal_core::PPQ as f64, KEYS);
+    rsx! {
+        div { class: "editor",
+            div { class: "view-toolbar",
+                span { class: "view-title",
+                    {|| store.selected_track.get().and_then(|id| store.project.with(|p| p.track(id).map(|t| t.name.clone()))).unwrap_or_default()}
+                }
+                Button { size: "xs", variant: "light",
+                    onclick: move || store.quantize_selected(grid_ticks("1/16").unwrap()),
+                    "Quantize 1/16"
+                }
+                Button { size: "xs",
+                    variant: {|| if store.roman.get() { "filled" } else { "default" }},
+                    onclick: move || store.roman.update(|v| *v = !*v),
+                    "Roman"
+                }
+                Button { size: "xs",
+                    variant: {|| if store.show_raw.get() { "filled" } else { "default" }},
+                    onclick: move || store.show_raw.update(|v| *v = !*v),
+                    "Show raw take"
+                }
+                Button { size: "xs", variant: "default", onclick: move || store.zoom.update(|z| *z = (*z / 1.5).max(8.0)), "−" }
+                Button { size: "xs", variant: "default", onclick: move || store.zoom.update(|z| *z = (*z * 1.5).min(400.0)), "+" }
+            }
+            {root}
+        }
     }
+}
+
+/// Keeps the playhead in view while playing, scrolling a page at a time.
+fn follow_playhead(scroller: &NodeHandle, store: Store, px_per_tick: impl Fn() -> f64 + 'static, offset: f64) {
+    let scroller = scroller.clone();
+    rinch::core::Effect::new(move || {
+        let Some(secs) = store.song_seconds() else { return };
+        let tick = store.project.with(|p| p.tempo.seconds_to_tick(secs));
+        let x = tick * untracked(&px_per_tick) + offset;
+        let (left, width) = (scroller.scroll_left(), scroller.client_width());
+        if width > 0.0 && (x > left + width - 40.0 || x < left + offset) {
+            scroller.set_scroll_left((x - offset - 40.0).max(0.0));
+        }
+    });
+}
+
+/// The whole song: sections across the top, a row per track with its
+/// clips, and whole-bar editing of the selection.
+#[component]
+fn Arranger() -> NodeHandle {
+    let store = use_store::<Store>();
+    let arr = Memo::new(move || store.arrangement());
+    let timeline = rsx! {
+        div { class: "arr-scroll",
+            div { class: "arr", style: {|| format!("width: {}px;", arr.get().width)},
+                div { class: "arr-sections",
+                    for sec in arr.get().sections {
+                        div {
+                            key: sec.key.clone(),
+                            class: "arr-section",
+                            style: {format!("left: {}px; width: {}px;", sec.left, sec.width - 2.0)},
+                            onclick: {
+                                let (a, b) = (sec.first, sec.last);
+                                move || store.select_bars(a, b)
+                            },
+                            {sec.name.clone()}
+                        }
+                    }
+                }
+                div {
+                    class: "arr-ruler",
+                    onclick: move || {
+                        let c = get_click_context();
+                        let x = (c.mouse_x - c.element_x) as f64;
+                        let tick = (x / arr.get().px).max(0.0) as u64;
+                        let bar = store.project.with(|p| compypal_core::text::bar_of(p, tick));
+                        store.select_bar(bar, c.modifiers.shift);
+                    },
+                    for b in arr.get().bars {
+                        div { key: b.key.clone(), class: "bar-number", style: {format!("left: {}px;", b.left)},
+                            {b.number.to_string()}
+                        }
+                    }
+                }
+                div { class: "arr-rows",
+                    for b in arr.get().bars {
+                        div { key: b.key.clone(), class: "bar-line", style: {format!("left: {}px;", b.left)} }
+                    }
+                    for row in arr.get().rows {
+                        div {
+                            key: row.key.clone(),
+                            class: {if row.muted { "arr-row muted" } else { "arr-row" }},
+                            style: {format!("height: {ARR_ROW}px;")},
+                            for clip in row.clips.clone() {
+                                div {
+                                    key: clip.key.clone(),
+                                    class: {if clip.recorded { "arr-clip recorded" } else { "arr-clip" }},
+                                    style: {format!("left: {}px; width: {}px;", clip.left, clip.width - 2.0)},
+                                    onclick: {
+                                        let (track, start) = (clip.track, clip.start);
+                                        move || store.open_clip(track, start)
+                                    },
+                                }
+                            }
+                            for n in row.notes.clone() {
+                                div { key: n.key.clone(), class: "arr-note",
+                                    style: {format!("left: {}px; top: {}px; width: {}px;", n.left, n.top, n.width)},
+                                }
+                            }
+                        }
+                    }
+                    div {
+                        class: "arr-selection",
+                        style: {|| match store.bar_sel.get() {
+                            Some((a, b)) => {
+                                // Read the memo before borrowing the project: a
+                                // memo recomputing inside `with` panics.
+                                let px = arr.get().px;
+                                store.project.with(|p| {
+                                let (from, to) = (compypal_core::text::bar_start(p, a), compypal_core::text::bar_start(p, b + 1));
+                                format!("left: {}px; width: {}px;", from as f64 * px, (to - from) as f64 * px)
+                                })
+                            }
+                            None => "display: none;".into(),
+                        }},
+                    }
+                    div {
+                        class: "playhead",
+                        style: {|| match store.song_seconds() {
+                            Some(secs) => {
+                                let tick = store.project.with(|p| p.tempo.seconds_to_tick(secs));
+                                format!("left: {}px;", tick * arr.get().px)
+                            }
+                            None => "display: none;".into(),
+                        }},
+                    }
+                }
+            }
+        }
+    };
+    follow_playhead(&timeline, store, move || arr.get().px, 0.0);
+    rsx! {
+        div { class: "arranger",
+            div { class: "arr-toolbar",
+                Button { size: "xs", variant: "default", onclick: move || store.arr_zoom.update(|z| *z = (*z / 1.5).max(4.0)), "−" }
+                Button { size: "xs", variant: "default", onclick: move || store.arr_zoom.update(|z| *z = (*z * 1.5).min(120.0)), "+" }
+                {|| match store.bar_sel.get() {
+                    Some((a, b)) if a == b => format!("Bar {a}"),
+                    Some((a, b)) => format!("Bars {a}–{b}"),
+                    None => "Click a bar to select it; shift-click to select a range.".into(),
+                }}
+                if store.bar_sel.get().is_some() {
+                    div { class: "arr-actions",
+                        Button { size: "xs", variant: "light", onclick: move || store.bars_action("duplicate"), "Duplicate" }
+                        Button { size: "xs", variant: "default", onclick: move || store.bars_action("insert"), "Insert empty before" }
+                        Button { size: "xs", variant: "default", color: "red", onclick: move || store.bars_action("delete"), "Delete bars" }
+                        div { class: "divider" }
+                        div { class: "section-namer-anchor",
+                            Button { size: "xs", variant: "light",
+                                onclick: move || store.section_edit.update(|v| *v = !*v),
+                                {|| match store.section_draft.get() {
+                                    name if name.is_empty() => "Name section…".to_string(),
+                                    name => format!("Section: {name} (rename…)"),
+                                }}
+                            }
+                            if store.section_edit.get() {
+                                SectionNamer {}
+                            }
+                        }
+                    }
+                }
+            }
+            div { class: "arr-body",
+                div { class: "arr-heads",
+                    div { class: "arr-head-spacer" }
+                    for row in arr.get().rows {
+                        div {
+                            key: row.key.clone(),
+                            class: {
+                                let id = row.track;
+                                move || if store.selected_track.get() == Some(id) { "arr-head selected" } else { "arr-head" }
+                            },
+                            style: {format!("height: {ARR_ROW}px;")},
+                            onclick: {
+                                let id = row.track;
+                                move || store.select_track(id)
+                            },
+                            div { class: "track-name", {row.name.clone()} }
+                            div { class: "track-detail", {row.instrument.clone()} }
+                        }
+                    }
+                }
+                {timeline}
+            }
+        }
+    }
+}
+
+/// Names the selected bars. Enter saves (an empty name removes the
+/// section), Escape cancels.
+#[component]
+fn SectionNamer() -> NodeHandle {
+    let store = use_store::<Store>();
+    let input = rsx! {
+        input {
+            class: "chord-input",
+            placeholder: "Verse, Chorus, Bridge…",
+            value: {|| store.section_draft.get()},
+            oninput: move |v: String| store.section_draft.set(v),
+        }
+    };
+    let root = rsx! {
+        div { class: "section-namer",
+            {input.clone()}
+            div { class: "editor-hint", "Enter save · empty removes · Esc cancel" }
+        }
+    };
+    overlay_dismiss::arm_keys_while_open(
+        __scope,
+        &root,
+        Rc::new(|| true),
+        Rc::new(move |k: &rinch::core::KeyEventData| match k.key.as_str() {
+            "Enter" => {
+                store.name_section();
+                store.section_edit.set(false);
+                true
+            }
+            "Escape" => {
+                store.section_edit.set(false);
+                true
+            }
+            _ => false,
+        }),
+        Rc::new(move || store.section_edit.set(false)),
+    );
+    input.focus();
+    root
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct InstrumentRow {
+    program: u8,
+    name: &'static str,
+}
+
+/// Picks a General MIDI instrument by typing part of its name.
+#[component]
+fn InstrumentPicker() -> NodeHandle {
+    let store = use_store::<Store>();
+    let input = rsx! {
+        input {
+            class: "chord-input",
+            placeholder: "piano, strings, bass…",
+            value: {|| store.instrument_draft.get()},
+            oninput: move |v: String| store.instrument_draft.set(v),
+        }
+    };
+    let root = rsx! {
+        div { class: "instrument-picker",
+            {input.clone()}
+            div { class: "suggestions",
+                for item in store.instrument_suggestions().into_iter().map(|(program, name)| InstrumentRow { program, name }) {
+                    div {
+                        key: item.program,
+                        class: "suggestion",
+                        onclick: move || {
+                            if let Some(t) = store.instrument_edit.get() {
+                                store.set_instrument(t, item.program);
+                            }
+                        },
+                        span { class: "suggestion-chord", {item.name} }
+                        span { class: "suggestion-alt", {format!("{}", item.program + 1)} }
+                    }
+                }
+            }
+        }
+    };
+    overlay_dismiss::arm_keys_while_open(
+        __scope,
+        &root,
+        Rc::new(|| true),
+        Rc::new(move |k: &rinch::core::KeyEventData| match k.key.as_str() {
+            "Enter" => {
+                if let (Some(t), Some((program, _))) = (store.instrument_edit.get(), store.instrument_suggestions().first().copied()) {
+                    store.set_instrument(t, program);
+                }
+                true
+            }
+            "Escape" => {
+                store.instrument_edit.set(None);
+                true
+            }
+            _ => false,
+        }),
+        Rc::new(move || store.instrument_edit.set(None)),
+    );
+    input.focus();
+    root
 }
 
 /// One box per figure, labelled with its chord, above the roll. Click one to
@@ -506,7 +817,7 @@ fn app() -> NodeHandle {
 
     // Space plays and stops, unless someone is typing.
     rinch::core::set_keyboard_interceptor(move |k| {
-        if k.is_space() && k.is_down() && store.editing.get().is_none() {
+        if k.is_space() && k.is_down() && !store.is_typing() {
             // Space ends a take too: the same key that starts things stops them.
             store.toggle_play();
             return true;
@@ -520,7 +831,10 @@ fn app() -> NodeHandle {
             Transport {}
             div { class: "main",
                 Sidebar {}
-                PianoRoll {}
+                match store.view.get() {
+                    View::Edit => PianoRoll {},
+                    View::Arrange => Arranger {},
+                }
             }
             div { class: "statusbar",
                 span { {|| store.status.get()} }

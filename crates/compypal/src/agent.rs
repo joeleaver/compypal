@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
-use compypal_core::text::{bar_of, format_notes};
+use compypal_core::text::bar_of;
 use compypal_core::{Id, Note, Project, Tick};
 use compypal_mcp::{App, Dispatch, Selection, ide::Ide, tools};
 use rinch::prelude::*;
@@ -170,32 +170,19 @@ pub fn start(store: Store) {
     });
 }
 
-/// A selection as Claude Code reads one: a "file" (project/track), a line
-/// range (bars), and the text (what's there, readably).
+/// A selection as Claude Code reads one: a "file" (the project, and the
+/// track if there is one), a line range (bars), and the text: the same
+/// summary the get_selection tool gives.
 fn selection_params(p: &Project, sel: &Selection) -> Option<Value> {
-    let t = p.track(sel.track)?;
-    let notes: Vec<Note> =
-        t.absolute_notes().into_iter().filter(|n| n.start >= sel.start && n.start < sel.end.max(sel.start + 1)).collect();
-    let end = sel.end.min(notes.iter().map(|n| n.end()).max().unwrap_or(sel.start + 1));
+    let end = if sel.end == Tick::MAX { p.end_tick().max(sel.start + 1) } else { sel.end };
     let (first, last) = (bar_of(p, sel.start), bar_of(p, end.saturating_sub(1).max(sel.start)));
-    let what = match sel.figure {
-        Some(i) => {
-            let figs = compypal_core::figure::analyze(&t.absolute_notes(), &p.meter_at(0), &Default::default());
-            let f = figs.get(i)?;
-            format!(
-                "figure {i} of track {:?}: {} ({}) {}",
-                t.name,
-                f.chord.name(compypal_core::theory::Spelling::for_key(p.key)),
-                f.chord.roman(p.key),
-                f.kind.label()
-            )
-        }
-        None => format!("track {:?}", t.name),
+    let file = match sel.track.and_then(|t| p.track(t)) {
+        Some(t) => format!("compypal/{}/{}", p.name, t.name),
+        None => format!("compypal/{}", p.name),
     };
-    let text = format!("{what}, bars {first}-{last}, {} notes:\n{}", notes.len(), format_notes(p, &notes));
     Some(json!({
-        "text": text,
-        "filePath": format!("compypal/{}/{}", p.name, t.name),
+        "text": tools::selection_text(p, sel),
+        "filePath": file,
         "selection": {
             "start": {"line": first - 1, "character": 0},
             "end": {"line": last - 1, "character": 1},

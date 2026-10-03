@@ -297,6 +297,27 @@ impl TempoMap {
         }
     }
 
+    /// Moves every change after `at` by `delta` ticks (never the first).
+    pub fn shift_from(&mut self, at: Tick, delta: i64) {
+        for c in self.changes.iter_mut().skip(1).filter(|c| c.tick >= at) {
+            c.tick = c.tick.saturating_add_signed(delta);
+        }
+    }
+
+    /// Drops changes in `from..to` and closes the gap. The tempo in force
+    /// at `to` carries on from `from`.
+    pub fn remove_range(&mut self, from: Tick, to: Tick) {
+        let carried = self.bpm_at(to);
+        let had_change_inside = self.changes.iter().any(|c| c.tick > from && c.tick <= to);
+        self.changes.retain(|c| c.tick == 0 || c.tick < from || c.tick > to);
+        for c in self.changes.iter_mut().skip(1).filter(|c| c.tick > to) {
+            c.tick -= to - from;
+        }
+        if had_change_inside && self.bpm_at(from) != carried {
+            self.set(from, carried);
+        }
+    }
+
     pub fn tick_to_seconds(&self, tick: f64) -> f64 {
         let mut secs = 0.0;
         for (i, c) in self.changes.iter().enumerate() {
