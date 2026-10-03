@@ -9,7 +9,8 @@ use compypal_core::cleanup::{self, Quantize};
 use compypal_core::figure::{self, FigureSettings};
 use compypal_core::text::{self, bar_of, bar_start, format_notes, format_position};
 use compypal_core::theory::{self, Chord, Spelling};
-use compypal_core::{Id, KeySignature, MeterChange, Note, PPQ, Project, Session, Tick, gm};
+use compypal_core::jam::{self, JamSummary, TempoGuess};
+use compypal_core::{Id, KeySignature, MeterChange, Note, PPQ, Project, RawEvent, Session, Tick, gm};
 use serde_json::{Value, json};
 
 /// What the user is pointing at in the UI: a track, a figure on a track,
@@ -57,6 +58,15 @@ pub trait App {
     fn audition(&mut self, track: Id, notes: &[Note]) -> Result<(), String>;
     /// Writes the project in `format` ("midi" or "abc"); returns the path.
     fn export(&mut self, format: &str) -> Result<String, String>;
+    /// Jams from the always-on journal, newest first; `true` marks the one
+    /// still being played.
+    fn jams(&self) -> Vec<(JamSummary, bool)>;
+    /// Journal events between two unix times.
+    fn jam_events(&self, from: f64, to: f64) -> Vec<RawEvent>;
+    /// Plays raw events as played, on a piano.
+    fn play_raw(&mut self, events: &[RawEvent]) -> Result<(), String>;
+    /// Unix seconds now.
+    fn now(&self) -> f64;
 }
 
 type ToolResult = Result<String, String>;
@@ -78,7 +88,42 @@ pub fn list() -> Value {
     });
     let section = json!({"type": "string", "description": "Act on this named section instead of giving bars."});
     let selection = json!({"type": "boolean", "description": "Act on whatever the user has selected in the app instead of giving bars."});
+    let jam_ref = json!({"type": ["string", "integer"], "description": "A jam id from list_jams, or \"latest\" (the default)."});
+    let secs = |what: &str| json!({"type": "number", "description": what});
     json!([
+        {
+            "name": "list_jams",
+            "description": "Jams from the always-on journal: while listening is on, everything the user plays is logged and cut into jams at silences. Newest first, one line each: id, when, length, notes, tempo guess, key, the chords it moved through. Use this when the user says they played something earlier.",
+            "inputSchema": {"type": "object", "properties": {
+                "limit": {"type": "integer", "description": "Default 10."},
+                "since_hours": {"type": "number", "description": "Only jams from the last this many hours."}
+            }}
+        },
+        {
+            "name": "get_jam",
+            "description": "One jam in detail, to find the part the user means: tempo guess, key, a timeline of chords (mm:ss), activity per 10 seconds (busy or loud stretches are often the idea), and the notes. Give from/to (seconds into the jam) to zoom in.",
+            "inputSchema": {"type": "object", "properties": {
+                "jam": jam_ref, "from": secs("Seconds into the jam."), "to": secs("Seconds into the jam.")
+            }}
+        },
+        {
+            "name": "audition_jam",
+            "description": "Plays a stretch of a jam to the user exactly as it was played, to check it's the right bit.",
+            "inputSchema": {"type": "object", "properties": {
+                "jam": jam_ref, "from": secs("Seconds into the jam."), "to": secs("Seconds into the jam.")
+            }}
+        },
+        {
+            "name": "keep_jam",
+            "description": "Brings a jam, or seconds from..to of it, into the song as a recorded session and a clip, on the beat grid its tempo implies. Then get_session, clean_take and get_figures work on it like any take. If the song is empty, it adopts the jam's tempo.",
+            "inputSchema": {"type": "object", "properties": {
+                "jam": jam_ref, "from": secs("Seconds into the jam."), "to": secs("Seconds into the jam."),
+                "bpm": {"type": "number", "description": "Override the tempo guess."},
+                "track": {"type": ["string", "integer"], "description": "An existing track, or a name for a new one (default: a new track named after the jam)."},
+                "instrument": {"type": ["string", "integer"], "description": "For a new track: a General MIDI name or number."},
+                "at_bar": {"type": "integer", "description": "Where it starts. Default: the bar after the song ends."}
+            }}
+        },
         {
             "name": "get_selection",
             "description": "What the user has selected in the app (a figure, a track, or bars across all tracks, possibly a named section), with the chords and notes in it. When the user says \"this\", \"here\" or \"the selection\", start here.",
@@ -293,6 +338,10 @@ pub fn call(app: &mut dyn App, name: &str, args: &Value) -> ToolResult {
         "get_figures" => get_figures(app, args),
         "get_session" => get_session(app, args),
         "get_selection" => get_selection(app),
+        "list_jams" => list_jams(app, args),
+        "get_jam" => get_jam(app, args),
+        "audition_jam" => audition_jam(app, args),
+        "keep_jam" => keep_jam(app, args),
         "clean_take" => clean_take(app, args),
         "set_notes" => set_notes(app, args),
         "transform" => transform(app, args),
@@ -582,6 +631,227 @@ fn get_figures(app: &mut dyn App, args: &Value) -> ToolResult {
         .map(|(l, _)| format!("{l}\n"))
         .collect();
     Ok(format!("index  start  chord (numeral in {})  shape  notes  confidence  [alternatives]\n{described}", p.key.name()))
+}
+
+// --- jams ------------------------------------------------------------------
+
+/// "14:22" today, "Tue 14:22" this week, else "Oct 3 14:22"; local time.
+pub fn when(t: f64, now: f64) -> String {
+    let Ok(ts) = jiff::Timestamp::from_second(t as i64) else { return format!("{t:.0}") };
+    let zone = jiff::tz::TimeZone::system();
+    let at = ts.to_zoned(zone.clone());
+    let today = jiff::Timestamp::from_second(now as i64).map(|n| n.to_zoned(zone).date()).ok();
+    let ago = now - t;
+    let rel = if ago < 3600.0 {
+        format!(" ({} min ago)", (ago / 60.0).round() as i64)
+    } else if ago < 86_400.0 {
+        format!(" ({:.0} h ago)", ago / 3600.0)
+    } else {
+        String::new()
+    };
+    let clock = at.strftime("%H:%M").to_string();
+    if Some(at.date()) == today {
+        format!("{clock}{rel}")
+    } else if ago < 6.0 * 86_400.0 {
+        format!("{} {clock}", at.strftime("%a"))
+    } else {
+        format!("{} {clock}", at.strftime("%b %-d"))
+    }
+}
+
+pub fn mmss(secs: f64) -> String {
+    let s = secs.max(0.0).round() as u64;
+    format!("{}:{:02}", s / 60, s % 60)
+}
+
+fn jam_line(j: &JamSummary, live: bool, now: f64) -> String {
+    let tempo = match j.tempo {
+        Some(t) if t.confidence >= 0.35 => format!("~{:.0} BPM", t.bpm),
+        Some(_) => "free time".into(),
+        None => "too short to time".into(),
+    };
+    format!(
+        "{}  {}  {}  {} notes  {}  {}{}{}",
+        j.id,
+        if live { "now playing".to_string() } else { when(j.start, now) },
+        mmss(j.duration()),
+        j.notes,
+        tempo,
+        j.key.as_deref().unwrap_or("?"),
+        if j.chords.is_empty() { String::new() } else { format!("  {}", j.chords.iter().take(12).cloned().collect::<Vec<_>>().join(" ")) },
+        if j.sustain_pedal { "  (pedal)" } else { "" }
+    )
+}
+
+fn find_jam(app: &dyn App, v: Option<&Value>) -> Result<(JamSummary, bool), String> {
+    let jams = app.jams();
+    if jams.is_empty() {
+        return Err("no jams logged yet; listening has to be on while the user plays".into());
+    }
+    match v {
+        None | Some(Value::Null) => Ok(jams[0].clone()),
+        Some(Value::String(s)) if s == "latest" => Ok(jams[0].clone()),
+        Some(v) => {
+            let id = v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())).ok_or("jam must be an id or \"latest\"")?;
+            jams.into_iter().find(|(j, _)| j.id == id).ok_or_else(|| format!("no jam {id}; see list_jams"))
+        }
+    }
+}
+
+/// The jam's events, optionally narrowed to `from..to` seconds into it.
+fn jam_slice(app: &dyn App, j: &JamSummary, args: &Value) -> (Vec<RawEvent>, f64, f64) {
+    let from = args.get("from").and_then(Value::as_f64).unwrap_or(0.0).max(0.0);
+    let to = args.get("to").and_then(Value::as_f64).unwrap_or(f64::INFINITY);
+    let (a, b) = (j.start + from, (j.start + to).min(j.end + 1.0));
+    (app.jam_events(a - 0.01, b), a, b)
+}
+
+fn list_jams(app: &mut dyn App, args: &Value) -> ToolResult {
+    let now = app.now();
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
+    let since = args.get("since_hours").and_then(Value::as_f64).map(|h| now - h * 3600.0);
+    let jams: Vec<String> = app
+        .jams()
+        .iter()
+        .filter(|(j, _)| since.is_none_or(|s| j.end >= s))
+        .take(limit)
+        .map(|(j, live)| jam_line(j, *live, now))
+        .collect();
+    if jams.is_empty() {
+        return Ok("No jams yet. Listening must be on (the Listen button) while the user plays.".into());
+    }
+    Ok(format!("id  when  length  notes  tempo  key  chords\n{}", jams.join("\n")))
+}
+
+fn get_jam(app: &mut dyn App, args: &Value) -> ToolResult {
+    let (j, live) = find_jam(app, args.get("jam"))?;
+    let (events, from, to) = jam_slice(app, &j, args);
+    if events.is_empty() {
+        return Err("no notes there".into());
+    }
+    let ons = jam::onsets(&events);
+    let tempo = jam::estimate_tempo(&ons).or(j.tempo);
+    let mut out = format!("{}\n", jam_line(&j, live, app.now()));
+    if from > j.start + 0.5 || to < j.end {
+        out.push_str(&format!("Showing {}–{} of it.\n", mmss(from - j.start), mmss(to.min(j.end) - j.start)));
+    }
+    if let Some(t) = tempo {
+        out.push_str(&format!("Tempo here: {:.1} BPM, confidence {:.2}{}\n", t.bpm, t.confidence, if t.confidence < 0.35 { " (free time)" } else { "" }));
+    }
+    out.push_str("\nActivity per 10s (start, notes, mean velocity):\n");
+    for (t, n, v) in jam::activity(&events, 10.0) {
+        let bar = "#".repeat(n.min(60) / 2);
+        out.push_str(&format!("  {}  {:>3}  {:>3}  {bar}\n", mmss(from - j.start + t), n, v));
+    }
+    if let Some(t) = tempo.filter(|t| t.confidence >= 0.3) {
+        let notes = jam::jam_notes(&events, Some(&t));
+        let figs = figure::analyze(&notes, &MeterChange::default_four(), &FigureSettings::default());
+        let beat = 60.0 / t.bpm;
+        out.push_str("\nChords (time into the jam):\n");
+        let mut line = Vec::new();
+        for f in figs {
+            let secs = from - j.start + (t.downbeat - from).max(-beat) + f.start as f64 / PPQ as f64 * beat;
+            line.push(format!("{} {}", mmss(secs.max(0.0)), f.chord.name(Spelling::Mixed)));
+        }
+        out.push_str(&format!("  {}\n", line.join(", ")));
+    }
+    let shown = events.iter().filter(|e| matches!(e.msg, compypal_core::RawMsg::NoteOn { velocity, .. } if velocity > 0)).count();
+    if shown <= 160 {
+        out.push_str("\nNotes (seconds into the jam):\n");
+        for e in &events {
+            if let compypal_core::RawMsg::NoteOn { pitch, velocity } = e.msg
+                && velocity > 0
+            {
+                out.push_str(&format!("  {:.2}  {}  vel {velocity}\n", e.t - j.start, gm::pitch_name(pitch)));
+            }
+        }
+    } else {
+        out.push_str(&format!("\n{shown} notes here; give from/to to see them.\n"));
+    }
+    Ok(out)
+}
+
+fn audition_jam(app: &mut dyn App, args: &Value) -> ToolResult {
+    let (j, _) = find_jam(app, args.get("jam"))?;
+    let (events, from, to) = jam_slice(app, &j, args);
+    if events.is_empty() {
+        return Err("no notes there".into());
+    }
+    app.play_raw(&events)?;
+    Ok(format!("Playing {}–{} of jam {}.", mmss(from - j.start), mmss(to.min(j.end) - j.start), j.id))
+}
+
+fn keep_jam(app: &mut dyn App, args: &Value) -> ToolResult {
+    let p = app.project();
+    let (j, _) = find_jam(app, args.get("jam"))?;
+    let (events, from, to) = jam_slice(app, &j, args);
+    let ons = jam::onsets(&events);
+    if ons.len() < 2 {
+        return Err("no notes there to keep".into());
+    }
+    // The beat of this stretch, which may differ from the whole jam's.
+    let tempo: Option<TempoGuess> = match args.get("bpm").and_then(Value::as_f64) {
+        Some(bpm) => jam::fit_phase(&ons, bpm),
+        None => jam::estimate_tempo(&ons).or(j.tempo).filter(|t| t.confidence >= 0.3),
+    };
+    let label = format!("Jam {}", when(j.start, app.now()).split(' ').next().unwrap_or(""));
+    let empty = p.tracks.iter().all(|t| t.clips.iter().all(|c| c.notes.is_empty()));
+    let at_bar = match args.get("at_bar").and_then(Value::as_u64) {
+        Some(b) => b as u32,
+        None if empty => 1,
+        None => bar_of(&p, p.end_tick().saturating_sub(1)) + 1,
+    };
+    let existing = match args.get("track") {
+        Some(v) if !v.is_null() => find_track(&p, v).ok(),
+        _ => None,
+    };
+    let new_name = args.get("track").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| label.clone());
+    let program = args.get("instrument").map(instrument_arg).transpose()?.unwrap_or(0);
+    let mut placed = (0, 0, 0usize, String::new());
+    app.edit(&format!("keep {label}"), &mut |p| {
+        if let (Some(t), true) = (tempo, empty) {
+            p.tempo = compypal_core::TempoMap::constant(t.bpm.round());
+        }
+        let track = existing.unwrap_or_else(|| p.add_track(new_name.clone(), program));
+        let start_tick = bar_start(p, at_bar);
+        let id = p.alloc_id();
+        let mut session = jam::to_session(&events, from, to, id, label.clone(), tempo.as_ref(), p.meter_at(start_tick), start_tick);
+        session.recorded_at = j.start as u64;
+        let imported = cleanup::import_session(&session, &p.tempo, true);
+        let bar = p.meter_at(start_tick).ticks_per_bar();
+        let clip_start = start_tick.saturating_sub(imported.pickup_bars as Tick * bar);
+        let end = imported.notes.iter().map(|n| n.end()).max().unwrap_or(0);
+        let clip_id = p.alloc_id();
+        placed = (
+            bar_of(p, clip_start),
+            bar_of(p, (clip_start + end).saturating_sub(1)),
+            imported.notes.len(),
+            p.track(track).map(|t| t.name.clone()).unwrap_or_default(),
+        );
+        let t = p.track_mut(track).ok_or("no such track")?;
+        t.clips.push(compypal_core::Clip {
+            id: clip_id,
+            name: label.clone(),
+            start: clip_start,
+            length: end.div_ceil(bar).max(1) * bar,
+            notes: imported.notes,
+            source_session: Some(id),
+        });
+        t.clips.sort_by_key(|c| c.start);
+        p.sessions.push(session);
+        Ok(())
+    })?;
+    let (first, last, notes, track) = placed;
+    Ok(format!(
+        "Kept {}–{} of jam {} as session {label:?}: {notes} notes on track {track:?}, bars {first}-{last}, {}. It's as played; get_session and clean_take work on it now.",
+        mmss(from - j.start),
+        mmss(to.min(j.end) - j.start),
+        j.id,
+        match tempo {
+            Some(t) => format!("at {:.1} BPM (confidence {:.2})", t.bpm, t.confidence),
+            None => "in free time (no steady beat found), at the song's tempo".into(),
+        }
+    ))
 }
 
 fn get_selection(app: &mut dyn App) -> ToolResult {
@@ -1209,11 +1479,14 @@ pub struct MemoryApp {
     pub project: Project,
     pub history: compypal_core::History,
     pub selection: Option<Selection>,
+    /// A journal: every event, unix-timed, and the jams found in it.
+    pub journal: Vec<RawEvent>,
+    pub clock: f64,
 }
 
 impl MemoryApp {
     pub fn new(project: Project) -> Self {
-        Self { project, history: Default::default(), selection: None }
+        Self { project, history: Default::default(), selection: None, journal: Vec::new(), clock: 0.0 }
     }
 }
 
@@ -1242,6 +1515,29 @@ impl App for MemoryApp {
     }
     fn export(&mut self, _: &str) -> Result<String, String> {
         Err("no exports here".into())
+    }
+    fn jams(&self) -> Vec<(JamSummary, bool)> {
+        // Split at gaps, as the real journal does.
+        let mut out = Vec::new();
+        let mut cur: Vec<RawEvent> = Vec::new();
+        for e in &self.journal {
+            if cur.last().is_some_and(|l| e.t - l.t > jam::GAP_SECONDS) {
+                out.extend(jam::summarize(&cur));
+                cur.clear();
+            }
+            cur.push(*e);
+        }
+        out.extend(jam::summarize(&cur));
+        out.into_iter().rev().map(|j| (j, false)).collect()
+    }
+    fn jam_events(&self, from: f64, to: f64) -> Vec<RawEvent> {
+        self.journal.iter().copied().filter(|e| e.t >= from && e.t <= to).collect()
+    }
+    fn play_raw(&mut self, _: &[RawEvent]) -> Result<(), String> {
+        Ok(())
+    }
+    fn now(&self) -> f64 {
+        self.clock
     }
 }
 
@@ -1376,6 +1672,53 @@ mod tests {
         assert_eq!(chords, ["Am (vi)", "F (IV)", "C (I)", "G (V)"], "{r}");
         let e = call(&mut app, "set_harmony", &json!({"section": "Intro", "chords": ["I"]})).unwrap_err();
         assert!(e.contains("has 4 chords and you gave 1"), "{e}");
+    }
+
+    /// A morning of noodling: a short free-time doodle, then a proper jam
+    /// at 92 BPM, Am F C G arpeggios, with a stray touch between.
+    fn journal() -> Vec<RawEvent> {
+        use compypal_core::RawMsg::{NoteOff, NoteOn};
+        let mut ev = Vec::new();
+        let mut note = |t: f64, pitch: u8, velocity: u8, len: f64| {
+            ev.push(RawEvent { t, channel: 0, msg: NoteOn { pitch, velocity } });
+            ev.push(RawEvent { t: t + len, channel: 0, msg: NoteOff { pitch } });
+        };
+        let t0 = 1_800_000_000.0;
+        for (i, p) in [60u8, 67, 64, 72, 65, 62, 71, 59, 69].iter().enumerate() {
+            note(t0 + i as f64 * 0.43 + (i % 3) as f64 * 0.17, *p, 70, 0.3);
+        }
+        note(t0 + 30.0, 40, 50, 0.1);
+        let start = t0 + 60.0;
+        let eighth = 30.0 / 92.0;
+        let chords = [[57u8, 60, 64, 69], [53, 57, 60, 65], [48, 52, 55, 60], [55, 59, 62, 67]];
+        for i in 0..64 {
+            let jit = ((i * 37 % 11) as f64 - 5.0) * 0.003;
+            let p = chords[(i / 8) % 4][[0, 1, 2, 3, 2, 1, 2, 1][i % 8]];
+            note(start + i as f64 * eighth + jit, p, if i % 2 == 0 { 96 } else { 74 }, eighth * 0.8);
+        }
+        ev.sort_by(|a, b| a.t.total_cmp(&b.t));
+        ev
+    }
+
+    #[test]
+    fn finding_and_keeping_a_jam() {
+        let mut app = MemoryApp::new(Project::new("Empty"));
+        app.journal = journal();
+        app.clock = 1_800_000_000.0 + 3600.0;
+        let list = run(&mut app, "list_jams", json!({}));
+        let lines: Vec<&str> = list.lines().skip(1).collect();
+        assert_eq!(lines.len(), 2, "doodle and jam; the stray note isn't one: {list}");
+        assert!(lines[0].contains("~92 BPM") && lines[0].contains("Am F C G"), "{list}");
+        let detail = run(&mut app, "get_jam", json!({"jam": "latest"}));
+        assert!(detail.contains("Chords (time into the jam)") && detail.contains("0:00 Am"), "{detail}");
+        let kept = run(&mut app, "keep_jam", json!({"from": 0, "to": 10.3}));
+        assert!(kept.contains("bars 1-4"), "{kept}");
+        // The empty song took the jam's tempo, and the take reads as the jam.
+        assert_eq!(app.project.tempo.bpm_at(0), 92.0);
+        let figs = run(&mut app, "get_figures", json!({}));
+        assert!(figs.contains("Am (vi)") && figs.contains("G (V)"), "{figs}");
+        let s = run(&mut app, "get_session", json!({}));
+        assert!(s.contains("32 notes"), "{s}");
     }
 
     #[test]

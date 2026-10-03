@@ -6,6 +6,7 @@
 //! loaded in the background, then switches over.
 
 pub mod input;
+pub mod journal;
 pub mod player;
 pub mod schedule;
 pub mod synth;

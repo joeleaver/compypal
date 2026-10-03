@@ -81,6 +81,25 @@ impl App for StoreApp {
         Ok(())
     }
 
+    fn jams(&self) -> Vec<(compypal_core::jam::JamSummary, bool)> {
+        self.0.journal.map(|j| j.jams()).unwrap_or_default()
+    }
+
+    fn jam_events(&self, from: f64, to: f64) -> Vec<compypal_core::RawEvent> {
+        self.0.journal.map(|j| j.events(from, to)).unwrap_or_default()
+    }
+
+    fn play_raw(&mut self, events: &[compypal_core::RawEvent]) -> Result<(), String> {
+        let engine = self.0.engine.ok_or("no audio output")?;
+        // Channel 16 is left free for previews like this; piano.
+        engine.audition(compypal_audio::schedule::from_raw(events, 15, 0));
+        Ok(())
+    }
+
+    fn now(&self) -> f64 {
+        compypal_audio::journal::now()
+    }
+
     fn export(&mut self, format: &str) -> Result<String, String> {
         let path = match format {
             "abc" => self.0.export_abc(),
@@ -106,6 +125,11 @@ impl Dispatch for UiDispatch {
         });
         rx.recv_timeout(Duration::from_secs(30)).unwrap_or_else(|_| Err("compypal didn't answer in time".into()))
     }
+}
+
+/// Runs a tool from the UI, exactly as the agent would.
+pub fn run_tool(store: Store, name: &str, args: Value) -> Result<String, String> {
+    tools::call(&mut StoreApp(store), name, &args)
 }
 
 pub fn status_text(agents: usize) -> String {

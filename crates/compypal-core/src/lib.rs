@@ -7,6 +7,7 @@ pub mod demo;
 pub mod figure;
 pub mod gm;
 pub mod history;
+pub mod jam;
 pub mod model;
 pub mod session;
 pub mod text;

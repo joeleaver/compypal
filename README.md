@@ -25,6 +25,7 @@ Early. Working today:
 - Arranger: sections and clips across tracks; duplicate, insert or delete bars song-wide
 - Playback through a General MIDI SoundFont, metronome, looping
 - Recording from a MIDI controller into raw sessions, with live display
+- Listen mode: leave it running and everything you play is journaled and split into jams; keep the good bits later, or ask Claude to find them
 - Claude Code integration: MCP tools for reading, cleaning, composing and arranging, and `/ide` for sharing what you've selected
 
 Not built yet: an arranger view and the custom synth. See `CLAUDE.md` for

@@ -393,3 +393,7 @@
 .stack-roll { position: relative; background: var(--rinch-color-dark-9); }
 .stack-c { position: absolute; left: 64px; right: 0; height: 1px; background: var(--rinch-color-dark-6); }
 .stack-note { height: 4px; border-radius: 1px; border-width: 0; }
+
+.jam-row { padding: 6px 12px; border-left: 3px solid transparent; }
+.jam-row.live { border-left-color: var(--rinch-color-teal-5); }
+.jam-actions { display: flex; gap: 2px; }

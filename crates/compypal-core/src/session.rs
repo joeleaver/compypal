@@ -25,6 +25,11 @@ pub struct Session {
     /// started on the timeline.
     #[serde(default)]
     pub start_tick: crate::model::Tick,
+    /// Played to its own pulse (`click_bpm`) rather than the project's, as
+    /// a jam caught by the journal is. Importing then keeps its beats, not
+    /// its seconds, so it lines up with the song at any project tempo.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub own_tempo: bool,
     pub events: Vec<RawEvent>,
 }
 
@@ -180,6 +185,7 @@ mod tests {
             meter: MeterChange { tick: 0, numerator: 4, denominator: 4 },
             downbeat_offset: 0.0,
             start_tick: 0,
+            own_tempo: false,
             events,
         }
     }

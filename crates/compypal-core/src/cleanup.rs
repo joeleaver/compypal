@@ -23,6 +23,16 @@ pub struct Imported {
 /// back relative to `start_tick` (plus any pickup bars), ready to be a
 /// clip's notes. With `sounding` set, durations include the sustain pedal.
 pub fn import_session(session: &Session, tempo: &TempoMap, sounding: bool) -> Imported {
+    if session.own_tempo
+        && let Some(bpm) = session.click_bpm
+    {
+        // Beats, not seconds: lay the take out at its own tempo, then
+        // shift it to where it starts in the song.
+        let own = TempoMap::constant(bpm);
+        let mut imp = import_session(&Session { own_tempo: false, start_tick: 0, ..session.clone() }, &own, sounding);
+        imp.notes.sort_by_key(|n| (n.start, n.pitch));
+        return imp;
+    }
     let raw = session.notes();
     let origin_secs = tempo.tick_to_seconds(session.start_tick as f64);
     let origin = session.start_tick as f64;
@@ -37,7 +47,10 @@ pub fn import_session(session: &Session, tempo: &TempoMap, sounding: bool) -> Im
 
     let earliest = ticks.iter().map(|t| t.0).fold(0.0, f64::min);
     let bar = session.meter.ticks_per_bar() as f64;
-    let pickup_bars = if earliest < 0.0 { (-earliest / bar).ceil() as u32 } else { 0 };
+    // A note a hair before the downbeat is early, not a pickup: it is
+    // clamped to the downbeat instead of adding a bar in front.
+    let early = PPQ as f64 / 8.0;
+    let pickup_bars = if earliest < -early { (-earliest / bar).ceil() as u32 } else { 0 };
     let shift = pickup_bars as f64 * bar;
 
     let mut notes: Vec<Note> = ticks
@@ -373,6 +386,7 @@ mod tests {
             meter: MeterChange { tick: 0, numerator: 4, denominator: 4 },
             downbeat_offset: 2.0,
             start_tick: 0,
+            own_tempo: false,
             events: vec![
                 // A beat before the downbeat.
                 RawEvent { t: 1.5, channel: 0, msg: RawMsg::NoteOn { pitch: 60, velocity: 90 } },
@@ -396,6 +410,7 @@ mod tests {
             meter: MeterChange { tick: 0, numerator: 4, denominator: 4 },
             downbeat_offset: 2.0,
             start_tick: 7680,
+            own_tempo: false,
             events: vec![
                 RawEvent { t: 2.5, channel: 0, msg: RawMsg::NoteOn { pitch: 60, velocity: 90 } },
                 RawEvent { t: 3.0, channel: 0, msg: RawMsg::NoteOff { pitch: 60 } },

@@ -51,6 +51,7 @@ pub fn sloppy_take(id: crate::model::Id) -> Session {
         meter: crate::model::MeterChange { tick: 0, numerator: 4, denominator: 4 },
         downbeat_offset: downbeat,
         start_tick: 0,
+        own_tempo: false,
         events,
     }
 }

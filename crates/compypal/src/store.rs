@@ -86,6 +86,21 @@ pub struct Store {
     pub stacked: Signal<bool>,
     /// The song's chords, from all pitched tracks together.
     pub harmony: Memo<Vec<Figure>>,
+    pub journal: Option<&'static compypal_audio::journal::Journal>,
+    /// Logging everything played, whatever else is going on.
+    pub listening: Signal<bool>,
+    /// Recent jams for the sidebar, refreshed from the journal.
+    pub jams: Signal<Vec<JamRow>>,
+}
+
+/// A jam as the sidebar lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JamRow {
+    pub key: String,
+    pub id: u64,
+    pub when: String,
+    pub detail: String,
+    pub live: bool,
 }
 
 /// A take in progress.
@@ -113,13 +128,19 @@ impl Recording {
             meter: self.meter,
             downbeat_offset: self.lead,
             start_tick: self.start_tick,
+            own_tempo: false,
             events,
         }
     }
 }
 
 impl Store {
-    pub fn new(project: Project, engine: Option<&'static Engine>, midi: Option<&'static MidiIn>) -> Self {
+    pub fn new(
+        project: Project,
+        engine: Option<&'static Engine>,
+        midi: Option<&'static MidiIn>,
+        journal: Option<&'static compypal_audio::journal::Journal>,
+    ) -> Self {
         let first = project.tracks.first().map(|t| t.id);
         let project = Signal::new(project);
         let selected_track = Signal::new(first);
@@ -168,7 +189,24 @@ impl Store {
             section_edit: Signal::new(false),
             stacked: Signal::new(false),
             harmony,
+            journal,
+            listening: Signal::new(journal.is_some_and(|j| j.listening())),
+            jams: Signal::new(Vec::new()),
         }
+    }
+
+    /// Turns the always-on journal on or off, and remembers the choice.
+    pub fn toggle_listening(self) {
+        let Some(j) = self.journal else { return };
+        let on = !j.listening();
+        j.set_listening(on);
+        self.listening.set(on);
+        crate::autosave::save_settings(&crate::autosave::Settings { listening: on });
+        self.status.set(if on {
+            "Listening: everything you play is kept in the journal, and jams show up in the sidebar".into()
+        } else {
+            "Stopped listening".into()
+        });
     }
 
     /// Whether a text field has the keyboard, so shortcuts stand aside. Every

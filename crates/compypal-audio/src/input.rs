@@ -13,6 +13,7 @@ use std::time::Instant;
 use compypal_core::{RawEvent, RawMsg};
 
 use crate::Engine;
+use crate::journal::Journal;
 
 #[derive(Debug, thiserror::Error)]
 pub enum InputError {
@@ -79,11 +80,14 @@ pub struct MidiIn {
     conn: RefCell<Option<(String, midir::MidiInputConnection<()>)>>,
     capture: Arc<Capture>,
     engine: Option<&'static Engine>,
+    journal: Option<Arc<Journal>>,
 }
 
 impl MidiIn {
-    pub fn new(engine: Option<&'static Engine>) -> Self {
-        Self { conn: RefCell::new(None), capture: Arc::new(Capture::default()), engine }
+    /// With a journal, everything played is also offered to it (it keeps
+    /// what arrives while it is listening).
+    pub fn new(engine: Option<&'static Engine>, journal: Option<Arc<Journal>>) -> Self {
+        Self { conn: RefCell::new(None), capture: Arc::new(Capture::default()), engine, journal }
     }
 
     pub fn capture(&self) -> Arc<Capture> {
@@ -104,6 +108,7 @@ impl MidiIn {
             .ok_or_else(|| InputError::NoPort(name.to_string()))?;
         let capture = self.capture.clone();
         let engine = self.engine;
+        let journal = self.journal.clone();
         let conn = input
             .connect(
                 &port,
@@ -111,6 +116,9 @@ impl MidiIn {
                 move |_stamp, bytes, _| {
                     let now = Instant::now();
                     let Some((channel, msg)) = RawMsg::from_midi(bytes) else { return };
+                    if let Some(j) = &journal {
+                        j.log(channel, msg);
+                    }
                     if let Some(take) = capture.take.lock().unwrap().as_mut() {
                         let t = now.saturating_duration_since(take.start).as_secs_f64();
                         take.events.push(RawEvent { t, channel, msg });

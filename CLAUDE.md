@@ -115,6 +115,24 @@ in the 2.1.x binary):
   in `call()`, a test against `MemoryApp`. Keep answers short, positional
   (`bar.beat.tick`), and in note names.
 
+## Listening (the journal)
+
+- With Listen on (remembered in `settings.json`), every MIDI message goes to
+  `journal/<utc-day>.jsonl` with unix time, whatever the transport is doing.
+  The writer thread (`compypal-audio::journal`) cuts the stream into jams at
+  8 s silences and appends each finished jam's `JamSummary` to
+  `journal/jams.jsonl`, so listing jams never reads the raw log.
+- `core::jam` has no I/O: `estimate_tempo` (grid fit on eighths plus
+  accent alignment on beats, to settle half/double time), `summarize`,
+  `activity`, `to_session`.
+- Kept jams are sessions with `own_tempo`: imported by their own pulse
+  (beats, not seconds), so they sit on the song's grid at any song tempo.
+- Agent: `list_jams`, `get_jam` (chord timeline in mm:ss, activity map),
+  `audition_jam`, `keep_jam` (a stretch, re-timed on that stretch). The
+  sidebar's ▶ and Keep buttons call the same tools via `agent::run_tool`.
+- To test without disturbing your own journal, run with
+  `XDG_DATA_HOME=/some/tmp` and the `fake_keys` example.
+
 ## Persistence
 
 The project autosaves to `$XDG_DATA_HOME/compypal/autosave.json` on every

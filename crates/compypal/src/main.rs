@@ -134,6 +134,17 @@ fn Transport() -> NodeHandle {
                 onclick: move || store.metronome.update(|m| *m = !*m),
                 "Click"
             }
+            Button { size: "xs",
+                color: "teal",
+                variant: {|| if store.listening.get() { "filled" } else { "default" }},
+                disabled: store.journal.is_none(),
+                onclick: move || store.toggle_listening(),
+                {|| match (store.listening.get(), store.jams.with(|j| j.first().is_some_and(|r| r.live))) {
+                    (true, true) => "◉ Listening (jam!)",
+                    (true, false) => "◉ Listening",
+                    _ => "○ Listen",
+                }}
+            }
             span { class: "readout position",
                 {|| {
                     let tick = match store.song_seconds() {
@@ -220,6 +231,33 @@ fn Sidebar() -> NodeHandle {
             }
             if store.project.with(|p| p.sessions.is_empty()) {
                 div { class: "empty", "No recordings yet" }
+            }
+            if store.listening.get() || store.jams.with(|j| !j.is_empty()) {
+                div { class: "sidebar-heading", "Jams" }
+            }
+            for jam in store.jams.get() {
+                div { key: jam.key.clone(), class: {if jam.live { "jam-row live" } else { "jam-row" }},
+                    div { class: "session-head",
+                        div { class: "track-name", {jam.when.clone()} }
+                        div { class: "jam-actions",
+                            Button { size: "xs", variant: "subtle",
+                                onclick: move || {
+                                    let r = agent::run_tool(store, "audition_jam", serde_json::json!({"jam": jam.id}));
+                                    store.status.set(r.unwrap_or_else(|e| e));
+                                },
+                                "▶"
+                            }
+                            Button { size: "xs", variant: "subtle",
+                                onclick: move || {
+                                    let r = agent::run_tool(store, "keep_jam", serde_json::json!({"jam": jam.id}));
+                                    store.status.set(r.unwrap_or_else(|e| e));
+                                },
+                                "Keep"
+                            }
+                        }
+                    }
+                    div { class: "track-detail", {jam.detail.clone()} }
+                }
             }
             div { class: "sidebar-heading", "MIDI input" }
             for port in port_rows() {
@@ -874,8 +912,21 @@ fn app() -> NodeHandle {
             None
         }
     };
+    // The journal lives as long as the app; MIDI input holds a handle too.
+    let journal: Option<&'static std::sync::Arc<compypal_audio::journal::Journal>> =
+        match autosave::journal_dir().map(compypal_audio::journal::Journal::open) {
+            Some(Ok(j)) => {
+                j.set_listening(autosave::load_settings().listening);
+                Some(Box::leak(Box::new(j)))
+            }
+            Some(Err(e)) => {
+                eprintln!("journal unavailable: {e}");
+                None
+            }
+            None => None,
+        };
     let midi: &'static compypal_audio::input::MidiIn =
-        Box::leak(Box::new(compypal_audio::input::MidiIn::new(engine)));
+        Box::leak(Box::new(compypal_audio::input::MidiIn::new(engine, journal.cloned())));
     match compypal_audio::input::default_port() {
         Some(port) => match midi.connect(&port) {
             Ok(()) => eprintln!("MIDI input: {port}"),
@@ -884,9 +935,45 @@ fn app() -> NodeHandle {
         None => eprintln!("MIDI input: none found"),
     }
     let project = autosave::load().unwrap_or_else(compypal_core::demo::project);
-    let store = create_store(Store::new(project, engine, Some(midi)));
+    let store = create_store(Store::new(project, engine, Some(midi), journal.map(|j| &**j)));
     store.select_track(store.selected_track.get().unwrap_or_default());
     agent::start(store);
+
+    // Keep the sidebar's jam list fresh: a jam appears while it's played and
+    // settles once the silence after it is long enough.
+    if let Some(j) = journal {
+        let (j, jams) = (j.clone(), store.jams);
+        std::thread::spawn(move || {
+            let mut last: Vec<store::JamRow> = Vec::new();
+            loop {
+                let now = compypal_audio::journal::now();
+                let rows: Vec<store::JamRow> = j
+                    .jams()
+                    .into_iter()
+                    .take(8)
+                    .map(|(s, live)| {
+                        let when = if live { "● now".to_string() } else { compypal_mcp::tools::when(s.start, now) };
+                        let tempo = match s.tempo {
+                            Some(t) if t.confidence >= 0.35 => format!(" · ~{:.0} BPM", t.bpm),
+                            _ => String::new(),
+                        };
+                        let detail = format!(
+                            "{} · {} notes{tempo}{}",
+                            compypal_mcp::tools::mmss(s.duration()),
+                            s.notes,
+                            s.key.as_deref().map(|k| format!(" · {k}")).unwrap_or_default()
+                        );
+                        store::JamRow { key: format!("{}:{when}:{detail}", s.id), id: s.id, when, detail, live }
+                    })
+                    .collect();
+                if rows != last {
+                    jams.send(rows.clone());
+                    last = rows;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        });
+    }
 
     // Every change is saved, so a take is never lost to a crash or a quit.
     rinch::core::Effect::new(move || {

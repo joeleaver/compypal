@@ -125,6 +125,34 @@ pub fn excerpt(song: &Schedule, from: f64, to: f64) -> Schedule {
     Schedule { events, length: to - from }
 }
 
+/// Raw played events (any clock, in seconds) as a schedule from zero, all
+/// on `channel` with `program`: for hearing a jam exactly as played.
+pub fn from_raw(events: &[compypal_core::RawEvent], channel: u8, program: u8) -> Schedule {
+    use compypal_core::RawMsg;
+    let Some(t0) = events.first().map(|e| e.t) else { return Schedule::default() };
+    let ch = channel & 0x0f;
+    let mut out = vec![Timed { t: 0.0, msg: [0xc0 | ch, program & 0x7f, 0] }];
+    for e in events {
+        let t = e.t - t0;
+        let msg = match e.msg {
+            RawMsg::NoteOn { pitch, velocity } => [0x90 | ch, pitch & 0x7f, velocity.clamp(1, 127)],
+            RawMsg::NoteOff { pitch } => [0x80 | ch, pitch & 0x7f, 0],
+            RawMsg::Cc { controller, value } => [0xb0 | ch, controller & 0x7f, value & 0x7f],
+            RawMsg::PitchBend { value } => {
+                let v = (value as i32 + 8192).clamp(0, 16383) as u16;
+                [0xe0 | ch, (v & 0x7f) as u8, (v >> 7) as u8]
+            }
+        };
+        out.push(Timed { t, msg });
+    }
+    // Let go of everything at the end, pedal included.
+    let end = out.last().map_or(0.0, |e| e.t) + 0.5;
+    out.push(Timed { t: end, msg: [0xb0 | ch, 64, 0] });
+    out.push(Timed { t: end, msg: [0xb0 | ch, 123, 0] });
+    sort(&mut out);
+    Schedule { events: out, length: end }
+}
+
 /// A one-off phrase to hear right now: notes for one instrument, starting
 /// at zero.
 pub fn audition(notes: &[Note], channel: u8, program: u8, project: &Project) -> Schedule {

@@ -9,4 +9,5 @@ compypal-io.workspace = true
 compypal-audio.workspace = true
 compypal-mcp.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 rinch = { workspace = true, features = ["desktop", "components", "theme", "debug"] }
