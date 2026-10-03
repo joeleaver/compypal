@@ -67,6 +67,18 @@ It has a chord and a shape (block, arpeggio, run, melody, note, mixed).
 - `cargo run -p compypal-audio --example play_demo` checks the device
   without the UI.
 
+## Note editing
+
+- The grid has one `onmousedown` (`grid_press`) that hit-tests notes itself;
+  notes, rows and barlines are `pointer-events: none`. A press arms a
+  `Drag::absolute()`; `Store::roll_press/roll_drag/roll_release` turn it into
+  a select / move / resize / draw, previewed live (`note_drag`) and committed
+  as one undoable edit.
+- The roll shows a fixed range (A0–C8, or GM drums) inside a vertical
+  scroller, so the grid never re-lays itself out under the pointer.
+- Picked notes are a `Selection` with `notes`; tools given `selection: true`
+  touch exactly those notes.
+
 ## Recording
 
 - `input::MidiIn` (midir) connects at launch to `COMPYPAL_MIDI_IN` (a

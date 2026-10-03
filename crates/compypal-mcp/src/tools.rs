@@ -24,6 +24,8 @@ pub struct Selection {
     pub end: Tick,
     pub figure: Option<usize>,
     pub section: Option<String>,
+    /// Particular notes picked out in the piano roll; empty for a range.
+    pub notes: Vec<Note>,
 }
 
 impl Selection {
@@ -35,6 +37,9 @@ impl Selection {
             if a == b { format!("bar {a}") } else { format!("bars {a}-{b}") }
         };
         let track = self.track.and_then(|t| p.track(t)).map(|t| t.name.clone());
+        if !self.notes.is_empty() {
+            return format!("{} selected note(s) on track {:?} ({bars})", self.notes.len(), track.unwrap_or_default());
+        }
         match (&track, self.figure, &self.section) {
             (Some(t), Some(f), _) => format!("figure {f} of track {t:?} ({bars})"),
             (Some(t), None, _) if self.end == Tick::MAX => format!("the whole of track {t:?}"),
@@ -606,8 +611,7 @@ fn get_notes(app: &mut dyn App, args: &Value) -> ToolResult {
         return Ok(compypal_io::abc::export(&p, &Default::default()));
     }
     let track = track_arg(app, &p, args)?;
-    let (from, to) = range_arg(app, &p, args)?;
-    let notes = notes_in(&p, track, from, to);
+    let notes = target_notes(app, &p, track, args)?;
     if notes.is_empty() {
         return Ok("No notes in that range.".into());
     }
@@ -871,7 +875,11 @@ pub fn selection_text(p: &Project, sel: &Selection) -> String {
     };
     for t in tracks {
         let all = t.absolute_notes();
-        let notes: Vec<Note> = all.iter().copied().filter(|n| n.start >= sel.start && n.start < end).collect();
+        let notes: Vec<Note> = if sel.notes.is_empty() {
+            all.iter().copied().filter(|n| n.start >= sel.start && n.start < end).collect()
+        } else {
+            sel.notes.iter().copied().filter(|n| all.contains(n)).collect()
+        };
         out.push_str(&format!("\n{:?}: {} notes", t.name, notes.len()));
         if notes.is_empty() {
             out.push('\n');
@@ -1058,11 +1066,24 @@ fn set_notes(app: &mut dyn App, args: &Value) -> ToolResult {
     Ok(format!("Bars {from_bar}-{to_bar}: replaced {} notes with {count}.", old.len()))
 }
 
+/// The notes a tool should touch: the user's picked notes when the call
+/// says `selection` and notes are picked, else every note in the range.
+fn target_notes(app: &dyn App, p: &Project, track: Id, args: &Value) -> Result<Vec<Note>, String> {
+    if args.get("selection").and_then(Value::as_bool) == Some(true)
+        && let Some(sel) = app.selection()
+        && !sel.notes.is_empty()
+    {
+        let all = p.track(track).map(|t| t.absolute_notes()).unwrap_or_default();
+        return Ok(sel.notes.into_iter().filter(|n| all.contains(n)).collect());
+    }
+    let (from, to) = range_arg(app, p, args)?;
+    Ok(notes_in(p, track, from, to))
+}
+
 fn transform(app: &mut dyn App, args: &Value) -> ToolResult {
     let p = app.project();
     let track = track_arg(app, &p, args)?;
-    let (from, to) = range_arg(app, &p, args)?;
-    let old = notes_in(&p, track, from, to);
+    let old = target_notes(app, &p, track, args)?;
     let mut notes = old.clone();
     let mut did = Vec::new();
     if args.get("delete").and_then(Value::as_bool) == Some(true) {
@@ -1653,7 +1674,7 @@ mod tests {
         let n = run(&mut app, "get_notes", json!({"track": "Bass", "section": "chorus"}));
         assert!(n.starts_with("12 notes") && n.contains("5.1.0"), "{n}");
         run(&mut app, "transform", json!({"track": "Keys", "section": "Chorus", "transpose": 12}));
-        app.selection = Some(Selection { track: None, start: 4 * 3840, end: 6 * 3840, figure: None, section: None });
+        app.selection = Some(Selection { track: None, start: 4 * 3840, end: 6 * 3840, figure: None, section: None, notes: vec![] });
         let s = run(&mut app, "get_selection", json!({}));
         assert!(s.contains("bars 5-6, all tracks") && s.contains("\"Keys\": 16 notes, figures: [4] C"), "{s}");
         let r = run(&mut app, "delete_bars", json!({"selection": true}));
@@ -1719,6 +1740,19 @@ mod tests {
         assert!(figs.contains("Am (vi)") && figs.contains("G (V)"), "{figs}");
         let s = run(&mut app, "get_session", json!({}));
         assert!(s.contains("32 notes"), "{s}");
+    }
+
+    #[test]
+    fn picked_notes_are_the_selection() {
+        let mut app = demo();
+        let bass = app.project.tracks[1].clone();
+        let picked: Vec<Note> = bass.absolute_notes().into_iter().take(2).collect();
+        app.selection = Some(Selection { track: Some(bass.id), start: 0, end: 3840, figure: None, section: None, notes: picked.clone() });
+        let s = run(&mut app, "get_selection", json!({}));
+        assert!(s.contains("2 selected note(s)") && s.contains("\"Bass\": 2 notes"), "{s}");
+        run(&mut app, "transform", json!({"selection": true, "transpose": 2}));
+        let after = app.project.tracks[1].absolute_notes();
+        assert_eq!(after.iter().filter(|n| n.pitch == 38).count(), 2, "only the two picked notes moved");
     }
 
     #[test]

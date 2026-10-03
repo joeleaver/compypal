@@ -82,6 +82,7 @@
 .grid { position: relative; }
 .row {
     position: absolute;
+    pointer-events: none;
     left: 0;
     right: 0;
     border-bottom: 1px solid var(--rinch-color-dark-7);
@@ -102,6 +103,7 @@
 }
 .bar-line {
     position: absolute;
+    pointer-events: none;
     top: 0;
     bottom: 0;
     width: 1px;
@@ -109,6 +111,7 @@
 }
 .note {
     position: absolute;
+    pointer-events: none;
     border-radius: 2px;
     background: var(--rinch-color-violet-4);
     border: 1px solid var(--rinch-color-violet-7);
@@ -397,3 +400,10 @@
 .jam-row { padding: 6px 12px; border-left: 3px solid transparent; }
 .jam-row.live { border-left-color: var(--rinch-color-teal-5); }
 .jam-actions { display: flex; gap: 2px; }
+
+.grid { cursor: crosshair; }
+.note.selected { background: var(--rinch-color-yellow-4); border-color: var(--rinch-color-yellow-7); }
+
+.roll-scroll { display: flex; flex-direction: column; overflow-x: auto; overflow-y: hidden; }
+.roll-fixed { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.grid-viewport { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; }

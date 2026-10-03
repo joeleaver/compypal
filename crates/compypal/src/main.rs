@@ -282,11 +282,67 @@ fn Sidebar() -> NodeHandle {
 fn PianoRoll() -> NodeHandle {
     let store = use_store::<Store>();
     let roll = Memo::new(move || store.roll());
+    // Only the grid scrolls vertically; the chord lane and ruler stay put.
+    let viewport = rsx! {
+        div { class: "grid-viewport",
+                div {
+                class: "grid",
+                style: {|| format!("height: {}px;", roll.get().height)},
+                // One handler for the whole grid: it hit-tests notes itself,
+                // so nothing depends on how presses bubble.
+                onmousedown: move || grid_press(store),
+                for row in roll.get().rows {
+                    div { key: row.key.clone(),
+                        class: {if row.black { "row black" } else { "row" }},
+                        style: {format!("top: {}px; height: {ROW}px;", row.top)},
+                        span { class: "key-label", {row.label.clone()} }
+                    }
+                }
+                for b in roll.get().bars {
+                    div { key: b.key.clone(), class: "bar-line",
+                        style: {format!("left: {}px;", b.left + 64.0)},
+                    }
+                }
+                for n in roll.get().notes {
+                    div { key: n.key.clone(), class: {if n.selected { "note selected" } else { "note" }},
+                        style: {format!("left: {}px; top: {}px; width: {}px; height: {}px; opacity: {:.2};",
+                            n.left + 64.0, n.top + 1.0, n.width, ROW - 2.0, 0.45 + n.velocity as f64 / 127.0 * 0.55)},
+                    }
+                }
+                div {
+                    class: "cursor-line",
+                    style: {|| format!("left: {}px;", store.cursor.get() as f64 * store.zoom.get() / compypal_core::PPQ as f64 + KEYS)},
+                }
+                div {
+                    class: "playhead",
+                    style: {|| match store.song_seconds() {
+                        Some(secs) => {
+                            let tick = store.project.with(|p| p.tempo.seconds_to_tick(secs));
+                            format!("left: {}px;", tick * store.zoom.get() / compypal_core::PPQ as f64 + KEYS)
+                        }
+                        None => "display: none;".into(),
+                    }},
+                }
+                for n in roll.get().live {
+                    div { key: n.key.clone(), class: "note live",
+                        style: {format!("left: {}px; top: {}px; width: {}px; height: {}px;",
+                            n.left + KEYS, n.top + 1.0, n.width, ROW - 2.0)},
+                    }
+                }
+                for n in roll.get().raw {
+                    div { key: n.key.clone(), class: "note raw",
+                        style: {format!("left: {}px; top: {}px; width: {}px; height: {}px;",
+                            n.left + 64.0, n.top + 1.0, n.width, ROW - 2.0)},
+                    }
+                }
+            }
+        }
+    };
     let root = rsx! {
         div { class: "roll-scroll",
             div {
-                class: "roll",
-                style: {|| { let r = roll.get(); format!("width: {}px; height: {}px;", r.width + 64.0, r.height + 20.0) }},
+                class: "roll roll-fixed",
+                style: {|| format!("width: {}px;", roll.get().width + 64.0)},
                 FigureLane {}
                 div {
                     class: "ruler",
@@ -306,68 +362,26 @@ fn PianoRoll() -> NodeHandle {
                         }
                     }
                 }
-                div { class: "grid", style: {|| format!("height: {}px;", roll.get().height)},
-                    for row in roll.get().rows {
-                        div { key: row.key.clone(),
-                            class: {if row.black { "row black" } else { "row" }},
-                            style: {format!("top: {}px; height: {ROW}px;", row.top)},
-                            span {
-                                class: "key-label",
-                                onclick: {
-                                    let pitch = row.pitch;
-                                    move || {
-                                        if let Some(t) = store.selected_track.get() {
-                                            let q = compypal_core::PPQ as u64;
-                                            store.audition(t, &[compypal_core::Note { pitch, velocity: 100, start: 0, duration: q }]);
-                                        }
-                                    }
-                                },
-                                {row.label.clone()}
-                            }
-                        }
-                    }
-                    for b in roll.get().bars {
-                        div { key: b.key.clone(), class: "bar-line",
-                            style: {format!("left: {}px;", b.left + 64.0)},
-                        }
-                    }
-                    for n in roll.get().notes {
-                        div { key: n.key.clone(), class: "note",
-                            style: {format!("left: {}px; top: {}px; width: {}px; height: {}px; opacity: {:.2};",
-                                n.left + 64.0, n.top + 1.0, n.width, ROW - 2.0, 0.45 + n.velocity as f64 / 127.0 * 0.55)},
-                        }
-                    }
-                    div {
-                        class: "cursor-line",
-                        style: {|| format!("left: {}px;", store.cursor.get() as f64 * store.zoom.get() / compypal_core::PPQ as f64 + KEYS)},
-                    }
-                    div {
-                        class: "playhead",
-                        style: {|| match store.song_seconds() {
-                            Some(secs) => {
-                                let tick = store.project.with(|p| p.tempo.seconds_to_tick(secs));
-                                format!("left: {}px;", tick * store.zoom.get() / compypal_core::PPQ as f64 + KEYS)
-                            }
-                            None => "display: none;".into(),
-                        }},
-                    }
-                    for n in roll.get().live {
-                        div { key: n.key.clone(), class: "note live",
-                            style: {format!("left: {}px; top: {}px; width: {}px; height: {}px;",
-                                n.left + KEYS, n.top + 1.0, n.width, ROW - 2.0)},
-                        }
-                    }
-                    for n in roll.get().raw {
-                        div { key: n.key.clone(), class: "note raw",
-                            style: {format!("left: {}px; top: {}px; width: {}px; height: {}px;",
-                                n.left + 64.0, n.top + 1.0, n.width, ROW - 2.0)},
-                        }
-                    }
-                }
+                {viewport.clone()}
             }
         }
     };
     follow_playhead(&root, store, move || store.zoom.get() / compypal_core::PPQ as f64, KEYS);
+    // Bring the selected track's notes into view when it changes.
+    {
+        let viewport = viewport.clone();
+        rinch::core::Effect::new(move || {
+            let _ = store.selected_track.get();
+            let (top, center) = untracked(|| (store.roll().top_pitch, store.center_pitch()));
+            let viewport = viewport.clone();
+            // After layout, so the viewport knows its height.
+            set_timeout(0, move || {
+                let h = viewport.client_height();
+                let y = (top.saturating_sub(center)) as f64 * ROW - h / 2.0;
+                viewport.set_scroll_top(y.max(0.0));
+            });
+        });
+    }
     rsx! {
         div { class: "editor",
             div { class: "view-toolbar",
@@ -384,6 +398,22 @@ fn PianoRoll() -> NodeHandle {
                         "Every track, under the song's chords".to_string()
                     } else {
                         store.selected_track.get().and_then(|id| store.project.with(|p| p.track(id).map(|t| t.name.clone()))).unwrap_or_default()
+                    }}
+                }
+                Button { size: "xs", variant: "default",
+                    onclick: move || store.snap.update(|s| {
+                        // Cycle through the usual grids, then off.
+                        let order = ["1/4", "1/8", "1/16", "1/32", "1/8t", "1/16t"];
+                        let grids: Vec<u64> = order.iter().map(|g| grid_ticks(g).unwrap()).collect();
+                        *s = match grids.iter().position(|g| g == s) {
+                            Some(i) if i + 1 < grids.len() => grids[i + 1],
+                            Some(_) => 0,
+                            None => grids[0],
+                        };
+                    }),
+                    {|| match store.snap.get() {
+                        0 => "Snap off".to_string(),
+                        t => format!("Snap {}", compypal_core::text::format_duration(t)),
                     }}
                 }
                 Button { size: "xs", variant: "light",
@@ -510,6 +540,39 @@ fn StackedRolls() -> NodeHandle {
     };
     follow_playhead(&root, store, move || store.zoom.get() / compypal_core::PPQ as f64, KEYS);
     root
+}
+
+/// A press in the piano roll grid: hear a key in the key column, or start
+/// a note gesture (select, move, resize, draw) that follows the pointer
+/// until release.
+fn grid_press(store: Store) {
+    let c = get_click_context();
+    if c.button != MouseButton::Left {
+        return;
+    }
+    let x = (c.mouse_x - c.element_x) as f64 - KEYS;
+    let y = (c.mouse_y - c.element_y) as f64;
+    if x < 0.0 {
+        let roll = store.roll();
+        let pitch = (roll.top_pitch as i32 - (y / ROW).floor() as i32).clamp(0, 127) as u8;
+        if let Some(t) = store.selected_track.get() {
+            let q = compypal_core::PPQ as u64;
+            store.audition(t, &[compypal_core::Note { pitch, velocity: 100, start: 0, duration: q }]);
+        }
+        return;
+    }
+    let Some(drag) = store.roll_press(x, y, c.modifiers.shift) else { return };
+    let (sx, sy) = (c.mouse_x, c.mouse_y);
+    let live = Rc::new(std::cell::RefCell::new(drag));
+    let (on_move, on_end) = (live.clone(), live);
+    Drag::absolute()
+        .on_move(move |mx, my| store.roll_drag(&mut on_move.borrow_mut(), (mx - sx) as f64, (my - sy) as f64))
+        .on_end(move |_, _| {
+            let d = on_end.borrow().clone();
+            store.roll_release(d);
+        })
+        .on_cancel(move |_, _| store.note_drag.set(None))
+        .start();
 }
 
 /// Keeps the playhead in view while playing, scrolling a page at a time.
@@ -1026,6 +1089,15 @@ fn app() -> NodeHandle {
 
     // Space plays and stops, unless someone is typing.
     rinch::core::set_keyboard_interceptor(move |k| {
+        if k.is_down()
+            && !store.is_typing()
+            && store.view.get() == View::Edit
+            && !store.stacked.get()
+            && !k.is_space()
+            && store.roll_key(&k.key, k.shift, k.ctrl || k.meta)
+        {
+            return true;
+        }
         if k.is_space() && k.is_down() && !store.is_typing() {
             // Space ends a take too: the same key that starts things stops them.
             store.toggle_play();

@@ -91,6 +91,52 @@ pub struct Store {
     pub listening: Signal<bool>,
     /// Recent jams for the sidebar, refreshed from the journal.
     pub jams: Signal<Vec<JamRow>>,
+    /// Notes selected in the piano roll, absolute, on the selected track.
+    pub note_sel: Signal<Vec<Note>>,
+    pub note_drag: Signal<Option<NoteDrag>>,
+    /// Where notes snap to when placed or moved; 0 is off.
+    pub snap: Signal<Tick>,
+    /// The length new notes get: the last one drawn or resized.
+    pub last_len: Signal<Tick>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DragMode {
+    /// Moving notes: time by the snap, pitch by rows.
+    Move,
+    /// Stretching notes from their right edge.
+    Resize,
+    /// Drawing a new note: dragging sets its length.
+    Create,
+}
+
+/// A note gesture in progress: the notes it started from, and how far the
+/// pointer has taken them so far.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NoteDrag {
+    pub mode: DragMode,
+    pub origin: Vec<Note>,
+    pub dt: i64,
+    pub dp: i32,
+}
+
+impl NoteDrag {
+    /// The notes as they'd be if the gesture ended now.
+    pub fn result(&self) -> Vec<Note> {
+        self.origin
+            .iter()
+            .map(|n| match self.mode {
+                DragMode::Move => Note {
+                    start: n.start.saturating_add_signed(self.dt),
+                    pitch: (n.pitch as i32 + self.dp).clamp(0, 127) as u8,
+                    ..*n
+                },
+                DragMode::Resize | DragMode::Create => {
+                    Note { duration: (n.duration as i64 + self.dt).max(PPQ as i64 / 32) as Tick, ..*n }
+                }
+            })
+            .collect()
+    }
 }
 
 /// A jam as the sidebar lists it.
@@ -192,7 +238,162 @@ impl Store {
             journal,
             listening: Signal::new(journal.is_some_and(|j| j.listening())),
             jams: Signal::new(Vec::new()),
+            note_sel: Signal::new(Vec::new()),
+            note_drag: Signal::new(None),
+            snap: Signal::new(PPQ as Tick / 4),
+            last_len: Signal::new(PPQ as Tick / 2),
         }
+    }
+
+    // --- note editing ----------------------------------------------------------
+
+    fn snap_tick(self, t: f64) -> Tick {
+        let snap = self.snap.get();
+        let t = t.max(0.0);
+        if snap == 0 { t.round() as Tick } else { ((t / snap as f64).floor() as Tick) * snap }
+    }
+
+    fn snap_delta(self, dt: f64) -> i64 {
+        let snap = self.snap.get() as f64;
+        if snap == 0.0 { dt.round() as i64 } else { ((dt / snap).round() * snap) as i64 }
+    }
+
+    /// Selects notes and tells the agent: "these notes" is now a thing.
+    pub fn select_notes(self, notes: Vec<Note>) {
+        let track = self.selected_track.get();
+        if let (Some(track), false) = (track, notes.is_empty()) {
+            let start = notes.iter().map(|n| n.start).min().unwrap();
+            let end = notes.iter().map(|n| n.end()).max().unwrap();
+            self.selection.set(Some(compypal_mcp::Selection {
+                track: Some(track),
+                start,
+                end,
+                figure: None,
+                section: None,
+                notes: notes.clone(),
+            }));
+        }
+        self.note_sel.set(notes);
+    }
+
+    /// A press in the piano roll at (`x`, `y`) pixels from the grid's top
+    /// left (after the key column). Returns the gesture to follow, if any.
+    pub fn roll_press(self, x: f64, y: f64, shift: bool) -> Option<NoteDrag> {
+        let track = self.selected_track.get()?;
+        let roll = self.roll();
+        let tick = x / roll.px;
+        let row = (y / ROW).floor();
+        if row < 0.0 {
+            return None;
+        }
+        let pitch = (roll.top_pitch as i32 - row as i32).clamp(0, 127) as u8;
+        let notes = self.project.with(|p| p.track(track).map(|t| t.absolute_notes()).unwrap_or_default());
+        let hit = notes.iter().rev().find(|n| n.pitch == pitch && (n.start as f64) <= tick && tick < n.end() as f64).copied();
+        match hit {
+            Some(n) => {
+                let mut sel = self.note_sel.get();
+                let selected = sel.contains(&n);
+                if shift {
+                    if selected { sel.retain(|s| *s != n) } else { sel.push(n) }
+                    self.select_notes(sel);
+                    return None;
+                }
+                if !selected {
+                    sel = vec![n];
+                    self.select_notes(sel.clone());
+                }
+                self.audition(track, &[n]);
+                let near_end = (n.end() as f64 - tick) * roll.px < 6.0;
+                let mode = if near_end { DragMode::Resize } else { DragMode::Move };
+                Some(NoteDrag { mode, origin: sel, dt: 0, dp: 0 })
+            }
+            None => {
+                if !shift && !self.note_sel.get().is_empty() {
+                    // A press on empty space clears the selection first;
+                    // the next one draws.
+                    self.select_notes(Vec::new());
+                    return None;
+                }
+                let n = Note { pitch, velocity: 90, start: self.snap_tick(tick), duration: self.last_len.get() };
+                self.audition(track, &[n]);
+                Some(NoteDrag { mode: DragMode::Create, origin: vec![n], dt: 0, dp: 0 })
+            }
+        }
+    }
+
+    /// The pointer has moved `dx`, `dy` pixels since the press.
+    pub fn roll_drag(self, drag: &mut NoteDrag, dx: f64, dy: f64) {
+        let px = self.roll().px;
+        drag.dt = self.snap_delta(dx / px);
+        if drag.mode == DragMode::Move {
+            drag.dp = -(dy / ROW).round() as i32;
+        }
+        self.note_drag.set(Some(drag.clone()));
+    }
+
+    /// Commits the gesture as one undoable edit.
+    pub fn roll_release(self, drag: NoteDrag) {
+        self.note_drag.set(None);
+        let Some(track) = self.selected_track.get() else { return };
+        let moved = drag.result();
+        let (old, label) = match drag.mode {
+            DragMode::Create => (Vec::new(), "add note"),
+            DragMode::Move if drag.dt == 0 && drag.dp == 0 => return,
+            DragMode::Resize if drag.dt == 0 => return,
+            DragMode::Move => (drag.origin.clone(), "move notes"),
+            DragMode::Resize => (drag.origin.clone(), "resize notes"),
+        };
+        if drag.mode != DragMode::Move
+            && let Some(n) = moved.first()
+        {
+            self.last_len.set(n.duration);
+        }
+        self.edit(label, |p| p.replace_notes(track, &old, &moved));
+        if drag.mode == DragMode::Move && drag.dp != 0 {
+            self.audition(track, &moved);
+        }
+        self.select_notes(moved);
+    }
+
+    /// Deletes, transposes or moves the selected notes from the keyboard.
+    /// Returns whether the key was used.
+    pub fn roll_key(self, key: &str, shift: bool, ctrl: bool) -> bool {
+        let Some(track) = self.selected_track.get() else { return false };
+        if ctrl && key == "a" {
+            let all = self.project.with(|p| p.track(track).map(|t| t.absolute_notes()).unwrap_or_default());
+            self.select_notes(all);
+            return true;
+        }
+        let sel = self.note_sel.get();
+        if sel.is_empty() {
+            return false;
+        }
+        let step = self.snap.get().max(PPQ as Tick / 16) as i64;
+        let (label, new): (&str, Vec<Note>) = match key {
+            "Delete" | "Backspace" => ("delete notes", Vec::new()),
+            "ArrowUp" | "ArrowDown" => {
+                let d: i32 = if shift { 12 } else { 1 } * if key == "ArrowUp" { 1 } else { -1 };
+                ("transpose notes", sel.iter().map(|n| Note { pitch: (n.pitch as i32 + d).clamp(0, 127) as u8, ..*n }).collect())
+            }
+            "ArrowLeft" | "ArrowRight" => {
+                let d = if key == "ArrowRight" { step } else { -step };
+                if sel.iter().any(|n| (n.start as i64 + d) < 0) {
+                    return true;
+                }
+                ("move notes", sel.iter().map(|n| Note { start: n.start.saturating_add_signed(d), ..*n }).collect())
+            }
+            "Escape" => {
+                self.select_notes(Vec::new());
+                return true;
+            }
+            _ => return false,
+        };
+        self.edit(label, |p| p.replace_notes(track, &sel, &new));
+        if key.starts_with("ArrowU") || key.starts_with("ArrowD") {
+            self.audition(track, &new);
+        }
+        self.select_notes(new);
+        true
     }
 
     /// Turns the always-on journal on or off, and remembers the choice.
@@ -232,7 +433,7 @@ impl Store {
         });
         self.section_draft.set(section.clone().unwrap_or_default());
         // Bars across every track: what "this" means to the agent now.
-        self.selection.set(Some(compypal_mcp::Selection { track: None, start: from, end: to, figure: None, section }));
+        self.selection.set(Some(compypal_mcp::Selection { track: None, start: from, end: to, figure: None, section, notes: Vec::new() }));
         let start = self.project.with(|p| text::bar_start(p, sel.0));
         self.cursor.set(start);
     }
@@ -357,10 +558,13 @@ impl Store {
     /// Selects a track, and plays live input through its instrument.
     pub fn select_track(self, id: Id) {
         self.close_editor();
+        if self.selected_track.get() != Some(id) {
+            self.note_sel.set(Vec::new());
+        }
         self.selected_track.set(Some(id));
         self.monitor_selected();
         // The whole track, however long it grows.
-        self.selection.set(Some(compypal_mcp::Selection { track: Some(id), start: 0, end: Tick::MAX, figure: None, section: None }));
+        self.selection.set(Some(compypal_mcp::Selection { track: Some(id), start: 0, end: Tick::MAX, figure: None, section: None, notes: Vec::new() }));
     }
 
     fn monitor_selected(self) {
@@ -641,13 +845,13 @@ impl Store {
                 let section = self.project.with(|p| {
                     p.sections.iter().find(|s| s.start <= from && from < s.start + s.length).map(|s| s.name.clone())
                 });
-                self.selection.set(Some(compypal_mcp::Selection { track: None, start: from, end: to, figure: None, section }));
+                self.selection.set(Some(compypal_mcp::Selection { track: None, start: from, end: to, figure: None, section, notes: Vec::new() }));
             }
         }
         if let (Slot::Figure(i), Some(track)) = (slot, self.selected_track.get())
             && let Some(f) = self.figures.get().get(i)
         {
-            self.selection.set(Some(compypal_mcp::Selection { track: Some(track), start: f.start, end: f.end, figure: Some(i), section: None }));
+            self.selection.set(Some(compypal_mcp::Selection { track: Some(track), start: f.start, end: f.end, figure: Some(i), section: None, notes: Vec::new() }));
         }
         if let (Slot::Figure(i), Some(track)) = (slot, self.selected_track.get())
             && let Some(f) = self.figures.get().get(i)
@@ -935,7 +1139,7 @@ impl Store {
                             .map(|n| {
                                 let (left, top, width) =
                                     (n.start as f64 * px, (hi - n.pitch) as f64 * STACK_ROW, (n.duration as f64 * px).max(2.0));
-                                RollNote { key: format!("{left}:{top}:{width}:{}", n.velocity), left, top, width, velocity: n.velocity }
+                                RollNote { key: format!("{left}:{top}:{width}:{}", n.velocity), left, top, width, velocity: n.velocity, selected: false }
                             })
                             .collect(),
                         c_lines: (lo..=hi).filter(|p| p % 12 == 0).map(|p| (hi - p) as f64 * STACK_ROW).collect(),
@@ -951,6 +1155,20 @@ impl Store {
         self.project.with(|p| Arrangement::build(p, px).sections)
     }
 
+    /// The pitch at the middle of the selected track's notes, for scrolling
+    /// the roll to them.
+    pub fn center_pitch(self) -> u8 {
+        let Some(track) = self.selected_track.get() else { return 60 };
+        self.project.with(|p| {
+            let notes = p.track(track).map(|t| t.absolute_notes()).unwrap_or_default();
+            if notes.is_empty() {
+                return if p.track(track).is_some_and(|t| t.is_drums()) { 42 } else { 60 };
+            }
+            let (lo, hi) = notes.iter().fold((127u8, 0u8), |(lo, hi), n| (lo.min(n.pitch), hi.max(n.pitch)));
+            ((lo as u16 + hi as u16) / 2) as u8
+        })
+    }
+
     /// The piano roll's contents for the selected track.
     pub fn roll(self) -> Roll {
         let zoom = self.zoom.get();
@@ -964,7 +1182,9 @@ impl Store {
             }
             r.session(Id(0), String::new(), events)
         });
-        self.project.with(|p| Roll::build(p, selected, zoom, show_raw, live.as_ref()))
+        let sel = self.note_sel.get();
+        let drag = self.note_drag.get();
+        self.project.with(|p| Roll::build(p, selected, zoom, show_raw, live.as_ref(), &sel, drag.as_ref()))
     }
 }
 
@@ -1006,6 +1226,7 @@ pub struct RollNote {
     pub top: f64,
     pub width: f64,
     pub velocity: u8,
+    pub selected: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1035,14 +1256,34 @@ pub struct Roll {
     pub raw: Vec<RollNote>,
     /// The take being recorded.
     pub live: Vec<RollNote>,
+    /// Pixels per tick, and the pitch of the top row: for turning a click
+    /// into a time and a pitch.
+    pub px: f64,
+    pub top_pitch: u8,
 }
 
 impl Roll {
-    fn build(p: &Project, track: Option<Id>, zoom: f64, show_raw: bool, live: Option<&Session>) -> Self {
+    fn build(
+        p: &Project,
+        track: Option<Id>,
+        zoom: f64,
+        show_raw: bool,
+        live: Option<&Session>,
+        selected: &[Note],
+        drag: Option<&NoteDrag>,
+    ) -> Self {
         let Some(t) = track.and_then(|id| p.track(id)) else {
             return Self::default();
         };
-        let notes = t.absolute_notes();
+        let mut notes = t.absolute_notes();
+        // While a gesture is under way, show its result in place of its origin.
+        let mut highlight: Vec<Note> = selected.to_vec();
+        if let Some(d) = drag {
+            notes.retain(|n| !d.origin.contains(n));
+            let preview = d.result();
+            notes.extend(preview.iter().copied());
+            highlight = preview;
+        }
         let raw: Vec<Note> = if show_raw {
             t.clips
                 .iter()
@@ -1068,12 +1309,9 @@ impl Roll {
             })
             .unwrap_or_default();
 
-        let pitches = notes.iter().chain(&raw).chain(&live).map(|n| n.pitch);
-        let (lo, hi) = pitches.fold((127u8, 0u8), |(lo, hi), p| (lo.min(p), hi.max(p)));
-        let (lo, hi) = if lo > hi { (48, 72) } else { (lo.saturating_sub(3), (hi + 3).min(127)) };
-        // At least two octaves, centred on what's there.
-        let pad = 24u8.saturating_sub(hi - lo) / 2;
-        let (lo, hi) = (lo.saturating_sub(pad), (hi + pad).min(127));
+        // A fixed range, scrolled vertically, so the grid never moves under
+        // the pointer as notes come and go: the piano, or the GM drum keys.
+        let (lo, hi) = if t.is_drums() { (35u8, 81u8) } else { (21u8, 108u8) };
 
         let px = zoom / PPQ as f64;
         let live_end = live.iter().map(|n| n.end()).max().unwrap_or(0);
@@ -1083,12 +1321,14 @@ impl Roll {
         let place = |n: &Note, tag: &str| {
             let (left, top, width) =
                 (n.start as f64 * px, (hi - n.pitch) as f64 * ROW, (n.duration as f64 * px).max(2.0));
+            let selected = tag == "n" && highlight.contains(n);
             RollNote {
-                key: format!("{tag}{left}:{top}:{width}:{}", n.velocity),
+                key: format!("{tag}{left}:{top}:{width}:{}:{selected}", n.velocity),
                 left,
                 top,
                 width,
                 velocity: n.velocity,
+                selected,
             }
         };
 
@@ -1127,6 +1367,8 @@ impl Roll {
             notes: notes.iter().map(|n| place(n, "n")).collect(),
             raw: raw.iter().map(|n| place(n, "r")).collect(),
             live: live.iter().map(|n| place(n, "l")).collect(),
+            px,
+            top_pitch: hi,
         }
     }
 }
