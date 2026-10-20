@@ -118,6 +118,9 @@ fn fit(weights: &[f64; 12], bass: Option<u8>) -> ChordFit {
     theory::best_fit(weights, bass).expect("non-empty histogram always has a fit")
 }
 
+/// What each chord tone past a triad costs per tick of a figure.
+const EXTENSION_COST: f64 = 0.1;
+
 /// How much more it costs to start a figure at `t` than on a barline:
 /// figures want to begin where the music is strong.
 fn metric_cost(t: Tick, meter: &MeterChange, window: Tick) -> f64 {
@@ -176,7 +179,12 @@ pub fn analyze(notes: &[Note], meter: &MeterChange, s: &FigureSettings) -> Vec<F
             }
             let f = fit(&weights, Some(lowest % 12));
             let start_cost = s.change_cost * metric_cost(evs[i][0].start, meter, s.chord_window);
-            let cost = best[i] + (1.0 - f.score) * total + start_cost;
+            // Every tone past a triad costs a little for each tick the
+            // figure lasts: C, Am and F in a row also spell Fmaj9, and
+            // three plain chords are the likelier reading.
+            let span = (evs[j - 1][0].start - evs[i][0].start) as f64;
+            let extended = f.chord.pcs().count().saturating_sub(3) as f64 * EXTENSION_COST * span;
+            let cost = best[i] + (1.0 - f.score) * total + start_cost + extended;
             if cost < best[j] {
                 best[j] = cost;
                 from[j] = i;
@@ -764,5 +772,23 @@ mod tests {
         let text = describe(&figs, p.key, &p.meter_at(0));
         let first = text.lines().next().unwrap();
         assert!(first.starts_with("0  1.1.") && first.contains("C (I)  arpeggio  8 notes"), "{text}");
+    }
+
+    #[test]
+    fn plain_chords_in_a_row_are_not_one_big_chord() {
+        // A bar each of C, Am and F as short eighth-note arpeggios, each
+        // change a hair early: together they spell Fmaj9.
+        let q = PPQ as Tick;
+        let shapes: [[u8; 4]; 3] = [[60, 64, 67, 72], [57, 60, 64, 69], [53, 57, 60, 65]];
+        let mut notes = Vec::new();
+        for (bar, chord) in shapes.iter().enumerate() {
+            for step in 0..8 {
+                let start = (bar as Tick * 4 * q + step * q / 2).saturating_sub(if step == 0 { 3 } else { 0 });
+                notes.push(Note { pitch: chord[[0, 1, 2, 3, 2, 1, 2, 1][step as usize]], velocity: 80, start, duration: q / 6 });
+            }
+        }
+        let figs = analyze(&notes, &MeterChange::default_four(), &FigureSettings::default());
+        let names: Vec<String> = figs.iter().map(|f| f.chord.name(crate::theory::Spelling::Sharps)).collect();
+        assert_eq!(names, ["C", "Am", "F"]);
     }
 }
