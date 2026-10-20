@@ -237,6 +237,17 @@ impl Track {
         notes
     }
 
+    /// The pitch bend heard, in absolute ticks: each heard clip's, back to
+    /// none at its end.
+    pub fn absolute_bend(&self) -> Vec<Bend> {
+        let mut clips: Vec<&Clip> = self.clips.iter().filter(|c| !c.muted && !c.bend.is_empty()).collect();
+        clips.sort_by_key(|c| c.start);
+        let mut out: Vec<Bend> = clips.iter().flat_map(|c| c.absolute_bend()).collect();
+        // Stable: a clip's return to none comes before the next one's bend.
+        out.sort_by_key(|b| b.tick);
+        out
+    }
+
     /// The notes of muted clips: what was there before something was laid
     /// over it.
     pub fn muted_notes(&self) -> Vec<Note> {
@@ -312,6 +323,48 @@ pub struct Clip {
     /// back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub muted_by: Option<Id>,
+    /// Pitch bend on the clip's channel, a step curve: each point holds
+    /// until the next. Ticks relative to the clip start, like notes. A
+    /// voice's wavering and scoops live here, so its notes can stay the
+    /// notes it meant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bend: Vec<Bend>,
+}
+
+/// A pitch-bend point: from `tick` on, bent by `value` (-8192..8191; the
+/// General MIDI range is two semitones each way, [`BEND_RANGE`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Bend {
+    pub tick: Tick,
+    pub value: i16,
+}
+
+/// Semitones a full bend reaches (the General MIDI default).
+pub const BEND_RANGE: f32 = 2.0;
+
+impl Bend {
+    /// The bend for `semitones` off the note, within [`BEND_RANGE`].
+    pub fn value_for(semitones: f32) -> i16 {
+        (semitones / BEND_RANGE * 8192.0).round().clamp(-8192.0, 8191.0) as i16
+    }
+
+    pub fn semitones(&self) -> f32 {
+        self.value as f32 / 8192.0 * BEND_RANGE
+    }
+}
+
+/// The bend in effect at `tick`: the last point at or before it.
+pub fn bend_at(bend: &[Bend], tick: Tick) -> i16 {
+    bend.iter().take_while(|b| b.tick <= tick).last().map_or(0, |b| b.value)
+}
+
+/// The points of `bend` in `from..to`, moved to start at zero, beginning
+/// with the bend already in effect at `from` (if any).
+pub fn bend_window(bend: &[Bend], from: Tick, to: Tick) -> Vec<Bend> {
+    let at = bend_at(bend, from);
+    let mut out: Vec<Bend> = if at != 0 { vec![Bend { tick: 0, value: at }] } else { Vec::new() };
+    out.extend(bend.iter().filter(|b| b.tick > from && b.tick < to).map(|b| Bend { tick: b.tick - from, ..*b }));
+    out
 }
 
 fn is_zero(t: &Tick) -> bool {
@@ -339,17 +392,30 @@ impl Clip {
             source_offset: self.source_offset + rel,
             muted: self.muted,
             muted_by: self.muted_by,
+            bend: bend_window(&self.bend, rel, Tick::MAX),
         };
         self.notes = before.into_iter().map(|n| Note { duration: n.duration.min(rel - n.start).max(1), ..n }).collect();
+        self.bend.retain(|b| b.tick < rel);
         self.length = rel;
         right
     }
 
-    /// Refills the clip from its take's notes (as imported, relative to
-    /// the take's own start), keeping to this clip's window.
-    pub fn refill(&mut self, fresh: &[Note]) {
+    /// Refills the clip from its take's notes and bend (as imported,
+    /// relative to the take's own start), keeping to this clip's window.
+    pub fn refill(&mut self, notes: &[Note], bend: &[Bend]) {
         let (from, to) = (self.source_offset, self.source_offset + self.length);
-        self.notes = fresh.iter().filter(|n| n.start >= from && n.start < to).map(|n| Note { start: n.start - from, ..*n }).collect();
+        self.notes = notes.iter().filter(|n| n.start >= from && n.start < to).map(|n| Note { start: n.start - from, ..*n }).collect();
+        self.bend = bend_window(bend, from, to);
+    }
+
+    /// The bend in absolute ticks, within the clip, and back to none at
+    /// its end so whatever follows on the channel isn't bent.
+    pub fn absolute_bend(&self) -> Vec<Bend> {
+        let mut out: Vec<Bend> = self.bend.iter().filter(|b| b.tick < self.length).map(|b| Bend { tick: self.start + b.tick, ..*b }).collect();
+        if out.last().is_some_and(|b| b.value != 0) {
+            out.push(Bend { tick: self.start + self.length, value: 0 });
+        }
+        out
     }
 
     /// Notes in absolute ticks. Notes that start past the clip end are
@@ -625,10 +691,29 @@ mod tests {
         let mut c = clip(1, 0, 8 * q, q);
         let mut right = c.split_at(4 * q, Id(2));
         let fresh: Vec<Note> = (0..8).map(|i| Note { pitch: 64, velocity: 80, start: i * q, duration: q }).collect();
-        c.refill(&fresh);
-        right.refill(&fresh);
+        c.refill(&fresh, &[]);
+        right.refill(&fresh, &[]);
         assert_eq!(c.notes.iter().map(|n| n.start).collect::<Vec<_>>(), [0, q, 2 * q, 3 * q]);
         assert_eq!(right.notes.iter().map(|n| n.start).collect::<Vec<_>>(), [0, q, 2 * q, 3 * q]);
         assert!(right.notes.iter().all(|n| n.pitch == 64));
+    }
+
+    #[test]
+    fn a_split_clip_keeps_the_bend_in_effect() {
+        let q = PPQ as Tick;
+        let mut c = Clip {
+            start: 4 * q,
+            length: 8 * q,
+            bend: vec![Bend { tick: q, value: 2000 }, Bend { tick: 6 * q, value: 0 }],
+            ..clip(1, 4 * q, 8 * q, q)
+        };
+        let right = c.split_at(7 * q, Id(2));
+        assert_eq!(c.bend, vec![Bend { tick: q, value: 2000 }]);
+        // Bent from its first tick, as the left one was there.
+        assert_eq!(right.bend, vec![Bend { tick: 0, value: 2000 }, Bend { tick: 3 * q, value: 0 }]);
+        // Played, each lets go of the bend at its end.
+        assert_eq!(c.absolute_bend(), vec![Bend { tick: 5 * q, value: 2000 }, Bend { tick: 7 * q, value: 0 }]);
+        assert_eq!(Bend::value_for(1.0), 4096);
+        assert_eq!(Bend::value_for(-5.0), -8192);
     }
 }

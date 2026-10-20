@@ -43,7 +43,7 @@ pub enum Reading {
 /// Which version of the transcription a transcript was made by. Raise it
 /// when reading changes enough to be worth redoing old recordings: they
 /// are written down again at the next start (the audio stays as it was).
-pub const TRANSCRIPT_VERSION: u32 = 3;
+pub const TRANSCRIPT_VERSION: u32 = 4;
 
 /// A recording, written down.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -114,7 +114,7 @@ pub fn transcribe(samples: &[f32], start: f64, model: Option<&BasicPitch>) -> Tr
         chordal: strums.chordal,
         strums: shift(strums.events()),
         notes,
-        line: Some(shift(analysis::notes_to_events(&line.notes))),
+        line: Some(shift(line.events())),
         monophony: line.monophony,
     }
 }

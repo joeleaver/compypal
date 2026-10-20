@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use compypal_core::theory::{self, Chord, Pc};
-use compypal_core::{RawEvent, RawMsg};
+use compypal_core::{Bend, RawEvent, RawMsg};
 use realfft::{RealFftPlanner, RealToComplex};
 
 /// The journal's audio rate, and the rate Basic Pitch takes.
@@ -802,17 +802,61 @@ pub fn line_notes(track: &[PitchFrame], onsets: &[Onset]) -> Vec<HeardNote> {
     out
 }
 
-/// A single line as notes: [`pitch_track`], [`onsets`], [`line_notes`].
+/// How the voice moves around each note, as pitch bend: (seconds, value)
+/// every frame it has moved by more than about two cents, back to none
+/// where the note ends. The note says what was sung; this says how.
+pub fn line_bend(track: &[PitchFrame], notes: &[HeardNote]) -> Vec<(f64, i16)> {
+    let mut out: Vec<(f64, i16)> = Vec::new();
+    let mut last = 0i16;
+    for n in notes {
+        for f in track.iter().filter(|f| f.t >= n.start && f.t < n.end) {
+            let Some(p) = f.pitch else { continue };
+            let value = Bend::value_for(p - n.pitch as f32);
+            if (value as i32 - last as i32).abs() >= 64 || out.is_empty() {
+                // The first point of a note is at its start, so it begins bent.
+                let t = if out.last().is_none_or(|(t, _)| *t < n.start) { n.start } else { f.t };
+                out.push((t, value));
+                last = value;
+            }
+        }
+        if last != 0 {
+            out.push((n.end, 0));
+            last = 0;
+        }
+    }
+    out
+}
+
+/// A single line as notes: [`pitch_track`], [`onsets`], [`line_notes`],
+/// with [`line_bend`].
 pub struct Line {
     pub notes: Vec<HeardNote>,
+    pub bend: Vec<(f64, i16)>,
     /// See [`monophony`].
     pub monophony: f32,
+}
+
+impl Line {
+    /// Notes and bend as raw events, in seconds from the first sample.
+    pub fn events(&self) -> Vec<RawEvent> {
+        let mut out = notes_to_events(&self.notes);
+        out.extend(self.bend.iter().map(|&(t, value)| RawEvent { t, channel: 0, msg: RawMsg::PitchBend { value } }));
+        // At the same moment: off, then bend, then on (a note starts bent).
+        let rank = |m: &RawMsg| match m {
+            RawMsg::NoteOff { .. } => 0,
+            RawMsg::PitchBend { .. } => 1,
+            _ => 2,
+        };
+        out.sort_by(|a, b| a.t.total_cmp(&b.t).then(rank(&a.msg).cmp(&rank(&b.msg))));
+        out
+    }
 }
 
 pub fn line(samples: &[f32], rate: u32) -> Line {
     let track = pitch_track(samples, rate);
     let ons = onsets(samples, rate);
-    Line { notes: line_notes(&track, &ons), monophony: monophony(&track) }
+    let notes = line_notes(&track, &ons);
+    Line { bend: line_bend(&track, &notes), notes, monophony: monophony(&track) }
 }
 
 #[cfg(test)]
@@ -1092,5 +1136,26 @@ pub(crate) mod tests {
         }
         let notes = line(&audio, rate).notes;
         assert_eq!(notes.iter().map(|n| n.pitch).collect::<Vec<_>>(), [52, 55], "{notes:?}");
+    }
+
+    #[test]
+    fn the_voice_around_its_notes_is_bend() {
+        let melody = [60u8, 62, 64];
+        let audio = sung(&melody, 0.5, RATE);
+        let l = line(&audio, RATE);
+        assert_eq!(l.notes.iter().map(|n| n.pitch).collect::<Vec<_>>(), melody);
+        assert!(l.bend.len() > 10, "vibrato bends: {:?}", l.bend);
+        // Note plus bend is where the voice is.
+        let track = pitch_track(&audio, RATE);
+        for f in track.iter().filter(|f| f.t > 0.45 && f.t < 0.75) {
+            let n = l.notes.iter().find(|n| f.t >= n.start && f.t < n.end).unwrap();
+            let bend = l.bend.iter().take_while(|(t, _)| *t <= f.t).last().map_or(0, |b| b.1);
+            let heard = n.pitch as f32 + Bend { tick: 0, value: bend }.semitones();
+            assert!((heard - f.pitch.unwrap()).abs() < 0.1, "{} vs {:?} at {}", heard, f.pitch, f.t);
+        }
+        // And none once it's over.
+        assert_eq!(l.bend.last().map(|b| b.1), Some(0));
+        let ev = l.events();
+        assert!(ev.iter().any(|e| matches!(e.msg, RawMsg::PitchBend { .. })));
     }
 }

@@ -934,6 +934,7 @@ fn add_sketch(app: &mut dyn App, args: &Value) -> ToolResult {
                 start: clip_start,
                 length: end.div_ceil(bar).max(1) * bar,
                 notes: imported.notes,
+                bend: imported.bend,
                 source_session: Some(id),
                 ..Default::default()
             },
@@ -1106,6 +1107,7 @@ fn clean_take(app: &mut dyn App, args: &Value) -> ToolResult {
     let overlaps = args.get("fix_overlaps").and_then(Value::as_bool).unwrap_or(true);
 
     let imported = cleanup::import_session(&s, &p.tempo, sustain);
+    let bend = imported.bend.clone();
     let mut notes = imported.notes;
     let before = notes.len();
     let mut report = Vec::new();
@@ -1131,7 +1133,7 @@ fn clean_take(app: &mut dyn App, args: &Value) -> ToolResult {
         clips = 0;
         for t in &mut p.tracks {
             for c in t.clips.iter_mut().filter(|c| c.source_session == Some(s.id)) {
-                c.refill(&fresh);
+                c.refill(&fresh, &bend);
                 clips += 1;
             }
         }

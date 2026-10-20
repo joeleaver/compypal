@@ -4,7 +4,7 @@
 //! anchors of recorded sessions, so raw takes stay lined up with their
 //! clips.
 
-use crate::model::{Clip, Note, Project, Section, Tick};
+use crate::model::{Bend, Clip, Note, Project, Section, Tick, bend_at, bend_window};
 
 /// Opens `len` ticks of silence at `at`. A clip running across `at` is
 /// stretched, with its later notes moved along.
@@ -20,6 +20,20 @@ pub fn insert_time(p: &mut Project, at: Tick, len: Tick) {
                 let rel = at - c.start;
                 for n in c.notes.iter_mut().filter(|n| n.start >= rel) {
                     n.start += len;
+                }
+                // The gap is unbent; the bend picks up again after it.
+                let held = bend_at(&c.bend, rel);
+                for b in c.bend.iter_mut().filter(|b| b.tick >= rel) {
+                    b.tick += len;
+                }
+                if held != 0 {
+                    c.bend.push(Bend { tick: rel, value: 0 });
+                    c.bend.push(Bend { tick: rel + len, value: held });
+                    c.bend.sort_by_key(|b| b.tick);
+                    c.bend.dedup_by(|later, earlier| later.tick == earlier.tick && {
+                        earlier.value = later.value;
+                        true
+                    });
                 }
                 c.length += len;
             }
@@ -63,6 +77,15 @@ pub fn delete_time(p: &mut Project, at: Tick, len: Tick) {
                 })
                 .collect();
             let (cs, ce) = (moved(c.start), moved(c.start + c.length));
+            // Bend: what was in effect at the end of the cut holds from its
+            // start; the points inside it go.
+            let abs: Vec<Bend> = c.bend.iter().map(|b| Bend { tick: c.start + b.tick, ..*b }).collect();
+            let mut bend: Vec<Bend> = abs.iter().filter(|b| b.tick < at).copied().collect();
+            if abs.iter().any(|b| b.tick >= at && b.tick < end) {
+                bend.push(Bend { tick: at, value: bend_at(&abs, end) });
+            }
+            bend.extend(abs.iter().filter(|b| b.tick >= end).map(|b| Bend { tick: b.tick - len, ..*b }));
+            c.bend = bend.into_iter().filter(|b| b.tick >= cs).map(|b| Bend { tick: b.tick - cs, ..b }).collect();
             c.start = cs;
             c.length = ce.saturating_sub(cs);
             c.notes = kept.into_iter().map(|n| Note { start: n.start - cs, ..n }).collect();
@@ -93,7 +116,7 @@ pub fn duplicate_time(p: &mut Project, from: Tick, len: Tick) {
         return;
     }
     let to = from + len;
-    let copies: Vec<(usize, Vec<Note>)> = p
+    let copies: Vec<(usize, Vec<Note>, Vec<Bend>)> = p
         .tracks
         .iter()
         .enumerate()
@@ -104,14 +127,19 @@ pub fn duplicate_time(p: &mut Project, from: Tick, len: Tick) {
                 .filter(|n| n.start >= from && n.start < to)
                 .map(|n| Note { start: n.start + len, duration: n.duration.min(to - n.start), ..n })
                 .collect();
-            (i, notes)
+            // The copy's bend, from the gap's start, back to none at its end.
+            let mut bend = bend_window(&t.absolute_bend(), from, to);
+            if bend.last().is_some_and(|b| b.value != 0) {
+                bend.push(Bend { tick: len, value: 0 });
+            }
+            (i, notes, bend)
         })
         .collect();
     let sections: Vec<Section> =
         p.sections.iter().filter(|s| s.start >= from && s.start + s.length <= to).cloned().collect();
     insert_time(p, to, len);
-    for (i, notes) in copies {
-        if notes.is_empty() {
+    for (i, notes, bend) in copies {
+        if notes.is_empty() && bend.is_empty() {
             continue;
         }
         let id = p.tracks[i].id;
@@ -124,6 +152,14 @@ pub fn duplicate_time(p: &mut Project, from: Tick, len: Tick) {
                 let cs = c.start;
                 c.notes.extend(notes.iter().map(|n| Note { start: n.start - cs, ..*n }));
                 c.notes.sort_by_key(|n| (n.start, n.pitch));
+                // The gap was left unbent by the insert; the copy's bend
+                // goes in it, and what followed resumes after.
+                let (g0, g1) = (to - cs, to - cs + len);
+                let after = bend_at(&c.bend, g1);
+                c.bend.retain(|b| b.tick < g0 || b.tick > g1);
+                c.bend.extend(bend.iter().map(|b| Bend { tick: g0 + b.tick, ..*b }));
+                c.bend.push(Bend { tick: g1, value: after });
+                c.bend.sort_by_key(|b| b.tick);
             }
             None => {
                 t.clips.push(Clip {
@@ -132,6 +168,7 @@ pub fn duplicate_time(p: &mut Project, from: Tick, len: Tick) {
                     start: to,
                     length: len,
                     notes: notes.iter().map(|n| Note { start: n.start - to, ..*n }).collect(),
+                    bend: bend.clone(),
                     source_session: None,
                     ..Default::default()
                 });
@@ -150,7 +187,7 @@ pub fn duplicate_time(p: &mut Project, from: Tick, len: Tick) {
 mod tests {
     use super::*;
     use crate::demo;
-    use crate::model::PPQ;
+    use crate::model::{Id, PPQ};
 
     const BAR: Tick = 4 * PPQ as Tick;
 
@@ -226,5 +263,28 @@ mod tests {
         let bar2: Vec<_> = bass.iter().filter(|n| n.start >= BAR && n.start < 2 * BAR).map(|n| n.pitch).collect();
         let bar3: Vec<_> = bass.iter().filter(|n| n.start >= 2 * BAR && n.start < 3 * BAR).map(|n| n.pitch).collect();
         assert_eq!(bar2, bar3);
+    }
+
+    #[test]
+    fn bend_moves_with_the_bars() {
+        let mut p = Project::new("b");
+        let t = p.add_track("Voice", 0);
+        let notes: Vec<Note> = (0..4).map(|i| Note { pitch: 60, velocity: 90, start: i * BAR, duration: BAR / 2 }).collect();
+        let bend = vec![Bend { tick: BAR + 10, value: 500 }, Bend { tick: 2 * BAR, value: 0 }];
+        p.track_mut(t).unwrap().clips.push(Clip { id: Id(9), start: 0, length: 4 * BAR, notes, bend, ..Default::default() });
+        duplicate_time(&mut p, BAR, BAR);
+        let b = p.tracks[0].absolute_bend();
+        // Bar 2's bend is in bar 2 and in its copy, bar 3.
+        assert!(b.contains(&Bend { tick: BAR + 10, value: 500 }) && b.contains(&Bend { tick: 2 * BAR + 10, value: 500 }), "{b:?}");
+        assert_eq!(crate::model::bend_at(&b, 2 * BAR + 20), 500);
+        assert_eq!(crate::model::bend_at(&b, 3 * BAR + 20), 0);
+        delete_time(&mut p, BAR, BAR);
+        let b = p.tracks[0].absolute_bend();
+        assert_eq!(crate::model::bend_at(&b, BAR + 20), 500, "the copy is where the original was: {b:?}");
+        assert_eq!(crate::model::bend_at(&b, 2 * BAR + 20), 0);
+        insert_time(&mut p, BAR + 100, BAR);
+        let b = p.tracks[0].absolute_bend();
+        assert_eq!(crate::model::bend_at(&b, BAR + 200), 0, "the gap is unbent: {b:?}");
+        assert_eq!(crate::model::bend_at(&b, 2 * BAR + 100), 500, "and it resumes after");
     }
 }

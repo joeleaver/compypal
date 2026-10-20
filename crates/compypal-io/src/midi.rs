@@ -1,6 +1,6 @@
 //! Standard MIDI File import and export (format 1).
 
-use compypal_core::{Clip, KeySignature, MeterChange, Note, PPQ, Project, Tick};
+use compypal_core::{Bend, Clip, KeySignature, MeterChange, Note, PPQ, Project, Tick};
 use midly::num::{u4, u7, u15, u24, u28};
 use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
 
@@ -62,6 +62,10 @@ pub fn export(project: &Project) -> Result<Vec<u8>, MidiError> {
             evs.push((n.end(), 2, midi(MidiMessage::NoteOff { key, vel: u7::new(0) })));
             evs.push((n.start, 3, midi(MidiMessage::NoteOn { key, vel: u7::new(n.velocity.clamp(1, 127)) })));
         }
+        // Bend goes before a note starting at the same tick: it starts bent.
+        for b in t.absolute_bend() {
+            evs.push((b.tick, 2, midi(MidiMessage::PitchBend { bend: midly::PitchBend::from_int(b.value.clamp(-8192, 8191)) })));
+        }
         tracks.push(finish(evs, 0));
     }
 
@@ -117,6 +121,7 @@ pub fn import(bytes: &[u8], name: &str) -> Result<Project, MidiError> {
         let mut program = [0u8; 16];
         let mut open: Vec<[Option<(Tick, u8)>; 128]> = vec![[None; 128]; 16];
         let mut notes: Vec<Vec<Note>> = vec![Vec::new(); 16];
+        let mut bends: Vec<Vec<Bend>> = vec![Vec::new(); 16];
 
         for ev in track {
             tick += ev.delta.as_int() as u64;
@@ -144,6 +149,15 @@ pub fn import(bytes: &[u8], name: &str) -> Result<Project, MidiError> {
                     let ch = channel.as_int() as usize;
                     match message {
                         MidiMessage::ProgramChange { program: pr } => program[ch] = pr.as_int(),
+                        MidiMessage::PitchBend { bend } => {
+                            let value = bend.as_int();
+                            match bends[ch].last_mut() {
+                                Some(b) if b.tick == now => b.value = value,
+                                Some(b) if b.value == value => {}
+                                None if value == 0 => {}
+                                _ => bends[ch].push(Bend { tick: now, value }),
+                            }
+                        }
                         MidiMessage::NoteOn { key, vel } if vel.as_int() > 0 => {
                             let k = key.as_int() as usize;
                             if let Some((s, v)) = open[ch][k].take() {
@@ -192,6 +206,7 @@ pub fn import(bytes: &[u8], name: &str) -> Result<Project, MidiError> {
                 start: 0,
                 length,
                 notes: ns,
+                bend: std::mem::take(&mut bends[ch]),
                 source_session: None,
                 ..Default::default()
             });
@@ -224,5 +239,16 @@ mod tests {
             assert!(b.name.starts_with(&a.name));
         }
         assert_eq!(back.tempo.bpm_at(0), 100.0);
+    }
+
+    #[test]
+    fn bend_round_trips() {
+        let mut p = Project::new("b");
+        let t = p.add_track("Voice", 0);
+        let notes = vec![Note { pitch: 60, velocity: 90, start: 0, duration: 960 }];
+        let bend = vec![Bend { tick: 100, value: -3000 }, Bend { tick: 500, value: 4000 }];
+        p.track_mut(t).unwrap().clips.push(Clip { id: compypal_core::Id(9), start: 0, length: 960, notes, bend, ..Default::default() });
+        let back = import(&export(&p).unwrap(), "b").unwrap();
+        assert_eq!(back.tracks[0].absolute_bend(), p.tracks[0].absolute_bend());
     }
 }

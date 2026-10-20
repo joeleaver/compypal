@@ -25,6 +25,13 @@ with a built-in synth; export MIDI and ABC.
   agent can compose them, inspect `timing_report`, and retry. Add new ones
   in the same style rather than one big "fix it" function.
 - Clip note times are relative to the clip start.
+- A clip has a bend lane (`Clip::bend`, `Bend { tick, value }`, a step
+  curve on the clip's channel, ±2 semitones as in GM): imported from a
+  session's pitch-bend events (`Imported::bend`, so a keyboard's wheel is
+  kept too), carried through `split_at`/`refill` (a split starts with the
+  bend in effect) and the arranger's bar edits, played by
+  `schedule::build` (`Track::absolute_bend`, back to none at each clip's
+  end) and written to and read from MIDI. The roll doesn't draw it yet.
 - Laying music over music (recording, adding a sketch) never mixes it in:
   `Track::add_over` cuts the clips underneath at its edges and mutes the
   covered parts, kept as alternatives, each remembering what muted it
@@ -251,7 +258,8 @@ mic hears the room.
   stretches split at breaks and at onsets where the level jumps, then cut
   by a DP into the fewest notes that explain the pitch: each note costs
   `NOTE_COST`, each frame its capped distance from its semitone, so
-  wavering and scoops stay in a note) and Basic
+  wavering and scoops stay in a note, and how the voice moves around
+  each note goes in as pitch bend, `line_bend`) and Basic
   Pitch's notes (`basic_pitch`, tract, the reference's note
   post-processing). Strummed playing (`chordal` >= 0.5) reads as strums,
   one clear pitch at a time (`monophony` >= 0.6) as a line, anything else

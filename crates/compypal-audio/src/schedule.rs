@@ -1,7 +1,7 @@
 //! Turning a project into timed MIDI messages. Pure: no audio here, so it
 //! can be tested and rebuilt on every edit while the music keeps playing.
 
-use compypal_core::{DRUM_CHANNEL, Note, Project, Tick};
+use compypal_core::{Bend, DRUM_CHANNEL, Note, Project, Tick};
 
 /// A MIDI message at a time in seconds.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -56,6 +56,7 @@ pub fn build(project: &Project, opts: ScheduleOptions) -> Schedule {
             continue;
         }
         push_notes(&mut events, &t.absolute_notes(), ch, secs);
+        push_bend(&mut events, &t.absolute_bend(), ch, secs);
     }
 
     // Round the end up to a whole bar, so a loop comes round in time.
@@ -111,7 +112,8 @@ pub fn with_count_in(song: &Schedule, from: f64, beats: u8, beat: f64) -> Schedu
 pub fn excerpt(song: &Schedule, from: f64, to: f64) -> Schedule {
     let mut events: Vec<Timed> =
         song.events.iter().filter(|e| !e.is_note() && e.t <= from).map(|e| Timed { t: 0.0, ..*e }).collect();
-    events.extend(song.events.iter().filter(|e| e.is_note_on() && e.t >= from && e.t < to).map(|e| Timed { t: e.t - from, ..*e }));
+    events.extend(song.events.iter().filter(|e| (e.is_note_on() || is_bend(e)) && e.t > from && e.t < to).map(|e| Timed { t: e.t - from, ..*e }));
+    events.extend(song.events.iter().filter(|e| e.is_note_on() && e.t == from).map(|e| Timed { t: 0.0, ..*e }));
     // Every note started here ends, at its own end or the excerpt's.
     for on in song.events.iter().filter(|e| e.is_note_on() && e.t >= from && e.t < to) {
         let off = song
@@ -138,10 +140,7 @@ pub fn from_raw(events: &[compypal_core::RawEvent], channel: u8, program: u8) ->
             RawMsg::NoteOn { pitch, velocity } => [0x90 | ch, pitch & 0x7f, velocity.clamp(1, 127)],
             RawMsg::NoteOff { pitch } => [0x80 | ch, pitch & 0x7f, 0],
             RawMsg::Cc { controller, value } => [0xb0 | ch, controller & 0x7f, value & 0x7f],
-            RawMsg::PitchBend { value } => {
-                let v = (value as i32 + 8192).clamp(0, 16383) as u16;
-                [0xe0 | ch, (v & 0x7f) as u8, (v >> 7) as u8]
-            }
+            RawMsg::PitchBend { value } => bend_msg(ch, value),
         };
         out.push(Timed { t, msg });
     }
@@ -149,6 +148,7 @@ pub fn from_raw(events: &[compypal_core::RawEvent], channel: u8, program: u8) ->
     let end = out.last().map_or(0.0, |e| e.t) + 0.5;
     out.push(Timed { t: end, msg: [0xb0 | ch, 64, 0] });
     out.push(Timed { t: end, msg: [0xb0 | ch, 123, 0] });
+    out.push(Timed { t: end, msg: bend_msg(ch, 0) });
     sort(&mut out);
     Schedule { events: out, length: end }
 }
@@ -178,6 +178,27 @@ fn push_notes(events: &mut Vec<Timed>, notes: &[Note], ch: u8, secs: impl Fn(Tic
         events.push(Timed { t: secs(n.start), msg: [0x90 | ch, key, n.velocity.clamp(1, 127)] });
         events.push(Timed { t: secs(n.end()), msg: [0x80 | ch, key, 0] });
     }
+}
+
+/// A pitch-bend message on `ch`.
+pub fn bend_msg(ch: u8, value: i16) -> [u8; 3] {
+    let v = (value as i32 + 8192).clamp(0, 16383) as u16;
+    [0xe0 | (ch & 0x0f), (v & 0x7f) as u8, (v >> 7) as u8]
+}
+
+fn push_bend(events: &mut Vec<Timed>, bend: &[Bend], ch: u8, secs: impl Fn(Tick) -> f64) {
+    if bend.is_empty() {
+        return;
+    }
+    // Start unbent, whatever the channel was left at.
+    events.push(Timed { t: 0.0, msg: bend_msg(ch, 0) });
+    for b in bend {
+        events.push(Timed { t: secs(b.tick), msg: bend_msg(ch, b.value) });
+    }
+}
+
+fn is_bend(e: &Timed) -> bool {
+    e.msg[0] & 0xf0 == 0xe0
 }
 
 fn sort(events: &mut [Timed]) {
@@ -226,5 +247,24 @@ mod tests {
         assert_eq!(channels.into_iter().collect::<Vec<_>>(), [p.tracks[1].channel, DRUM_CHANNEL]);
         let clicks = s.events.iter().filter(|e| e.is_note_on() && matches!(e.msg[1], CLICK | CLICK_ACCENT)).count();
         assert_eq!(clicks, 16);
+    }
+
+    #[test]
+    fn a_clips_bend_is_played_on_its_channel() {
+        let mut p = compypal_core::Project::new("b");
+        let t = p.add_track("Voice", 52);
+        let ch = p.track(t).unwrap().channel;
+        let notes = vec![Note { pitch: 60, velocity: 90, start: 0, duration: 960 }];
+        let bend = vec![Bend { tick: 480, value: 4096 }];
+        p.track_mut(t).unwrap().clips.push(compypal_core::Clip { start: 960, length: 1920, notes, bend, ..Default::default() });
+        let s = build(&p, ScheduleOptions::default());
+        let bends: Vec<(f64, [u8; 3])> = s.events.iter().filter(|e| e.msg[0] == 0xe0 | ch).map(|e| (e.t, e.msg)).collect();
+        // At 120 BPM: unbent from the start, bent a semitone half a beat
+        // into the clip (0.75 s), let go at the clip's end (1.5 s).
+        let at = |t: f64| bends.iter().find(|b| (b.0 - t).abs() < 1e-9).map(|b| b.1);
+        assert_eq!(at(0.0), Some(bend_msg(ch, 0)));
+        assert_eq!(at(0.75), Some(bend_msg(ch, 4096)));
+        assert_eq!(at(1.5), Some(bend_msg(ch, 0)));
+        assert_eq!(bend_msg(0, 0), [0xe0, 0, 64]);
     }
 }

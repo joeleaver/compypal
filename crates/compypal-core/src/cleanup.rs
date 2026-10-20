@@ -7,12 +7,14 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{MeterChange, Note, PPQ, TempoMap, Tick};
-use crate::session::Session;
+use crate::model::{Bend, MeterChange, Note, PPQ, TempoMap, Tick};
+use crate::session::{RawMsg, Session};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Imported {
     pub notes: Vec<Note>,
+    /// The take's pitch bend, on the same ticks as its notes.
+    pub bend: Vec<Bend>,
     /// Whole bars added to the front so pickup notes before the downbeat
     /// do not land at negative time. Zero if nothing was early.
     pub pickup_bars: u32,
@@ -62,7 +64,18 @@ pub fn import_session(session: &Session, tempo: &TempoMap, sounding: bool) -> Im
         })
         .collect();
     sort(&mut notes);
-    Imported { notes, pickup_bars }
+    let mut bend: Vec<Bend> = Vec::new();
+    for e in &session.events {
+        if let RawMsg::PitchBend { value } = e.msg {
+            let tick = (at(e.t) + shift).round().max(0.0) as Tick;
+            match bend.last_mut() {
+                Some(b) if b.tick == tick => b.value = value,
+                Some(b) if b.value == value => {}
+                _ => bend.push(Bend { tick, value }),
+            }
+        }
+    }
+    Imported { notes, bend, pickup_bars }
 }
 
 pub fn sort(notes: &mut [Note]) {
@@ -331,7 +344,7 @@ pub fn bar_beat_tick(tick: Tick, meter: &MeterChange) -> String {
 mod tests {
     use super::*;
     use crate::model::Id;
-    use crate::session::{RawEvent, RawMsg};
+    use crate::session::RawEvent;
 
     fn n(pitch: u8, start: Tick, duration: Tick) -> Note {
         Note { pitch, velocity: 100, start, duration }
@@ -428,5 +441,30 @@ mod tests {
         let r = timing_report(&notes, 240);
         assert!((r.mean_signed_deviation - 30.0).abs() < 1e-9);
         assert_eq!(bar_beat_tick(4 * 960 + 960 + 5, &MeterChange { tick: 0, numerator: 4, denominator: 4 }), "2.2.5");
+    }
+
+    #[test]
+    fn a_takes_bend_comes_along() {
+        let s = Session {
+            id: Id(1),
+            name: "t".into(),
+            recorded_at: 0,
+            click_bpm: Some(120.0),
+            meter: MeterChange { tick: 0, numerator: 4, denominator: 4 },
+            downbeat_offset: 0.0,
+            start_tick: 0,
+            own_tempo: false,
+            audio: None,
+            events: vec![
+                RawEvent { t: 0.0, channel: 0, msg: RawMsg::NoteOn { pitch: 60, velocity: 90 } },
+                RawEvent { t: 0.25, channel: 0, msg: RawMsg::PitchBend { value: 1000 } },
+                RawEvent { t: 0.25, channel: 0, msg: RawMsg::PitchBend { value: 1200 } },
+                RawEvent { t: 0.5, channel: 0, msg: RawMsg::PitchBend { value: 0 } },
+                RawEvent { t: 0.5, channel: 0, msg: RawMsg::NoteOff { pitch: 60 } },
+            ],
+        };
+        let imp = import_session(&s, &TempoMap::constant(120.0), false);
+        // Half a beat in: the later of two bends at the same moment.
+        assert_eq!(imp.bend, vec![Bend { tick: 480, value: 1200 }, Bend { tick: 960, value: 0 }]);
     }
 }

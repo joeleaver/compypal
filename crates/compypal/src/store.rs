@@ -1025,10 +1025,10 @@ impl Store {
         let mut report = cleanup::TidyReport::default();
         self.edit("tidy take", |p| {
             let Some(s) = p.session(session).cloned() else { return };
-            let fresh = cleanup::import_session(&s, &p.tempo, true).notes;
+            let fresh = cleanup::import_session(&s, &p.tempo, true);
             for t in &mut p.tracks {
                 for c in t.clips.iter_mut().filter(|c| c.source_session == Some(session)) {
-                    c.refill(&fresh);
+                    c.refill(&fresh.notes, &fresh.bend);
                     report = cleanup::tidy(&mut c.notes);
                 }
             }
@@ -1550,6 +1550,7 @@ fn lay_take(p: &mut Project, track: Id, session: &Session, start_tick: Tick, nam
             start,
             length: end.div_ceil(bar).max(1) * bar,
             notes: imported.notes,
+            bend: imported.bend,
             source_session: Some(session.id),
             ..Default::default()
         },
@@ -1682,7 +1683,7 @@ impl Roll {
                     let s = p.session(c.source_session?)?;
                     // Only this clip's window of the take.
                     let mut window = c.clone();
-                    window.refill(&cleanup::import_session(s, &p.tempo, true).notes);
+                    window.refill(&cleanup::import_session(s, &p.tempo, true).notes, &[]);
                     Some(window.absolute_notes().collect::<Vec<_>>())
                 })
                 .flatten()
