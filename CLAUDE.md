@@ -10,7 +10,7 @@ with a built-in synth; export MIDI and ABC.
 | Crate | What it holds |
 |---|---|
 | `compypal-core` | Project model (ticks, `PPQ = 960`), raw `Session`s (seconds), cleanup ops, snapshot undo, GM names, `theory` (chords, Roman numerals, keys), `figure` (musical units), demo project. No I/O, no UI. |
-| `compypal-io` | SMF import/export (`midly`), ABC export. |
+| `compypal-io` | SMF import/export (`midly`), ABC export. (Audio export, MP3/WAV, is `compypal-audio::render`.) |
 | `compypal-mcp` | The agent interface: MCP tools over an `App` trait (`tools.rs`, testable on `MemoryApp`), JSON-RPC handling, an HTTP server for tools, the Claude Code IDE WebSocket link, and `agent` (running coding agents: ACP and Claude Code backends, the panel's conversation model). |
 | `compypal-audio` | `Engine` (cpal output on its own thread), `Synth` trait with SoundFont (`rustysynth`) and built-in fallback, pure `schedule::build` from a project, realtime `Player`; MIDI and audio input, the journal, and hearing audio (`analysis`, `basic_pitch`). |
 | `compypal` | The rinch desktop app. `store.rs` is all app state; every project edit goes through `Store::edit` so UI and agent share undo. |
@@ -91,6 +91,14 @@ It has a chord and a shape (block, arpeggio, run, melody, note, mixed).
   unoptimized, the synth can't keep up with the callback.
 - `cargo run -p compypal-audio --example play_demo` checks the device
   without the UI.
+- Export to sound (`render`): the same schedule, `Player` and SoundFont
+  synth as Play, run offline at 44.1 kHz with a 3 s tail (trimmed at
+  -80 dB), one gain so the peak is -1 dBFS, then MP3 (LAME via
+  `mp3lame-encoder`, built from its bundled source; LGPL, 192 kbps, the
+  song's name as the ID3 title) or 16-bit WAV. The Export menu and the
+  agent's `export` (`mp3`/`wav`) render on a thread and write to
+  `exports/`. `--example render_song <project.json> <out.mp3>` does it
+  from the command line.
 
 ## Note editing
 

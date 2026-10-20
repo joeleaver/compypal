@@ -214,6 +214,22 @@ fn ExportMenu() -> NodeHandle {
                 div { class: "track-name", "ABC notation" }
                 div { class: "track-detail", "Text sheet music" }
             }
+            div { class: "agent-row",
+                onclick: move || {
+                    store.export_menu.set(false);
+                    store.export_audio("mp3");
+                },
+                div { class: "track-name", "MP3" }
+                div { class: "track-detail", "The song as you hear it, to share" }
+            }
+            div { class: "agent-row",
+                onclick: move || {
+                    store.export_menu.set(false);
+                    store.export_audio("wav");
+                },
+                div { class: "track-name", "WAV" }
+                div { class: "track-detail", "The same, uncompressed" }
+            }
         }
     };
     overlay_dismiss::arm_keys_while_open(

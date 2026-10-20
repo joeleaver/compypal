@@ -135,9 +135,15 @@ impl App for StoreApp {
 
     fn export(&mut self, format: &str) -> Result<String, String> {
         let path = match format {
-            "abc" => self.0.export_abc(),
-            _ => self.0.export_midi(),
-        }?;
+            "abc" => self.0.export_abc()?,
+            // Rendered in the background: the file appears in a few seconds.
+            "mp3" | "wav" => {
+                let path = self.0.export_audio(if format == "wav" { "wav" } else { "mp3" });
+                let dir = std::fs::canonicalize(path.parent().unwrap_or(std::path::Path::new("."))).unwrap_or_default();
+                return Ok(format!("{} (rendering; there in a few seconds)", dir.join(path.file_name().unwrap_or_default()).display()));
+            }
+            _ => self.0.export_midi()?,
+        };
         Ok(std::fs::canonicalize(&path).unwrap_or(path).display().to_string())
     }
 }

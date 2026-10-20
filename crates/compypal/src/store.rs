@@ -1391,6 +1391,33 @@ impl Store {
         self.report_export(write_export(&p.name, "abc", abc.as_bytes()))
     }
 
+    /// Renders the song to sound and writes it as `mp3` or `wav`, on a
+    /// thread of its own (the synth plays it through, which takes a few
+    /// seconds); the status line says when it's there. Returns where.
+    pub fn export_audio(self, format: &'static str) -> PathBuf {
+        let p = self.project.get();
+        let path = export_path(&p.name, format);
+        let status = self.status;
+        status.set(format!("Rendering the song to {}…", path.display()));
+        let target = path.clone();
+        std::thread::spawn(move || {
+            let r = compypal_audio::render::render(&p);
+            let bytes = match format {
+                "wav" => Ok(compypal_audio::render::wav(&r)),
+                _ => compypal_audio::render::mp3(&r, &p.name),
+            };
+            let result = bytes.and_then(|b| {
+                std::fs::create_dir_all(target.parent().unwrap_or(std::path::Path::new("."))).map_err(|e| e.to_string())?;
+                std::fs::write(&target, b).map_err(|e| e.to_string())
+            });
+            status.send(match result {
+                Ok(()) => format!("Exported {} ({}, {} through {})", target.display(), compypal_mcp::tools::mmss(r.seconds()), format.to_uppercase(), r.synth),
+                Err(e) => format!("Export failed: {e}"),
+            });
+        });
+        path
+    }
+
     fn report_export(self, result: Result<PathBuf, String>) -> Result<PathBuf, String> {
         self.status.set(match &result {
             Ok(path) => format!("Exported {}", path.display()),
@@ -1558,12 +1585,14 @@ fn lay_take(p: &mut Project, track: Id, session: &Session, start_tick: Tick, nam
     count
 }
 
+fn export_path(name: &str, ext: &str) -> PathBuf {
+    let stem: String = name.chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' }).collect();
+    PathBuf::from("exports").join(format!("{stem}.{ext}"))
+}
+
 fn write_export(name: &str, ext: &str, bytes: &[u8]) -> Result<PathBuf, String> {
-    let dir = PathBuf::from("exports");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let stem: String =
-        name.chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' }).collect();
-    let path = dir.join(format!("{stem}.{ext}"));
+    let path = export_path(name, ext);
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
     std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
     Ok(path)
 }

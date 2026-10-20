@@ -12,6 +12,7 @@ pub mod input;
 pub mod journal;
 pub mod mic;
 pub mod player;
+pub mod render;
 pub mod schedule;
 pub mod synth;
 pub mod wav;

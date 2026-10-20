@@ -358,8 +358,8 @@ pub fn list() -> Value {
         },
         {
             "name": "export",
-            "description": "Writes the project to the exports folder as a Standard MIDI File or ABC notation.",
-            "inputSchema": {"type": "object", "properties": {"format": {"type": "string", "enum": ["midi", "abc"]}}, "required": ["format"]}
+            "description": "Writes the project to the exports folder: a Standard MIDI File, ABC notation, or the song as sound (mp3 or wav, played through the app's synth, as Play sounds; rendered in the background, so the file appears a few seconds later).",
+            "inputSchema": {"type": "object", "properties": {"format": {"type": "string", "enum": ["midi", "abc", "mp3", "wav"]}}, "required": ["format"]}
         }
     ])
 }
