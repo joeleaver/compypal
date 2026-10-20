@@ -598,3 +598,4 @@
     border-right: 2px solid var(--rinch-color-green-6);
     pointer-events: none;
 }
+.toolbar-label { font-size: 11px; color: var(--rinch-color-dimmed); margin-right: 2px; }

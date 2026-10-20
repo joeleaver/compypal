@@ -34,7 +34,8 @@ It has a chord and a shape (block, arpeggio, run, melody, note, mixed).
 
 - Onsets within `chord_window` are one event (human spread).
 - A DP splits events into figures: chord misfit (duration-weighted) plus a
-  per-figure cost that is cheapest on barlines. Passing tones (stepwise in
+  per-figure cost that is cheapest on barlines, plus a small cost per tick
+  for each tone past a triad (C, Am, F in a row also spell Fmaj9). Passing tones (stepwise in
   and out) count a quarter. Rests past `split_gap` always split.
 - `revoice` maps each note to its role in the new chord, near its old
   pitch, keeping the contour. A new chord's tones that no note plays take a
@@ -108,8 +109,12 @@ It has a chord and a shape (block, arpeggio, run, melody, note, mixed).
   records when position zero of a Play is heard (`Engine::heard_zero`),
   and `stop_recording` shifts the take by the difference (~56 ms here).
   MIDI input latency itself (~1 ms over USB) is not corrected.
-- Not yet: the KeyLab's DAW-port transport buttons, free-time recording
-  with tempo detection.
+- **Free** (next to Rec): no click, no count-in, nothing playing. On stop
+  the pulse is found (`jam::estimate_tempo`, refined by a least-squares
+  line through the eighths so long takes don't drift off the grid) and the
+  take is laid on the song's grid by its own beats at the cursor's bar
+  (`jam::to_session`, as `keep_jam` does). An empty song takes the tempo.
+- Not yet: the KeyLab's DAW-port transport buttons.
 
 ## Agent (MCP)
 

@@ -62,6 +62,9 @@ pub struct Store {
     /// The connected input port.
     pub midi_port: Signal<Option<String>>,
     pub recording: Signal<Option<Recording>>,
+    /// Rec records in free time: no click, no count-in, the tempo found
+    /// from the playing afterwards.
+    pub free_rec: Signal<bool>,
     /// The running take so far, for drawing as it's played.
     pub live_take: Signal<Vec<RawEvent>>,
     /// Engine time minus song time: nonzero while recording, where the
@@ -176,6 +179,8 @@ pub struct Recording {
     pub meter: MeterChange,
     /// When the take's clock started: Rec, not the first click heard.
     pub started: std::time::Instant,
+    /// No click and no count-in: the tempo comes from the playing.
+    pub free: bool,
 }
 
 impl Recording {
@@ -241,6 +246,7 @@ impl Store {
             midi_port: Signal::new(midi.and_then(|m| m.connected())),
             recording: Signal::new(None),
             live_take: Signal::new(Vec::new()),
+            free_rec: Signal::new(false),
             play_offset: Signal::new(0.0),
             selection: Signal::new(None),
             agents: Signal::new(0),
@@ -731,15 +737,19 @@ impl Store {
     /// count-in, then the song plays (with the click, if on) while
     /// everything played on the controller is captured.
     pub fn record(self) {
-        let (Some(engine), Some(midi)) = (self.engine, self.midi) else {
-            self.status.set("Recording needs audio output and a MIDI input".into());
-            return;
-        };
-        if midi.connected().is_none() {
+        let Some(midi) = self.midi.filter(|m| m.connected().is_some()) else {
             self.status.set("Connect a MIDI input to record".into());
             return;
-        }
+        };
         let Some(track) = self.selected_track.get() else { return };
+        if self.free_rec.get() {
+            self.record_free(track, midi);
+            return;
+        }
+        let Some(engine) = self.engine else {
+            self.status.set("Recording to the click needs audio output; try Free".into());
+            return;
+        };
         engine.stop();
         let start_tick = self.cursor.get();
         let (song, from, bpm, meter) = self.project.with(|p| {
@@ -758,8 +768,53 @@ impl Store {
         engine.play(take, 0.0, compypal_audio::Looping::Off);
         self.play_offset.set(lead - from);
         self.playhead.set(Some(0.0));
-        self.recording.set(Some(Recording { track, start_tick, lead, bpm, meter, started }));
+        self.recording.set(Some(Recording { track, start_tick, lead, bpm, meter, started, free: false }));
         self.status.set("Recording… (Space or Rec to stop)".into());
+    }
+
+    /// Starts a take in free time: no click, no count-in, nothing playing.
+    /// It lands at the cursor's bar, on the song's grid by its own beat.
+    fn record_free(self, track: Id, midi: &'static MidiIn) {
+        if let Some(e) = self.engine {
+            e.stop();
+        }
+        self.playhead.set(None);
+        let (start_tick, bpm, meter) = self.project.with(|p| {
+            let start = text::bar_start(p, text::bar_of(p, self.cursor.get()));
+            (start, p.tempo.bpm_at(start), p.meter_at(start))
+        });
+        self.monitor_selected();
+        let started = std::time::Instant::now();
+        midi.start_take(started);
+        self.recording.set(Some(Recording { track, start_tick, lead: 0.0, bpm, meter, started, free: true }));
+        self.status.set("Recording in free time: no click, play at your own pace (Space or Rec to stop)".into());
+    }
+
+    /// Keeps a free-time take: finds its pulse, and lays it on the song's
+    /// grid by its own beats. An empty song takes the take's tempo.
+    fn keep_free_take(self, rec: Recording, events: Vec<RawEvent>) {
+        let tempo = compypal_core::jam::estimate_tempo(&compypal_core::jam::onsets(&events)).filter(|t| t.confidence >= 0.3);
+        let end = events.last().map_or(0.0, |e| e.t);
+        let mut summary = String::new();
+        self.edit("record in free time", |p| {
+            let empty = p.tracks.iter().all(|t| t.clips.iter().all(|c| c.notes.is_empty()));
+            if let (Some(t), true) = (tempo, empty) {
+                p.tempo = compypal_core::TempoMap::constant(t.bpm.round());
+            }
+            let id = p.alloc_id();
+            let name = format!("Take {}", p.sessions.len() + 1);
+            let meter = p.meter_at(rec.start_tick);
+            let mut session = compypal_core::jam::to_session(&events, 0.0, end, id, name.clone(), tempo.as_ref(), meter, rec.start_tick);
+            session.recorded_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let notes = lay_take(p, rec.track, &session, rec.start_tick, &name);
+            p.sessions.push(session);
+            summary = match tempo {
+                Some(t) if empty => format!("{name}: {notes} notes at about {:.0} BPM; the song is at that tempo now", t.bpm),
+                Some(t) => format!("{name}: {notes} notes played at about {:.0} BPM, fitted to the song's grid beat by beat", t.bpm),
+                None => format!("{name}: {notes} notes; no steady beat found, so it's laid down as played"),
+            };
+        });
+        self.status.set(format!("Recorded {summary}. Tidy it from the session list, or ask the agent."));
     }
 
     /// Ends the take: keeps it as a session and lays it down as a clip on
@@ -774,6 +829,14 @@ impl Store {
         self.recording.set(None);
         self.live_take.set(Vec::new());
         let mut events = self.midi.map(|m| m.finish_take()).unwrap_or_default();
+        if !events.iter().any(|e| matches!(e.msg, compypal_core::RawMsg::NoteOn { .. })) {
+            self.status.set("Nothing recorded".into());
+            return;
+        }
+        if rec.free {
+            self.keep_free_take(rec, events);
+            return;
+        }
         // The take's clock started at Rec, but the first click came out of
         // the speakers later (a buffer or two, plus the device's latency),
         // and you played to what you heard. Time the take from there.
@@ -781,32 +844,13 @@ impl Store {
         for e in &mut events {
             e.t -= late;
         }
-        if !events.iter().any(|e| matches!(e.msg, compypal_core::RawMsg::NoteOn { .. })) {
-            self.status.set("Nothing recorded".into());
-            return;
-        }
         let mut summary = String::new();
         self.edit("record", |p| {
             let id = p.alloc_id();
             let name = format!("Take {}", p.sessions.len() + 1);
             let session = rec.session(id, name.clone(), events);
-            let imported = cleanup::import_session(&session, &p.tempo, true);
-            let bar = rec.meter.ticks_per_bar();
-            let start = rec.start_tick.saturating_sub(imported.pickup_bars as Tick * bar);
-            let end = imported.notes.iter().map(|n| n.end()).max().unwrap_or(0);
-            let clip_id = p.alloc_id();
-            summary = format!("{name}: {} notes", imported.notes.len());
-            if let Some(t) = p.track_mut(rec.track) {
-                t.clips.push(Clip {
-                    id: clip_id,
-                    name: name.clone(),
-                    start,
-                    length: end.div_ceil(bar).max(1) * bar,
-                    notes: imported.notes,
-                    source_session: Some(id),
-                });
-                t.clips.sort_by_key(|c| c.start);
-            }
+            let notes = lay_take(p, rec.track, &session, rec.start_tick, &name);
+            summary = format!("{name}: {notes} notes");
             p.sessions.push(session);
         });
         self.status.set(format!(
@@ -1326,6 +1370,29 @@ impl Store {
         let drag = self.note_drag.get();
         self.project.with(|p| Roll::build(p, selected, zoom, show_raw, live.as_ref(), &sel, drag.as_ref()))
     }
+}
+
+/// Lays a take down as a clip on `track`, as played, its first downbeat at
+/// `start_tick` (a pickup goes before it). Returns how many notes.
+fn lay_take(p: &mut Project, track: Id, session: &Session, start_tick: Tick, name: &str) -> usize {
+    let imported = cleanup::import_session(session, &p.tempo, true);
+    let bar = session.meter.ticks_per_bar();
+    let start = start_tick.saturating_sub(imported.pickup_bars as Tick * bar);
+    let end = imported.notes.iter().map(|n| n.end()).max().unwrap_or(0);
+    let count = imported.notes.len();
+    let clip_id = p.alloc_id();
+    if let Some(t) = p.track_mut(track) {
+        t.clips.push(Clip {
+            id: clip_id,
+            name: name.to_string(),
+            start,
+            length: end.div_ceil(bar).max(1) * bar,
+            notes: imported.notes,
+            source_session: Some(session.id),
+        });
+        t.clips.sort_by_key(|c| c.start);
+    }
+    count
 }
 
 fn write_export(name: &str, ext: &str, bytes: &[u8]) -> Result<PathBuf, String> {

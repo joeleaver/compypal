@@ -69,15 +69,45 @@ pub fn estimate_tempo(onsets: &[(f64, u8)]) -> Option<TempoGuess> {
         }
         bpm += 0.25;
     }
-    let (_, bpm, grid) = best?;
-    let beat = 60.0 / bpm;
+    let (_, coarse, grid) = best?;
     // The beat grid's phase, from all the notes; the downbeat is the beat
     // nearest the first note of at least average loudness.
-    let (_, phase) = align(beat, &|v| v as f64, onsets.iter().map(|(_, v)| *v as f64).sum());
+    let (_, phase) = align(60.0 / coarse, &|v| v as f64, onsets.iter().map(|(_, v)| *v as f64).sum());
+    let (bpm, grid0) = refine(onsets, coarse, phase / std::f64::consts::TAU * 60.0 / coarse);
+    let beat = 60.0 / bpm;
     let first = onsets.iter().find(|(_, v)| *v as f64 >= mean_v).unwrap_or(&onsets[0]).0;
-    let grid0 = phase / std::f64::consts::TAU * beat;
     let k = ((first - grid0) / beat).round();
     Some(TempoGuess { bpm, downbeat: grid0 + k * beat, confidence: grid.clamp(0.0, 1.0) })
+
+}
+
+/// Sharpens a tempo found on a coarse search: puts each note on its nearest
+/// eighth of that grid and fits a line through (eighth, time) by least
+/// squares. Over a long take a fraction of a BPM is the difference between
+/// sitting on the grid and drifting off it at both ends. Returns the BPM
+/// and a time where a beat falls; keeps the coarse answer if the fit
+/// wanders off it.
+fn refine(onsets: &[(f64, u8)], bpm: f64, beat0: f64) -> (f64, f64) {
+    let (mut step, mut zero) = (30.0 / bpm, beat0);
+    for _ in 0..3 {
+        let pts: Vec<(f64, f64)> = onsets.iter().map(|(t, _)| (((t - zero) / step).round(), *t)).collect();
+        let n = pts.len() as f64;
+        let (mx, my) = (pts.iter().map(|p| p.0).sum::<f64>() / n, pts.iter().map(|p| p.1).sum::<f64>() / n);
+        let sxx: f64 = pts.iter().map(|p| (p.0 - mx).powi(2)).sum();
+        if sxx <= 0.0 {
+            break;
+        }
+        let slope = pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum::<f64>() / sxx;
+        if !(slope > 0.0) || (slope / step - 1.0).abs() > 0.03 {
+            return (bpm, beat0);
+        }
+        // An eighth-note line through the notes; a beat is every other one,
+        // so keep the one nearest the coarse beat.
+        let line0 = my - slope * mx;
+        let k = ((beat0 - line0) / (2.0 * slope)).round();
+        (step, zero) = (slope, line0 + k * 2.0 * slope);
+    }
+    (30.0 / step, zero)
 }
 
 /// Places a beat grid of a known tempo on the onsets: for when the player
@@ -343,5 +373,22 @@ mod tests {
         // The first note (the C chord's root) lands on the downbeat.
         assert!(notes[0].start < 40, "{:?}", &notes[..2]);
         assert_eq!(notes[0].pitch, 48);
+    }
+
+    #[test]
+    fn a_long_steady_take_gets_an_exact_tempo() {
+        // 21 s of eighths at 77.3 BPM, a little uneven, accents on the beat.
+        let eighth = 30.0 / 77.3;
+        let ons: Vec<(f64, u8)> = (0..56)
+            .map(|i| {
+                let wobble = ((i * 37) % 11) as f64 / 11.0 - 0.5;
+                (1.234 + i as f64 * eighth + wobble * 0.012, if i % 2 == 0 { 96 } else { 70 })
+            })
+            .collect();
+        let g = estimate_tempo(&ons).unwrap();
+        assert!((g.bpm - 77.3).abs() < 0.05, "{}", g.bpm);
+        // The downbeat lands on a played beat, to within a few ms.
+        let off = ((g.downbeat - 1.234) / (2.0 * eighth)).fract().abs();
+        assert!(off.min(1.0 - off) * 2.0 * eighth < 0.006, "downbeat {} off by {off}", g.downbeat);
     }
 }

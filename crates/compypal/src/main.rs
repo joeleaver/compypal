@@ -131,9 +131,15 @@ fn Transport() -> NodeHandle {
             Button { size: "xs",
                 color: "red",
                 variant: {|| if store.is_recording() { "filled" } else { "light" }},
-                disabled: store.engine.is_none() || store.midi.is_none(),
+                disabled: store.midi.is_none(),
                 onclick: move || if store.is_recording() { store.stop_recording() } else { store.record() },
                 {|| if store.is_recording() { "■ Stop rec" } else { "● Rec" }}
+            }
+            Button { size: "xs",
+                variant: {|| if store.free_rec.get() { "filled" } else { "default" }},
+                disabled: {|| store.is_recording()},
+                onclick: move || store.free_rec.update(|f| *f = !*f),
+                "Free"
             }
             Button { size: "xs",
                 variant: {|| if store.looping.get() { "filled" } else { "default" }},
@@ -181,8 +187,9 @@ fn Transport() -> NodeHandle {
                 "Redo"
             }
             div { class: "divider" }
-            Button { size: "xs", variant: "default", onclick: move || { let _ = store.export_midi(); }, "Export MIDI" }
-            Button { size: "xs", variant: "default", onclick: move || { let _ = store.export_abc(); }, "Export ABC" }
+            span { class: "toolbar-label", "Export" }
+            Button { size: "xs", variant: "default", onclick: move || { let _ = store.export_midi(); }, "MIDI" }
+            Button { size: "xs", variant: "default", onclick: move || { let _ = store.export_abc(); }, "ABC" }
             div { class: "divider" }
             Button { size: "xs",
                 variant: {|| if store.chat_open.get() { "filled" } else { "light" }},
