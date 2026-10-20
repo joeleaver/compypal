@@ -40,9 +40,17 @@ pub enum Reading {
     Line,
 }
 
+/// Which version of the transcription a transcript was made by. Raise it
+/// when reading changes enough to be worth redoing old recordings: they
+/// are written down again at the next start (the audio stays as it was).
+pub const TRANSCRIPT_VERSION: u32 = 2;
+
 /// A recording, written down.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Transcript {
+    /// [`TRANSCRIPT_VERSION`] when it was made; 0 before versions.
+    #[serde(default)]
+    pub version: u32,
     /// Unix time of the first sample.
     pub start: f64,
     pub seconds: f64,
@@ -99,6 +107,7 @@ pub fn transcribe(samples: &[f32], start: f64, model: Option<&BasicPitch>) -> Tr
         Reading::Strums
     };
     Transcript {
+        version: TRANSCRIPT_VERSION,
         start,
         seconds: samples.len() as f64 / RATE as f64,
         reading,
@@ -135,6 +144,9 @@ pub fn transcript_path(dir: &Path, file: u64) -> PathBuf {
 pub struct Job {
     pub file: u64,
     pub start: f64,
+    /// Written down before, by an older version: its sketches are
+    /// replaced, and the recording is kept whatever comes of it.
+    pub redo: bool,
 }
 
 /// A jam being recorded.
@@ -247,7 +259,7 @@ fn close(dir: &Path, jam: &mut Option<Open>, state: &Mutex<State>, jobs: &Sender
     let mut st = state.lock().unwrap();
     st.audio_live = None;
     st.audio_pending.push((j.file, j.start, end));
-    let _ = jobs.send(Job { file: j.file, start: j.start });
+    let _ = jobs.send(Job { file: j.file, start: j.start, redo: false });
     let _ = dir;
 }
 
@@ -279,7 +291,17 @@ pub fn transcriber(dir: PathBuf, index: PathBuf, rx: Receiver<Job>, state: Arc<M
                 (Vec::new(), None)
             }
         };
-        match transcript.filter(|_| !sketches.is_empty()) {
+        if job.redo && transcript.is_some() {
+            // Out with the old reading's sketches.
+            let mut st = state.lock().unwrap();
+            st.index.retain(|s| s.audio.is_none_or(|a| a.file != job.file));
+            let kept: Vec<String> = st.index.iter().filter_map(|s| serde_json::to_string(s).ok()).collect();
+            let tmp = index.with_extension("jsonl.tmp");
+            if std::fs::write(&tmp, kept.iter().map(|l| format!("{l}\n")).collect::<String>()).is_ok() {
+                let _ = std::fs::rename(&tmp, &index);
+            }
+        }
+        match transcript.filter(|t| !sketches.is_empty() || job.redo && !t.events().is_empty()) {
             Some(t) => {
                 if let Ok(text) = serde_json::to_string(&t) {
                     let _ = std::fs::write(transcript_path(&dir, job.file), text);
@@ -295,7 +317,9 @@ pub fn transcriber(dir: PathBuf, index: PathBuf, rx: Receiver<Job>, state: Arc<M
                 st.index.sort_by(|a, b| a.start.total_cmp(&b.start));
             }
             None => {
-                if read.is_ok() {
+                // Nothing in it (a door, a cough). A recording that once
+                // held a sketch is kept, whatever a new reading makes of it.
+                if read.is_ok() && !job.redo {
                     let _ = std::fs::remove_file(&wav);
                 }
             }
@@ -304,9 +328,10 @@ pub fn transcriber(dir: PathBuf, index: PathBuf, rx: Receiver<Job>, state: Arc<M
     }
 }
 
-/// Recordings the app stopped in the middle of (a crash, a quit while
-/// playing): finished and queued for writing down.
-pub fn unfinished(dir: &Path) -> Vec<Job> {
+/// Recordings to write down at startup: those the app stopped in the
+/// middle of (a crash, a quit while playing), finished first; and those
+/// written down by an older version of the transcription.
+pub fn to_write_down(dir: &Path) -> Vec<Job> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut out = Vec::new();
     for e in entries.flatten() {
@@ -314,8 +339,19 @@ pub fn unfinished(dir: &Path) -> Vec<Job> {
         let Some(file) = path.extension().filter(|x| *x == "wav").and(path.file_stem()).and_then(|s| s.to_str()?.parse::<u64>().ok()) else {
             continue;
         };
-        if !transcript_path(dir, file).exists() && wav::repair(&path).is_ok() {
-            out.push(Job { file, start: file as f64 });
+        match std::fs::read_to_string(transcript_path(dir, file)) {
+            Err(_) => {
+                if wav::repair(&path).is_ok() {
+                    out.push(Job { file, start: file as f64, redo: false });
+                }
+            }
+            Ok(text) => {
+                if let Ok(t) = serde_json::from_str::<Transcript>(&text)
+                    && t.version < TRANSCRIPT_VERSION
+                {
+                    out.push(Job { file, start: t.start, redo: true });
+                }
+            }
         }
     }
     out.sort_by_key(|j| j.file);

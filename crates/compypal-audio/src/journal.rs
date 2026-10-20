@@ -82,7 +82,7 @@ impl Journal {
         let audio = dir.join("audio");
         std::fs::create_dir_all(&audio)?;
         let (jobs_tx, jobs_rx) = channel();
-        for job in audio_journal::unfinished(&audio) {
+        for job in audio_journal::to_write_down(&audio) {
             let _ = jobs_tx.send(job);
         }
         let (audio_tx, audio_rx) = channel();
@@ -400,6 +400,28 @@ mod tests {
         let again = Journal::open(dir.clone()).unwrap();
         let (back, _) = again.sketches().into_iter().find(|(x, _)| x.id == s.id).unwrap();
         assert_eq!(again.sketch_events(&back, back.start - 0.01, back.end + 0.01).len(), s.notes * 2);
+        drop(again);
+        // Written down by an older version: done again at the next start,
+        // its sketch replaced, not doubled.
+        let json = audio_journal::transcript_path(&dir.join("audio"), a.file);
+        let mut old: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+        old["version"] = 0.into();
+        std::fs::write(&json, old.to_string()).unwrap();
+        let redone = Journal::open(dir.clone()).unwrap();
+        let mut version = 0;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            version = serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&json).unwrap()).unwrap()["version"].as_u64().unwrap();
+            if version == audio_journal::TRANSCRIPT_VERSION as u64 {
+                break;
+            }
+        }
+        assert_eq!(version, audio_journal::TRANSCRIPT_VERSION as u64);
+        std::thread::sleep(Duration::from_millis(200));
+        let ours = |j: &Journal| j.sketches().into_iter().filter(|(x, _)| x.audio.is_some_and(|b| b.file == a.file) && x.notes > 0).count();
+        assert_eq!(ours(&redone), 1);
+        drop(redone);
+        assert_eq!(ours(&Journal::open(dir.clone()).unwrap()), 1, "and so on disk");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

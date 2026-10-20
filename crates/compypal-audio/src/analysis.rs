@@ -580,7 +580,7 @@ const LINE_WINDOW: usize = 1024;
 const LINE_LOWEST_HZ: f32 = 70.0;
 const LINE_HIGHEST_HZ: f32 = 1_400.0;
 /// YIN's threshold on the normalised difference: below it, a period.
-const YIN_THRESHOLD: f32 = 0.15;
+const YIN_THRESHOLD: f32 = 0.25;
 /// The longest a voice may leave its note before it's a new one: a note
 /// is held through vibrato and scoops, and only a new pitch held this
 /// long counts as moving on.
@@ -627,8 +627,10 @@ fn yin(frame: &[f32], rate: u32) -> Option<(f32, f32)> {
     Some((rate as f32 / (lag as f32 + shift.clamp(-0.5, 0.5)), (1.0 - b).clamp(0.0, 1.0)))
 }
 
-/// The pitch of a recording every 10 ms. Quiet frames (40 dB under the
-/// loudest, or nearly silent) are unvoiced whatever their period.
+/// The pitch of a recording every 10 ms. Frames near the room's noise
+/// (within 10 dB of the quietest tenth) or 45 dB under the loudest are
+/// unvoiced whatever their period: judged against the recording itself,
+/// so a quiet input (low gain) is heard as well as a loud one.
 pub fn pitch_track(samples: &[f32], rate: u32) -> Vec<PitchFrame> {
     let hop = (LINE_HOP_SECS * rate as f64) as usize;
     let mut frames = Vec::new();
@@ -637,7 +639,7 @@ pub fn pitch_track(samples: &[f32], rate: u32) -> Vec<PitchFrame> {
         let frame = &samples[start..start + LINE_WINDOW];
         let rms = (frame.iter().map(|s| s * s).sum::<f32>() / LINE_WINDOW as f32).sqrt();
         let level = 20.0 * (rms + 1e-9).log10();
-        let found = if level > -60.0 { yin(frame, rate) } else { None };
+        let found = if level > -90.0 { yin(frame, rate) } else { None };
         frames.push(PitchFrame {
             t: (start + LINE_WINDOW / 2) as f64 / rate as f64,
             pitch: found.map(|(f, _)| 69.0 + 12.0 * (f / 440.0).log2()),
@@ -647,8 +649,9 @@ pub fn pitch_track(samples: &[f32], rate: u32) -> Vec<PitchFrame> {
         start += hop;
     }
     let loudest = frames.iter().map(|f| f.level).fold(-120.0f32, f32::max);
+    let room = noise_floor(&frames);
     for f in &mut frames {
-        if f.level < (loudest - 40.0).max(-55.0) {
+        if f.level < (loudest - 45.0).max(room + 10.0) {
             f.pitch = None;
         }
     }
@@ -665,16 +668,35 @@ pub fn pitch_track(samples: &[f32], rate: u32) -> Vec<PitchFrame> {
     frames
 }
 
-/// How much of the sound is one clear pitch at a time: the share of loud
-/// frames that are voiced. A voice or a single line is most of it; chords
-/// and noise are little.
+/// The room: the level of the quietest tenth of the frames, but at least
+/// 30 dB under the loudest (a recording that is all playing has no quiet
+/// tenth to go by).
+fn noise_floor(frames: &[PitchFrame]) -> f32 {
+    let mut levels: Vec<f32> = frames.iter().map(|f| f.level).collect();
+    levels.sort_by(f32::total_cmp);
+    let loudest = levels.last().copied().unwrap_or(-120.0);
+    levels.get(levels.len() / 10).copied().unwrap_or(-120.0).min(loudest - 30.0)
+}
+
+/// How much of the sound is one clear pitch at a time: of the frames that
+/// have a pitch at all, the share where it's clear. A voice or a single
+/// line is most of it (its consonants and breaths have no pitch, and
+/// don't count against it); chords and noise are little.
 pub fn monophony(track: &[PitchFrame]) -> f32 {
     let loudest = track.iter().map(|f| f.level).fold(-120.0f32, f32::max);
-    let loud: Vec<&PitchFrame> = track.iter().filter(|f| f.level > loudest - 25.0).collect();
-    if loud.is_empty() {
+    let room = noise_floor(track);
+    // Loud enough to be playing.
+    let playing: Vec<&PitchFrame> = track.iter().filter(|f| f.level > (loudest - 30.0).max(room + 12.0)).collect();
+    if playing.is_empty() {
         return 0.0;
     }
-    loud.iter().filter(|f| f.pitch.is_some() && f.clarity > 0.8).count() as f32 / loud.len() as f32
+    let pitched = playing.iter().filter(|f| f.pitch.is_some()).count();
+    let clear = playing.iter().filter(|f| f.pitch.is_some() && f.clarity > 0.85).count();
+    // Mostly unpitched (noise, drums) isn't a line either.
+    if pitched * 4 < playing.len() {
+        return 0.0;
+    }
+    clear as f32 / pitched as f32
 }
 
 /// Notes of one line (a voice, a whistle, a single string) from its pitch

@@ -238,13 +238,17 @@ mic hears the room.
   `journal/audio/<start>.wav` (0.5 s pre-roll, 1.5 s tail; immutable).
   `transcriber` then writes it down (`audio/<start>.json`, a `Transcript`)
   and files its sketches; a jam with no sketch in it isn't kept. Files cut
-  short by a quit are repaired and transcribed at the next start.
+  short by a quit are repaired and transcribed at the next start, and so
+  is any transcript older than `TRANSCRIPT_VERSION` (raise it when reading
+  improves: its sketches are replaced in `sketches.jsonl`, the audio stays).
 - Three readings, all kept in the transcript: `analysis::strums` (onsets
   by spectral flux placed on the waveform; per onset the notes sounding by
   harmonic sums on a 16k FFT, tuned to the instrument; which were struck,
   by their rise; the chord via `theory::best_fit`; in strummed playing a
   light stroke strikes everything ringing from the last strum's bass up),
-  `analysis::line` (one voice or line: YIN pitch every 10 ms, a note held
+  `analysis::line` (one voice or line: YIN pitch every 10 ms, voiced
+  only above the recording's own noise floor so low gain still works, a
+  note held
   through vibrato and scoops until the pitch settles a semitone away for
   60 ms, split at breaks and at onsets where the level jumps) and Basic
   Pitch's notes (`basic_pitch`, tract, the reference's note
@@ -269,6 +273,8 @@ mic hears the room.
 - No guitar needed: `cargo run -p compypal-audio --example fake_strums --
   <data dir>/compypal` (app closed) writes a strummed G C D Em into that
   journal. `--example mic_level [name]` checks an input without the UI.
+  `--example transcribe_wav <journal/audio/N.wav>` prints a recording's
+  pitch track and each reading's notes, to compare with what was played.
 - Input goes through PipeWire (cpal's `pipewire` feature, on by default in
   compypal-audio; needs libpipewire-0.3 headers): it owns the cards, so
   opening their raw ALSA devices fails as busy. Sources are listed by
