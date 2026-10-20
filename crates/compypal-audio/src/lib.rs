@@ -110,6 +110,7 @@ impl Engine {
     }
 
     pub fn play(&self, schedule: Schedule, from: f64, looping: bool) {
+        self.shared.forget_heard_zero();
         self.send(Cmd::Play { schedule: Arc::new(schedule), from, looping });
     }
 
@@ -136,6 +137,12 @@ impl Engine {
 
     pub fn panic(&self) {
         self.send(Cmd::Panic);
+    }
+
+    /// When position zero of the last Play was (or will be) heard; `None`
+    /// until the audio thread has started it.
+    pub fn heard_zero(&self) -> Option<std::time::Instant> {
+        self.shared.heard_zero()
     }
 
     /// Transport position in seconds, or `None` when stopped.
@@ -166,7 +173,11 @@ where
     device
         .build_output_stream::<T, _, _>(
             *config,
-            move |out: &mut [T], _| {
+            move |out: &mut [T], info: &cpal::OutputCallbackInfo| {
+                // When this buffer will come out of the speakers.
+                let ts = info.timestamp();
+                let latency = ts.playback.duration_since(ts.callback);
+                player.set_clock(std::time::Instant::now() + latency);
                 let frames = out.len() / channels;
                 if left.len() < frames {
                     left.resize(frames, 0.0);

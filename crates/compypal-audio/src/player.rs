@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 
 use crate::schedule::{Schedule, Timed};
 use crate::synth::Synth;
@@ -25,14 +26,38 @@ pub enum Cmd {
 }
 
 /// What the UI can read without talking to the audio thread.
-#[derive(Default)]
 pub struct Shared {
     /// Transport position in seconds, as f64 bits.
     position: AtomicU64,
     playing: AtomicBool,
+    /// When position zero of the last Play is heard, in nanoseconds after
+    /// `epoch`; zero until the audio thread has started it.
+    heard_zero: AtomicU64,
+    epoch: Instant,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self { position: AtomicU64::new(0), playing: AtomicBool::new(false), heard_zero: AtomicU64::new(0), epoch: Instant::now() }
+    }
 }
 
 impl Shared {
+    /// The moment position zero of the current Play comes out of the
+    /// speakers: later than the Play was asked for by however long the
+    /// command waited for a callback plus the output's own latency. A take
+    /// is timed from here, since that's the click the player heard.
+    pub fn heard_zero(&self) -> Option<Instant> {
+        match self.heard_zero.load(Ordering::Relaxed) {
+            0 => None,
+            ns => Some(self.epoch + Duration::from_nanos(ns)),
+        }
+    }
+
+    pub(crate) fn forget_heard_zero(&self) {
+        self.heard_zero.store(0, Ordering::Relaxed);
+    }
+
     pub fn position(&self) -> Option<f64> {
         self.playing
             .load(Ordering::Relaxed)
@@ -122,11 +147,21 @@ pub struct Player {
     audition: Option<Run>,
     cmds: Receiver<Cmd>,
     shared: Arc<Shared>,
+    /// When this buffer's first frame will be heard (see `set_clock`).
+    heard_at: Option<Instant>,
+    /// A Play started in this buffer, from this position.
+    started: Option<f64>,
 }
 
 impl Player {
     pub fn new(synth: Box<dyn Synth>, rate: u32, cmds: Receiver<Cmd>, shared: Arc<Shared>) -> Self {
-        Self { synth, rate: rate as f64, transport: None, audition: None, cmds, shared }
+        Self { synth, rate: rate as f64, transport: None, audition: None, cmds, shared, heard_at: None, started: None }
+    }
+
+    /// Tells the player when the buffer it's about to fill will be heard:
+    /// the callback's time plus the output latency the device reports.
+    pub fn set_clock(&mut self, heard_at: Instant) {
+        self.heard_at = Some(heard_at);
     }
 
     fn handle(&mut self, cmd: Cmd) {
@@ -138,6 +173,7 @@ impl Player {
                 }
                 chase(&schedule, from, synth);
                 self.transport = Some(Run::new(schedule, from, looping));
+                self.started = Some(from);
             }
             Cmd::Update(schedule) => {
                 if let Some(r) = self.transport.as_mut() {
@@ -189,6 +225,12 @@ impl Player {
         while let Ok(cmd) = self.cmds.try_recv() {
             self.handle(cmd);
         }
+        // A Play starts at this buffer's first frame.
+        if let (Some(from), Some(at)) = (self.started.take(), self.heard_at) {
+            let zero = at.checked_sub(Duration::from_secs_f64(from.max(0.0))).unwrap_or(at);
+            let ns = zero.saturating_duration_since(self.shared.epoch).as_nanos().max(1) as u64;
+            self.shared.heard_zero.store(ns, Ordering::Relaxed);
+        }
         left.fill(0.0);
         right.fill(0.0);
 
@@ -228,6 +270,20 @@ impl Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_play_knows_when_it_is_heard() {
+        let (tx, rx) = channel();
+        let shared = Arc::new(Shared::default());
+        let mut p = Player::new(Box::new(crate::synth::BasicSynth::new(48_000)), 48_000, rx, shared.clone());
+        let at = shared.epoch + Duration::from_millis(500);
+        p.set_clock(at);
+        tx.send(Cmd::Play { schedule: Arc::new(Schedule::default()), from: 0.25, looping: false }).unwrap();
+        let (mut l, mut r) = (vec![0.0; 64], vec![0.0; 64]);
+        p.process(&mut l, &mut r);
+        // Position 0.25 is heard at `at`, so position zero a quarter second before.
+        assert_eq!(shared.heard_zero(), Some(shared.epoch + Duration::from_millis(250)));
+    }
     use std::sync::Mutex;
     use std::sync::mpsc::channel;
 

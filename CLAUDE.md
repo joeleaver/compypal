@@ -95,8 +95,14 @@ It has a chord and a shape (block, arpeggio, run, melody, note, mixed).
 - No hardware needed for testing: `cargo run -p compypal-audio --example
   fake_keys -- 10` opens a virtual port and plays an arpeggio after 10s;
   run the app with `COMPYPAL_MIDI_IN=compypal-fake-keys`.
-- Not yet: latency compensation (takes may sit a few ms late), the KeyLab's
-  DAW-port transport buttons, free-time recording with tempo detection.
+- Latency: a take's clock starts at Rec, but the first click is heard a
+  buffer or two later plus the device's output latency. The audio callback
+  passes cpal's playback timestamp to `Player::set_clock`, the player
+  records when position zero of a Play is heard (`Engine::heard_zero`),
+  and `stop_recording` shifts the take by the difference (~56 ms here).
+  MIDI input latency itself (~1 ms over USB) is not corrected.
+- Not yet: the KeyLab's DAW-port transport buttons, free-time recording
+  with tempo detection.
 
 ## Agent (MCP)
 

@@ -174,6 +174,8 @@ pub struct Recording {
     pub lead: f64,
     pub bpm: f64,
     pub meter: MeterChange,
+    /// When the take's clock started: Rec, not the first click heard.
+    pub started: std::time::Instant,
 }
 
 impl Recording {
@@ -751,11 +753,12 @@ impl Store {
         take.length = f64::INFINITY;
         let lead = meter.numerator as f64 * beat;
         self.monitor_selected();
-        midi.start_take(std::time::Instant::now());
+        let started = std::time::Instant::now();
+        midi.start_take(started);
         engine.play(take, 0.0, false);
         self.play_offset.set(lead - from);
         self.playhead.set(Some(0.0));
-        self.recording.set(Some(Recording { track, start_tick, lead, bpm, meter }));
+        self.recording.set(Some(Recording { track, start_tick, lead, bpm, meter, started }));
         self.status.set("Recording… (Space or Rec to stop)".into());
     }
 
@@ -770,7 +773,14 @@ impl Store {
         self.play_offset.set(0.0);
         self.recording.set(None);
         self.live_take.set(Vec::new());
-        let events = self.midi.map(|m| m.finish_take()).unwrap_or_default();
+        let mut events = self.midi.map(|m| m.finish_take()).unwrap_or_default();
+        // The take's clock started at Rec, but the first click came out of
+        // the speakers later (a buffer or two, plus the device's latency),
+        // and you played to what you heard. Time the take from there.
+        let late = self.engine.and_then(|e| e.heard_zero()).map_or(0.0, |h| h.saturating_duration_since(rec.started).as_secs_f64());
+        for e in &mut events {
+            e.t -= late;
+        }
         if !events.iter().any(|e| matches!(e.msg, compypal_core::RawMsg::NoteOn { .. })) {
             self.status.set("Nothing recorded".into());
             return;
@@ -799,7 +809,10 @@ impl Store {
             }
             p.sessions.push(session);
         });
-        self.status.set(format!("Recorded {summary}. Tidy it from the session list, or ask the agent."));
+        self.status.set(format!(
+            "Recorded {summary} (timed {:.0} ms after Rec, when the first click was heard). Tidy it from the session list, or ask the agent.",
+            late * 1000.0
+        ));
     }
 
     /// Re-derives every clip made from `session` with the default cleanup.
