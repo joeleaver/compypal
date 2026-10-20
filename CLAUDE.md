@@ -12,7 +12,7 @@ with a built-in synth; export MIDI and ABC.
 | `compypal-core` | Project model (ticks, `PPQ = 960`), raw `Session`s (seconds), cleanup ops, snapshot undo, GM names, `theory` (chords, Roman numerals, keys), `figure` (musical units), demo project. No I/O, no UI. |
 | `compypal-io` | SMF import/export (`midly`), ABC export. |
 | `compypal-mcp` | The agent interface: MCP tools over an `App` trait (`tools.rs`, testable on `MemoryApp`), JSON-RPC handling, an HTTP server for tools, the Claude Code IDE WebSocket link, and `agent` (running coding agents: ACP and Claude Code backends, the panel's conversation model). |
-| `compypal-audio` | `Engine` (cpal output on its own thread), `Synth` trait with SoundFont (`rustysynth`) and built-in fallback, pure `schedule::build` from a project, realtime `Player`. |
+| `compypal-audio` | `Engine` (cpal output on its own thread), `Synth` trait with SoundFont (`rustysynth`) and built-in fallback, pure `schedule::build` from a project, realtime `Player`; MIDI and audio input, the journal, and hearing audio (`analysis`, `basic_pitch`). |
 | `compypal` | The rinch desktop app. `store.rs` is all app state; every project edit goes through `Store::edit` so UI and agent share undo. |
 
 ## Model rules
@@ -221,6 +221,52 @@ playing (not take, jam or session).
   `XDG_DATA_HOME=/some/tmp` and the `fake_keys` example (`fake_keys 12 3 4`
   plays three ideas a step apart with 4 s pauses: three sketches).
 
+## Audio sketches (a guitar, a voice)
+
+For instruments with no MIDI: an audio input (sidebar "Audio input", one
+row per card plus "System input"; `COMPYPAL_AUDIO_IN` or the remembered
+`settings.json` `audio_in`) is heard while Listen is on. Off by default: a
+mic hears the room.
+
+- `mic::AudioIn` runs a cpal input stream on its own thread, mixes to mono,
+  blocks DC (a stuck input reads silent), feeds the level meter and, while
+  listening, hands 22.05 kHz audio (`analysis::RATE`, Basic Pitch's rate)
+  to `Journal::log_audio`.
+- `audio_journal::writer` cuts it into jams with `analysis::Gate` (level
+  vs. a noise floor that only rises when nobody plays; 8 s of quiet, by the
+  stream's own clock, ends a jam), keeping each as
+  `journal/audio/<start>.wav` (0.5 s pre-roll, 1.5 s tail; immutable).
+  `transcriber` then writes it down (`audio/<start>.json`, a `Transcript`)
+  and files its sketches; a jam with no sketch in it isn't kept. Files cut
+  short by a quit are repaired and transcribed at the next start.
+- Two readings, both kept in the transcript: `analysis::strums` (onsets
+  by spectral flux placed on the waveform; per onset the notes sounding by
+  harmonic sums on a 16k FFT, tuned to the instrument; which were struck,
+  by their rise; the chord via `theory::best_fit`; in strummed playing a
+  light stroke strikes everything ringing from the last strum's bass up)
+  and Basic Pitch's notes (`basic_pitch`, tract, the reference's note
+  post-processing). Strummed playing (`chordal` >= 0.5) reads as strums,
+  anything else as notes when the model is there. The events go through the
+  same `split_sketches` / `summarize` / `sketch_name` / `estimate_tempo`
+  as MIDI.
+- The model isn't in the repo: `COMPYPAL_BASIC_PITCH`, else
+  `<data dir>/models/basic-pitch.onnx` (Spotify's `nmp.onnx`, Apache-2.0).
+  Without it everything works on the strum reader, which handles strums and
+  plucked lines but not legato singing (no attacks to find).
+- A `Sketch`/`Session` with `audio: Some(AudioRef)` was heard: `start` is
+  the recording's first sample in the events' clock (unix seconds for a
+  sketch, seconds into the session for a session). `Journal::sketch_events`
+  gives any sketch's events; `sketch_audio` its sound. Hear it plays the
+  recording (`Engine::play_clip`; the engine holds the samples so the
+  audio thread never frees them), "Hear the notes" the transcription; the
+  agent's `hear_sketch` takes `as: "notes"`. A recording still going or
+  being written down is listed with `notes == 0`.
+- No guitar needed: `cargo run -p compypal-audio --example fake_strums --
+  <data dir>/compypal` (app closed) writes a strummed G C D Em into that
+  journal. `--example mic_level [name]` checks an input without the UI.
+  Under PipeWire, the cards' raw ALSA devices may be busy or return junk;
+  "System input" goes through the sound server.
+
 ## Persistence
 
 Each project is `$XDG_DATA_HOME/compypal/projects/<stem>.json`, written on
@@ -285,7 +331,8 @@ creates projects; the agent has `list_projects` and `open_project`.
    insert / delete bars (`core::arrange`), section naming.
 4b. ~~Sketches~~ (done): raw playing split into ideas, one list, alternative
    lanes under music, picked per bar range in the roll, hiding and taking
-   out. Follow-ups: audio sketches (a guitar via the mic, transcribed to
-   notes).
+   out. ~~Audio sketches~~ (done): a mic or interface, journaled, read as
+   strums or Basic Pitch notes. Follow-ups: a monophonic pitch tracker for
+   voice without the model; picking the reading per sketch in the UI.
 5. **Own synth**: a wavetable/mod-matrix synth in the spirit of Vital, to sit
    alongside the SoundFont player.
