@@ -58,7 +58,7 @@ impl Engine {
             .name("compypal-audio".into())
             .spawn(move || {
                 let opened = (|| {
-                    let host = cpal::default_host();
+                    let host = output_host();
                     let device = host.default_output_device().ok_or(AudioError::NoDevice)?;
                     let supported = device.default_output_config().map_err(|e| AudioError::Device(e.to_string()))?;
                     let format = supported.sample_format();
@@ -180,6 +180,17 @@ impl Engine {
     pub fn status(&self) -> String {
         self.status.lock().unwrap().clone()
     }
+}
+
+/// Where sound goes out. On Linux that stays ALSA (through the sound
+/// server's ALSA plugin) even when input goes through PipeWire: the
+/// recording latency correction is measured against ALSA's timestamps.
+fn output_host() -> cpal::Host {
+    #[cfg(target_os = "linux")]
+    if let Ok(h) = cpal::host_from_id(cpal::HostId::Alsa) {
+        return h;
+    }
+    cpal::default_host()
 }
 
 fn build<T>(

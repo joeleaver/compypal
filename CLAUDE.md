@@ -269,8 +269,12 @@ mic hears the room.
 - No guitar needed: `cargo run -p compypal-audio --example fake_strums --
   <data dir>/compypal` (app closed) writes a strummed G C D Em into that
   journal. `--example mic_level [name]` checks an input without the UI.
-  Under PipeWire, the cards' raw ALSA devices may be busy or return junk;
-  "System input" goes through the sound server.
+- Input goes through PipeWire (cpal's `pipewire` feature, on by default in
+  compypal-audio; needs libpipewire-0.3 headers): it owns the cards, so
+  opening their raw ALSA devices fails as busy. Sources are listed by
+  their PipeWire names, "System input" is the default source. Output
+  stays on ALSA (`output_host`), whose timestamps the latency correction
+  was measured against. Without PipeWire it falls back to ALSA cards.
 
 ## Persistence
 

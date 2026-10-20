@@ -3,6 +3,12 @@ name = "compypal-audio"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Audio input through PipeWire, where the sound server owns the cards
+# (raw ALSA devices are busy). Needs libpipewire-0.3 headers to build.
+default = ["pipewire"]
+pipewire = ["cpal/pipewire"]
+
 [dependencies]
 compypal-core.workspace = true
 cpal = "0.18"

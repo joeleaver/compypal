@@ -19,34 +19,43 @@ pub struct InputDevice {
     pub name: String,
 }
 
-/// Devices to offer. On ALSA every card shows up under a dozen plugin
-/// names; one entry per card (its converting `plughw` device) plus the
-/// system default (which, under PipeWire or Pulse, is whatever the sound
-/// settings pick) is the useful list.
+/// Devices to offer. Through PipeWire (the usual sound server on Linux,
+/// which owns the cards, so they're shared), its sources by name, plus
+/// the system's default source. Plain ALSA lists every card under a dozen
+/// plugin names; there it's one entry per card (its converting `plughw`
+/// device) plus the default.
 pub fn devices() -> Vec<InputDevice> {
     let host = cpal::default_host();
     let Ok(all) = host.input_devices() else { return Vec::new() };
-    let alsa = host.id().name().eq_ignore_ascii_case("alsa");
+    let host_name = host.id().name().to_lowercase();
     let mut out: Vec<InputDevice> = Vec::new();
     for d in all {
         let Ok(id) = d.id().map(|i| i.to_string()) else { continue };
         let name = d.description().map(|x| x.name().to_string()).unwrap_or_else(|_| id.clone());
-        if alsa {
-            let raw = id.split_once(':').map_or(id.as_str(), |(_, r)| r);
-            if raw == "default" {
-                out.insert(0, InputDevice { id, name: "System input".into() });
-                continue;
+        let raw = id.split_once(':').map_or(id.as_str(), |(_, r)| r);
+        match host_name.as_str() {
+            "pipewire" => {
+                if raw == "input_default" {
+                    out.insert(0, InputDevice { id, name: "System input".into() });
+                } else if raw.starts_with("alsa_input") || !(raw.starts_with("alsa_output") || raw.contains("sink") || raw == "output_default") {
+                    out.push(InputDevice { id, name });
+                }
             }
-            // `plughw:CARD=Name,DEV=0`; numbered duplicates (CARD=1) and
-            // the other plugins are left out.
-            let Some(card) = raw.strip_prefix("plughw:CARD=") else { continue };
-            if card.chars().next().is_some_and(|c| c.is_ascii_digit()) || !card.ends_with(",DEV=0") {
-                continue;
+            "alsa" => {
+                if raw == "default" {
+                    out.insert(0, InputDevice { id, name: "System input".into() });
+                    continue;
+                }
+                // `plughw:CARD=Name,DEV=0`; numbered duplicates (CARD=1)
+                // and the other plugins are left out.
+                let Some(card) = raw.strip_prefix("plughw:CARD=") else { continue };
+                if card.chars().next().is_some_and(|c| c.is_ascii_digit()) || !card.ends_with(",DEV=0") {
+                    continue;
+                }
+                let name = name.split(',').next().unwrap_or(&name).trim().to_string();
+                out.push(InputDevice { id, name });
             }
-            let name = name.split(',').next().unwrap_or(&name).trim().to_string();
-            out.push(InputDevice { id, name });
-        } else {
-            out.push(InputDevice { id, name });
+            _ => out.push(InputDevice { id, name }),
         }
     }
     out
