@@ -88,11 +88,11 @@ impl App for StoreApp {
         Ok(())
     }
 
-    fn jams(&self) -> Vec<(compypal_core::jam::JamSummary, bool)> {
-        self.0.journal.map(|j| j.jams()).unwrap_or_default()
+    fn sketches(&self) -> Vec<(compypal_core::jam::Sketch, bool)> {
+        self.0.journal.map(|j| j.sketches()).unwrap_or_default()
     }
 
-    fn jam_events(&self, from: f64, to: f64) -> Vec<compypal_core::RawEvent> {
+    fn played_events(&self, from: f64, to: f64) -> Vec<compypal_core::RawEvent> {
         self.0.journal.map(|j| j.events(from, to)).unwrap_or_default()
     }
 

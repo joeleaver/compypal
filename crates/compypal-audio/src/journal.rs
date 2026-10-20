@@ -1,11 +1,13 @@
 //! The always-on journal: every MIDI message played while listening is
-//! appended to a file per day, and the stream is cut into jams at
-//! silences. Each finished jam's summary goes into an index, so finding
-//! "that thing I played this afternoon" never means reading everything.
+//! appended to a file per day, and the stream is cut into jams at long
+//! silences and each jam into sketches, one idea each. Each finished
+//! sketch's summary goes into an index, so finding "that thing I played
+//! this afternoon" never means reading everything.
 //!
 //! Layout under the data directory:
-//! `journal/YYYYMMDD.jsonl` (one [`RawEvent`] per line, unix-time `t`), and
-//! `journal/jams.jsonl` (one [`JamSummary`] per line).
+//! `journal/<day>.jsonl` (one [`RawEvent`] per line, unix-time `t`), and
+//! `journal/sketches.jsonl` (one [`Sketch`] per line). An older
+//! `jams.jsonl` (a summary per whole jam) is split into sketches once.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -15,7 +17,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use compypal_core::jam::{self, GAP_SECONDS, JamSummary};
+use compypal_core::jam::{self, GAP_SECONDS, Sketch};
 use compypal_core::{RawEvent, RawMsg};
 
 pub fn now() -> f64 {
@@ -35,7 +37,7 @@ fn day_file(dir: &Path, day: i64) -> PathBuf {
 struct State {
     /// Events of the jam in progress, if any.
     current: Vec<RawEvent>,
-    index: Vec<JamSummary>,
+    index: Vec<Sketch>,
 }
 
 pub struct Journal {
@@ -50,7 +52,7 @@ impl Journal {
     /// writer thread. Starts not listening.
     pub fn open(dir: PathBuf) -> std::io::Result<Arc<Self>> {
         std::fs::create_dir_all(&dir)?;
-        let index = read_lines::<JamSummary>(&dir.join("jams.jsonl"));
+        let index = load_index(&dir);
         let state = Arc::new(Mutex::new(State { current: Vec::new(), index }));
         let (tx, rx) = channel();
         let (dir2, state2) = (dir.clone(), state.clone());
@@ -73,19 +75,25 @@ impl Journal {
         }
     }
 
-    /// Finished jams, newest first, then the jam in progress (if it has
-    /// enough notes) at the front, with `live` set.
-    pub fn jams(&self) -> Vec<(JamSummary, bool)> {
+    /// Sketches, newest first. Those of the jam still going come first: all
+    /// but its last are over (a pause ended them); the last, if it has
+    /// enough notes, is `live`.
+    pub fn sketches(&self) -> Vec<(Sketch, bool)> {
         let st = self.state.lock().unwrap();
-        let mut out: Vec<(JamSummary, bool)> = st.index.iter().rev().cloned().map(|j| (j, false)).collect();
-        if let Some(live) = jam::summarize(&st.current) {
-            out.insert(0, (live, true));
+        let mut out: Vec<(Sketch, bool)> = Vec::new();
+        let parts = jam::split_sketches(&st.current);
+        for (i, (from, to)) in parts.iter().enumerate().rev() {
+            let slice: Vec<RawEvent> = st.current.iter().filter(|e| e.t >= *from && e.t <= *to).copied().collect();
+            if let Some(s) = jam::summarize(&slice) {
+                out.push((s, i + 1 == parts.len()));
+            }
         }
+        out.extend(st.index.iter().rev().cloned().map(|j| (j, false)));
         out
     }
 
-    pub fn jam(&self, id: u64) -> Option<(JamSummary, bool)> {
-        self.jams().into_iter().find(|(j, _)| j.id == id)
+    pub fn sketch(&self, id: u64) -> Option<(Sketch, bool)> {
+        self.sketches().into_iter().find(|(j, _)| j.id == id)
     }
 
     /// Every event logged between `from` and `to` (unix seconds).
@@ -118,6 +126,50 @@ impl Journal {
     }
 }
 
+/// The sketches in a finished jam.
+fn sketches_of(events: &[RawEvent]) -> Vec<Sketch> {
+    jam::split_sketches(events)
+        .into_iter()
+        .filter_map(|(from, to)| {
+            let slice: Vec<RawEvent> = events.iter().filter(|e| e.t >= from && e.t <= to).copied().collect();
+            jam::summarize(&slice)
+        })
+        .collect()
+}
+
+/// The sketch index; built once from an older index of whole jams.
+fn load_index(dir: &Path) -> Vec<Sketch> {
+    let path = dir.join("sketches.jsonl");
+    if path.exists() {
+        return read_lines(&path);
+    }
+    let jams = read_lines::<Sketch>(&dir.join("jams.jsonl"));
+    let mut out = Vec::new();
+    for j in jams {
+        let mut events = Vec::new();
+        for d in day(j.start)..=day(j.end) {
+            let Ok(f) = File::open(day_file(dir, d)) else { continue };
+            events.extend(
+                BufReader::new(f)
+                    .lines()
+                    .map_while(Result::ok)
+                    .filter_map(|l| serde_json::from_str::<RawEvent>(&l).ok())
+                    .filter(|e| e.t >= j.start && e.t <= j.end),
+            );
+        }
+        events.sort_by(|a, b| a.t.total_cmp(&b.t));
+        let parts = sketches_of(&events);
+        // A jam whose events are gone stays as it was.
+        if parts.is_empty() { out.push(j) } else { out.extend(parts) }
+    }
+    for s in &out {
+        if let Ok(line) = serde_json::to_string(s) {
+            let _ = append(&path, &line);
+        }
+    }
+    out
+}
+
 fn read_lines<T: serde::de::DeserializeOwned>(path: &Path) -> Vec<T> {
     let Ok(f) = File::open(path) else { return Vec::new() };
     BufReader::new(f).lines().map_while(Result::ok).filter_map(|l| serde_json::from_str(&l).ok()).collect()
@@ -147,10 +199,10 @@ fn writer(dir: PathBuf, rx: Receiver<RawEvent>, state: Arc<Mutex<State>>) {
         let idle = st.current.last().is_some_and(|last| now() - last.t > GAP_SECONDS);
         if idle {
             let events = std::mem::take(&mut st.current);
-            // Only notes make a jam; a pedal or a knob alone doesn't.
-            if let Some(summary) = jam::summarize(&events) {
+            // Only notes make a sketch; a pedal or a knob alone doesn't.
+            for summary in sketches_of(&events) {
                 if let Ok(line) = serde_json::to_string(&summary) {
-                    let _ = append(&dir.join("jams.jsonl"), &line);
+                    let _ = append(&dir.join("sketches.jsonl"), &line);
                 }
                 st.index.push(summary);
             }
@@ -178,10 +230,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         let back = j.events(t0 - 1.0, now() + 1.0);
         assert_eq!(back.len(), 16);
-        let jams = j.jams();
-        assert_eq!(jams.len(), 1);
-        assert!(jams[0].1, "still live: no gap has passed");
-        assert_eq!(jams[0].0.notes, 8);
+        let sketches = j.sketches();
+        assert_eq!(sketches.len(), 1);
+        assert!(sketches[0].1, "still live: no gap has passed");
+        assert_eq!(sketches[0].0.notes, 8);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

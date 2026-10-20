@@ -13,6 +13,8 @@ use rinch::prelude::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
+    /// Everything played, one idea at a time.
+    Sketches,
     /// One track's piano roll, with the chord lane.
     Edit,
     /// Every track across the song, with sections.
@@ -92,8 +94,18 @@ pub struct Store {
     pub journal: Option<&'static compypal_audio::journal::Journal>,
     /// Logging everything played, whatever else is going on.
     pub listening: Signal<bool>,
-    /// Recent jams for the sidebar, refreshed from the journal.
-    pub jams: Signal<Vec<JamRow>>,
+    /// Sketches from the journal, refreshed by a thread.
+    pub played: Signal<Vec<crate::sketches::Played>>,
+    /// The sketch shown in the Sketches view; `None` shows the newest.
+    pub sketch_sel: Signal<Option<crate::sketches::Source>>,
+    /// Where Add to song puts a sketch: a track, or `None` for a new one.
+    pub sketch_track: Signal<Option<Id>>,
+    /// Add at the cursor's bar rather than after the song.
+    pub sketch_at_cursor: Signal<bool>,
+    /// The track menu in the Sketches view is open.
+    pub sketch_menu: Signal<bool>,
+    /// The export menu is open.
+    pub export_menu: Signal<bool>,
     /// Notes selected in the piano roll, absolute, on the selected track.
     pub note_sel: Signal<Vec<Note>>,
     pub note_drag: Signal<Option<NoteDrag>>,
@@ -155,16 +167,6 @@ impl NoteDrag {
             })
             .collect()
     }
-}
-
-/// A jam as the sidebar lists it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct JamRow {
-    pub key: String,
-    pub id: u64,
-    pub when: String,
-    pub detail: String,
-    pub live: bool,
 }
 
 /// A take in progress.
@@ -261,7 +263,12 @@ impl Store {
             harmony,
             journal,
             listening: Signal::new(journal.is_some_and(|j| j.listening())),
-            jams: Signal::new(Vec::new()),
+            played: Signal::new(Vec::new()),
+            sketch_sel: Signal::new(None),
+            sketch_track: Signal::new(None),
+            sketch_at_cursor: Signal::new(false),
+            sketch_menu: Signal::new(false),
+            export_menu: Signal::new(false),
             note_sel: Signal::new(Vec::new()),
             note_drag: Signal::new(None),
             snap: Signal::new(PPQ as Tick / 4),
@@ -437,7 +444,7 @@ impl Store {
         self.listening.set(on);
         crate::autosave::update_settings(|s| s.listening = on);
         self.status.set(if on {
-            "Listening: everything you play is kept in the journal, and jams show up in the sidebar".into()
+            "Listening: everything you play is kept, split into sketches (the Sketches tab)".into()
         } else {
             "Stopped listening".into()
         });
@@ -802,7 +809,7 @@ impl Store {
                 p.tempo = compypal_core::TempoMap::constant(t.bpm.round());
             }
             let id = p.alloc_id();
-            let name = format!("Take {}", p.sessions.len() + 1);
+            let name = compypal_core::jam::summarize(&events).map_or_else(|| format!("Take {}", p.sessions.len() + 1), |s| compypal_core::jam::sketch_name(&s));
             let meter = p.meter_at(rec.start_tick);
             let mut session = compypal_core::jam::to_session(&events, 0.0, end, id, name.clone(), tempo.as_ref(), meter, rec.start_tick);
             session.recorded_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -814,7 +821,7 @@ impl Store {
                 None => format!("{name}: {notes} notes; no steady beat found, so it's laid down as played"),
             };
         });
-        self.status.set(format!("Recorded {summary}. Tidy it from the session list, or ask the agent."));
+        self.status.set(format!("Recorded {summary}. It's in Sketches too; tidy it there, or ask the agent."));
     }
 
     /// Ends the take: keeps it as a session and lays it down as a clip on
@@ -847,16 +854,33 @@ impl Store {
         let mut summary = String::new();
         self.edit("record", |p| {
             let id = p.alloc_id();
-            let name = format!("Take {}", p.sessions.len() + 1);
+            let name = compypal_core::jam::summarize(&events).map_or_else(|| format!("Take {}", p.sessions.len() + 1), |s| compypal_core::jam::sketch_name(&s));
             let session = rec.session(id, name.clone(), events);
             let notes = lay_take(p, rec.track, &session, rec.start_tick, &name);
             summary = format!("{name}: {notes} notes");
             p.sessions.push(session);
         });
         self.status.set(format!(
-            "Recorded {summary} (timed {:.0} ms after Rec, when the first click was heard). Tidy it from the session list, or ask the agent.",
+            "Recorded {summary} (timed {:.0} ms after Rec, when the first click was heard). It's in Sketches too; tidy it there, or ask the agent.",
             late * 1000.0
         ));
+    }
+
+    /// Lays one of the song's sessions down again as a clip: on `track` (or
+    /// a new one) at `bar`.
+    pub fn add_session(self, session: Id, track: Option<Id>, bar: u32) -> Result<String, String> {
+        let mut msg = Err("no such sketch".to_string());
+        self.edit("add sketch", |p| {
+            let Some(s) = p.session(session).cloned() else { return };
+            let start = text::bar_start(p, bar);
+            let name = s.name.clone();
+            let track = track.unwrap_or_else(|| p.add_track(name.clone(), 0));
+            let moved = Session { start_tick: start, ..s };
+            let notes = lay_take(p, track, &moved, start, &name);
+            let tname = p.track(track).map(|t| t.name.clone()).unwrap_or_default();
+            msg = Ok(format!("Added {name:?} to {tname}: {notes} notes from bar {bar}"));
+        });
+        msg
     }
 
     /// Re-derives every clip made from `session` with the default cleanup.

@@ -3,6 +3,7 @@
 mod agent;
 mod autosave;
 mod chat;
+mod sketches;
 mod store;
 
 use std::rc::Rc;
@@ -10,6 +11,7 @@ use std::rc::Rc;
 use compypal_core::cleanup::grid_ticks;
 use compypal_core::{Id, Project, gm};
 use chat::AgentPanel;
+use sketches::SketchesView;
 use rinch::prelude::*;
 use store::{ARR_ROW, ROW, Slot, Store, View};
 
@@ -29,13 +31,6 @@ struct TrackRow {
     channel: u8,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct SessionRow {
-    id: Id,
-    name: String,
-    detail: String,
-}
-
 fn track_rows(p: &Project) -> Vec<TrackRow> {
     p.tracks
         .iter()
@@ -49,20 +44,6 @@ fn track_rows(p: &Project) -> Vec<TrackRow> {
                 instrument,
                 notes,
                 channel: t.channel + 1,
-            }
-        })
-        .collect()
-}
-
-fn session_rows(p: &Project) -> Vec<SessionRow> {
-    p.sessions
-        .iter()
-        .map(|s| {
-            let tempo = s.click_bpm.map_or("free time".to_string(), |b| format!("{b:.0} BPM"));
-            SessionRow {
-                id: s.id,
-                name: s.name.clone(),
-                detail: format!("{} notes · {:.1}s · {tempo}", s.notes().len(), s.duration()),
             }
         })
         .collect()
@@ -104,6 +85,11 @@ fn Transport() -> NodeHandle {
                 }
             }
             div { class: "view-switch",
+                Button { size: "xs",
+                    variant: {|| if store.view.get() == View::Sketches { "filled" } else { "default" }},
+                    onclick: move || store.view.set(View::Sketches),
+                    "Sketches"
+                }
                 Button { size: "xs",
                     variant: {|| if store.view.get() == View::Arrange { "filled" } else { "default" }},
                     onclick: move || store.view.set(View::Arrange),
@@ -157,14 +143,15 @@ fn Transport() -> NodeHandle {
             }
             Button { size: "xs",
                 color: "teal",
-                variant: {|| if store.listening.get() { "filled" } else { "default" }},
+                // Filled while something is being played, light while waiting.
+                variant: {|| match (store.listening.get(), store.played.with(|j| j.first().is_some_and(|r| r.live))) {
+                    (true, true) => "filled",
+                    (true, false) => "light",
+                    _ => "default",
+                }},
                 disabled: store.journal.is_none(),
                 onclick: move || store.toggle_listening(),
-                {|| match (store.listening.get(), store.jams.with(|j| j.first().is_some_and(|r| r.live))) {
-                    (true, true) => "◉ Listening (jam!)",
-                    (true, false) => "◉ Listening",
-                    _ => "○ Listen",
-                }}
+                {|| if store.listening.get() { "◉ Listening" } else { "○ Listen" }}
             }
             span { class: "readout position",
                 {|| {
@@ -187,9 +174,12 @@ fn Transport() -> NodeHandle {
                 "Redo"
             }
             div { class: "divider" }
-            span { class: "toolbar-label", "Export" }
-            Button { size: "xs", variant: "default", onclick: move || { let _ = store.export_midi(); }, "MIDI" }
-            Button { size: "xs", variant: "default", onclick: move || { let _ = store.export_abc(); }, "ABC" }
+            div { class: "agent-pick-anchor",
+                Button { size: "xs", variant: "default", onclick: move || store.export_menu.update(|o| *o = !*o), "Export ▾" }
+                if store.export_menu.get() {
+                    ExportMenu {}
+                }
+            }
             div { class: "divider" }
             Button { size: "xs",
                 variant: {|| if store.chat_open.get() { "filled" } else { "light" }},
@@ -199,6 +189,46 @@ fn Transport() -> NodeHandle {
             }
         }
     }
+}
+
+/// Where the song can go: a MIDI file or ABC notation.
+#[component]
+fn ExportMenu() -> NodeHandle {
+    let store = use_store::<Store>();
+    let root = rsx! {
+        div { class: "agent-menu export-menu",
+            div { class: "agent-row",
+                onclick: move || {
+                    store.export_menu.set(false);
+                    let _ = store.export_midi();
+                },
+                div { class: "track-name", "MIDI file" }
+                div { class: "track-detail", "For a DAW or notation program" }
+            }
+            div { class: "agent-row",
+                onclick: move || {
+                    store.export_menu.set(false);
+                    let _ = store.export_abc();
+                },
+                div { class: "track-name", "ABC notation" }
+                div { class: "track-detail", "Text sheet music" }
+            }
+        }
+    };
+    overlay_dismiss::arm_keys_while_open(
+        __scope,
+        &root,
+        Rc::new(|| true),
+        Rc::new(move |k: &rinch::core::KeyEventData| {
+            if k.key == "Escape" {
+                store.export_menu.set(false);
+                return true;
+            }
+            false
+        }),
+        Rc::new(move || store.export_menu.set(false)),
+    );
+    root
 }
 
 #[component]
@@ -239,52 +269,6 @@ fn Sidebar() -> NodeHandle {
                     if store.instrument_edit.get() == Some(t.id) {
                         InstrumentPicker {}
                     }
-                }
-            }
-            div { class: "sidebar-heading", "Sessions" }
-            for s in store.project.with(session_rows) {
-                div { key: s.id.0, class: "session-row",
-                    div { class: "session-head",
-                        div { class: "track-name", {s.name.clone()} }
-                        Button { size: "xs", variant: "subtle",
-                            onclick: {
-                                let id = s.id;
-                                move || store.tidy_session(id)
-                            },
-                            "Tidy"
-                        }
-                    }
-                    div { class: "track-detail", {s.detail.clone()} }
-                }
-            }
-            if store.project.with(|p| p.sessions.is_empty()) {
-                div { class: "empty", "No recordings yet" }
-            }
-            if store.listening.get() || store.jams.with(|j| !j.is_empty()) {
-                div { class: "sidebar-heading", "Jams" }
-            }
-            for jam in store.jams.get() {
-                div { key: jam.key.clone(), class: {if jam.live { "jam-row live" } else { "jam-row" }},
-                    div { class: "session-head",
-                        div { class: "track-name", {jam.when.clone()} }
-                        div { class: "jam-actions",
-                            Button { size: "xs", variant: "subtle",
-                                onclick: move || {
-                                    let r = agent::run_tool(store, "audition_jam", serde_json::json!({"jam": jam.id}));
-                                    store.status.set(r.unwrap_or_else(|e| e));
-                                },
-                                "▶"
-                            }
-                            Button { size: "xs", variant: "subtle",
-                                onclick: move || {
-                                    let r = agent::run_tool(store, "keep_jam", serde_json::json!({"jam": jam.id}));
-                                    store.status.set(r.unwrap_or_else(|e| e));
-                                },
-                                "Keep"
-                            }
-                        }
-                    }
-                    div { class: "track-detail", {jam.detail.clone()} }
                 }
             }
             div { class: "sidebar-heading", "MIDI input" }
@@ -1149,35 +1133,28 @@ fn app() -> NodeHandle {
     store.select_track(store.selected_track.get().unwrap_or_default());
     agent::start(store);
 
-    // Keep the sidebar's jam list fresh: a jam appears while it's played and
-    // settles once the silence after it is long enough.
+    // Keep the sketch list fresh: a sketch appears while it's played and
+    // settles once a pause ends it. Thumbnails are drawn once per sketch.
     if let Some(j) = journal {
-        let (j, jams) = (j.clone(), store.jams);
+        let (j, played) = (j.clone(), store.played);
         std::thread::spawn(move || {
-            let mut last: Vec<store::JamRow> = Vec::new();
+            let mut last: Vec<sketches::Played> = Vec::new();
+            let mut thumbs: std::collections::HashMap<(u64, usize), Vec<(f32, f32)>> = std::collections::HashMap::new();
             loop {
-                let now = compypal_audio::journal::now();
-                let rows: Vec<store::JamRow> = j
-                    .jams()
+                let rows: Vec<sketches::Played> = j
+                    .sketches()
                     .into_iter()
-                    .take(8)
-                    .map(|(s, live)| {
-                        let when = if live { "● now".to_string() } else { compypal_mcp::tools::when(s.start, now) };
-                        let tempo = match s.tempo {
-                            Some(t) if t.confidence >= 0.35 => format!(" · ~{:.0} BPM", t.bpm),
-                            _ => String::new(),
-                        };
-                        let detail = format!(
-                            "{} · {} notes{tempo}{}",
-                            compypal_mcp::tools::mmss(s.duration()),
-                            s.notes,
-                            s.key.as_deref().map(|k| format!(" · {k}")).unwrap_or_default()
-                        );
-                        store::JamRow { key: format!("{}:{when}:{detail}", s.id), id: s.id, when, detail, live }
+                    .take(60)
+                    .map(|(sketch, live)| {
+                        let thumb = thumbs
+                            .entry((sketch.id, sketch.notes))
+                            .or_insert_with(|| sketches::thumb(&j.events(sketch.start - 0.01, sketch.end + 0.01)))
+                            .clone();
+                        sketches::Played { sketch, live, thumb }
                     })
                     .collect();
                 if rows != last {
-                    jams.send(rows.clone());
+                    played.send(rows.clone());
                     last = rows;
                 }
                 std::thread::sleep(std::time::Duration::from_secs(2));
@@ -1282,8 +1259,12 @@ fn app() -> NodeHandle {
             style { {CSS} }
             Transport {}
             div { class: "main",
-                Sidebar {}
+                // Sketches have their own list; the tracks are for the song.
+                if store.view.get() != View::Sketches {
+                    Sidebar {}
+                }
                 match store.view.get() {
+                    View::Sketches => SketchesView {},
                     View::Edit => PianoRoll {},
                     View::Arrange => Arranger {},
                 }
