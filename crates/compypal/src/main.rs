@@ -2,12 +2,14 @@
 
 mod agent;
 mod autosave;
+mod chat;
 mod store;
 
 use std::rc::Rc;
 
 use compypal_core::cleanup::grid_ticks;
 use compypal_core::{Id, Project, gm};
+use chat::AgentPanel;
 use rinch::prelude::*;
 use store::{ARR_ROW, ROW, Slot, Store, View};
 
@@ -175,8 +177,15 @@ fn Transport() -> NodeHandle {
                 "Redo"
             }
             div { class: "divider" }
-            Button { size: "xs", variant: "light", onclick: move || { let _ = store.export_midi(); }, "Export MIDI" }
-            Button { size: "xs", variant: "light", onclick: move || { let _ = store.export_abc(); }, "Export ABC" }
+            Button { size: "xs", variant: "default", onclick: move || { let _ = store.export_midi(); }, "Export MIDI" }
+            Button { size: "xs", variant: "default", onclick: move || { let _ = store.export_abc(); }, "Export ABC" }
+            div { class: "divider" }
+            Button { size: "xs",
+                variant: {|| if store.chat_open.get() { "filled" } else { "light" }},
+                onclick: move || chat::toggle(store),
+                span { class: {|| chat::dot_class(store)} }
+                "Agent"
+            }
         }
     }
 }
@@ -1190,6 +1199,16 @@ fn app() -> NodeHandle {
 
     // Space plays and stops, unless someone is typing.
     rinch::core::set_keyboard_interceptor(move |k| {
+        // Ctrl+L opens the agent panel from anywhere, and closes it.
+        if k.is_down() && (k.ctrl || k.meta) && k.key.eq_ignore_ascii_case("l") {
+            chat::toggle(store);
+            return true;
+        }
+        // Escape stops the agent wherever the focus is.
+        if k.is_down() && k.key == "Escape" && store.chat.with(|c| c.busy()) {
+            chat::stop(store);
+            return true;
+        }
         if k.is_down()
             && !store.is_typing()
             && store.view.get() == View::Edit
@@ -1217,6 +1236,9 @@ fn app() -> NodeHandle {
                     View::Edit => PianoRoll {},
                     View::Arrange => Arranger {},
                 }
+                if store.chat_open.get() {
+                    AgentPanel {}
+                }
             }
             div { class: "statusbar",
                 span { {|| store.status.get()} }
@@ -1232,6 +1254,17 @@ fn app() -> NodeHandle {
 }
 
 fn main() {
+    // `compypal --mcp-stdio <url>`: the tools over stdio, for agents that
+    // can't reach them over HTTP. The agent panel starts this itself.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--mcp-stdio") {
+        let url = args.get(2).cloned().unwrap_or_else(|| format!("http://127.0.0.1:{}/mcp", compypal_mcp::http::DEFAULT_PORT));
+        if let Err(e) = compypal_mcp::agent::bridge::run(&url) {
+            eprintln!("compypal --mcp-stdio: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     App::new(app)
         .title("compypal")
         .size(1280, 800)

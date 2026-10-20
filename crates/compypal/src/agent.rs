@@ -17,6 +17,13 @@ use crate::store::Store;
 /// The IDE link, kept so its lockfile can be withdrawn at exit.
 static IDE: std::sync::OnceLock<&'static Ide> = std::sync::OnceLock::new();
 
+/// The port the MCP tools are served on.
+static MCP_PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+
+pub fn mcp_port() -> u16 {
+    MCP_PORT.get().copied().unwrap_or(compypal_mcp::http::DEFAULT_PORT)
+}
+
 /// Withdraws the IDE lockfile. Call when the app is closing.
 pub fn shutdown() {
     if let Some(ide) = IDE.get() {
@@ -43,7 +50,7 @@ impl App for StoreApp {
         let mut next = self.0.project.get();
         f(&mut next)?;
         self.0.edit(&format!("agent: {label}"), |p| *p = next);
-        self.0.status.set(format!("Claude: {label}"));
+        self.0.status.set(format!("Agent: {label}"));
         Ok(())
     }
 
@@ -152,9 +159,10 @@ pub fn run_tool(store: Store, name: &str, args: Value) -> Result<String, String>
 
 pub fn status_text(agents: usize) -> String {
     match agents {
-        0 => "Claude: not attached (run claude here, then /ide)".into(),
-        1 => "Claude attached".into(),
-        n => format!("{n} Claude sessions attached"),
+        // The panel is the usual way in; a terminal session is extra.
+        0 => String::new(),
+        1 => "A Claude Code terminal is attached".into(),
+        n => format!("{n} Claude Code terminals attached"),
     }
 }
 
@@ -168,6 +176,7 @@ pub fn start(store: Store) {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(compypal_mcp::http::DEFAULT_PORT);
+    let _ = MCP_PORT.set(port);
     match compypal_mcp::http::serve(port, dispatch.clone()) {
         Ok(()) => eprintln!("MCP tools: http://127.0.0.1:{port}/mcp"),
         Err(e) => eprintln!("MCP tools unavailable: {e}"),

@@ -4,6 +4,7 @@
 // The tool list is one large json! literal.
 #![recursion_limit = "512"]
 
+pub mod agent;
 pub mod http;
 pub mod ide;
 pub mod protocol;

@@ -11,7 +11,7 @@ with a built-in synth; export MIDI and ABC.
 |---|---|
 | `compypal-core` | Project model (ticks, `PPQ = 960`), raw `Session`s (seconds), cleanup ops, snapshot undo, GM names, `theory` (chords, Roman numerals, keys), `figure` (musical units), demo project. No I/O, no UI. |
 | `compypal-io` | SMF import/export (`midly`), ABC export. |
-| `compypal-mcp` | The agent interface: MCP tools over an `App` trait (`tools.rs`, testable on `MemoryApp`), JSON-RPC handling, an HTTP server for tools and the Claude Code IDE WebSocket link. |
+| `compypal-mcp` | The agent interface: MCP tools over an `App` trait (`tools.rs`, testable on `MemoryApp`), JSON-RPC handling, an HTTP server for tools, the Claude Code IDE WebSocket link, and `agent` (running coding agents: ACP and Claude Code backends, the panel's conversation model). |
 | `compypal-audio` | `Engine` (cpal output on its own thread), `Synth` trait with SoundFont (`rustysynth`) and built-in fallback, pure `schedule::build` from a project, realtime `Player`. |
 | `compypal` | The rinch desktop app. `store.rs` is all app state; every project edit goes through `Store::edit` so UI and agent share undo. |
 
@@ -100,28 +100,55 @@ It has a chord and a shape (block, arpeggio, run, melody, note, mixed).
 
 ## Agent (MCP)
 
-Two links, because Claude Code hides an IDE connection's tools from the
-model (only `mcp__ide__executeCode`/`getDiagnostics` get through; checked
-in the 2.1.x binary):
+The agent is any coding agent; compypal is its editor. Everything it does to
+the song goes through MCP tools, whichever way it's connected:
 
 - **Tools**: MCP over HTTP at `127.0.0.1:7766/mcp` (`COMPYPAL_MCP_PORT`),
   registered for this repo by `.mcp.json`. Requests must have a local
   Host/Origin and a JSON content type (blocks DNS rebinding and CSRF from
-  web pages).
-- **IDE link**: a WebSocket MCP server on a random port, advertised by
-  `~/.claude/ide/<port>.lock` (`pid`, `workspaceFolders` = compypal's cwd,
-  `ideName`, `transport: "ws"`, `authToken`, checked against the
-  `X-Claude-Code-Ide-Authorization` header). `claude` started inside that
-  folder offers it under `/ide`. It carries `selection_changed`
-  notifications: clicking a figure or a track tells the agent what you mean
-  by "this". The lockfile is removed on exit, and stale ones are swept at
-  startup.
+  web pages). `compypal --mcp-stdio <url>` serves the same tools over stdio
+  (`agent::bridge`), for agents that only start MCP servers as processes.
+- **Agent panel** (Ctrl+L, `chat.rs`): the app runs the agent as a
+  subprocess, the way an editor hosts one. `compypal_mcp::agent` has the
+  conversation model (`Event` → `Chat`, no I/O, tested) and two backends
+  behind `Backend`: `acp` (the Agent Client Protocol: JSON-RPC over stdio;
+  Gemini CLI, Qwen Code, opencode, goose, adapters for Codex and Claude
+  Code) and `claude` (Claude Code's own `stream-json` protocol, so it needs
+  no adapter). The agent gets compypal's MCP server and nothing else from
+  us (no fs/terminal capabilities); each message carries a `<selection>`
+  block (in full when it changed, else just its name). The UI says
+  "Agent", never a product name.
+- **Permissions**: compypal's own tools never ask: they only do what the
+  user could do in the editor, and every one undoes (`--allowedTools
+  mcp__compypal` for Claude Code; `agent::is_ours` auto-answers ACP
+  requests). Everything else (shell, files, web) shows a card.
+- **Picking the agent**: `COMPYPAL_AGENT` (an id like `gemini`, or any ACP
+  command line) wins, then the one picked in the panel (`settings.json`
+  `agent`), then the first known agent on PATH (`agent::installed`).
+  `COMPYPAL_AGENT_MODEL` passes a model to Claude Code. Agents run in their
+  own process group, killed with the session, so no helper outlives it.
+- **Debugging an agent**: `COMPYPAL_AGENT_LOG=<file>` appends every ACP
+  message both ways. `cargo build -p compypal-mcp --example fake_agent`,
+  then `COMPYPAL_AGENT=$PWD/target/debug/examples/fake_agent` runs a
+  scripted agent (no model): it reads the harmony, sets the tempo if asked
+  ("tempo"), and asks to run a command ("shell"). `FAKE_AGENT_NO_HTTP=1`
+  makes it take the stdio bridge.
+- **IDE link** (for `claude` in a terminal): a WebSocket MCP server on a
+  random port, advertised by `~/.claude/ide/<port>.lock` (`pid`,
+  `workspaceFolders` = compypal's cwd, `ideName`, `transport: "ws"`,
+  `authToken`, checked against the `X-Claude-Code-Ide-Authorization`
+  header). `claude` started inside that folder offers it under `/ide`. It
+  carries `selection_changed` notifications only: Claude Code hides an IDE
+  connection's tools from the model (only
+  `mcp__ide__executeCode`/`getDiagnostics` get through; checked in the
+  2.1.x binary), so tools always come over HTTP. The lockfile is removed
+  on exit, and stale ones are swept at startup.
 - Tool calls run on the UI thread (`run_on_main_thread` + a thread-local
   store) through the same `Store::edit` as the UI, so agent edits are
   undoable and show up live, labelled "agent: ...".
 - A selection is a track, a figure, or bars across all tracks (maybe a
   named section). Tools that take bars also take `section: "Chorus"` or
-  `selection: true`; `get_selection` and the `/ide` push share
+  `selection: true`; `get_selection`, the panel and the `/ide` push share
   `tools::selection_text`.
 - Add tools in `compypal-mcp/src/tools.rs`: schema in `list()`, a match arm
   in `call()`, a test against `MemoryApp`. Keep answers short, positional
@@ -187,10 +214,11 @@ creates projects; the agent has `list_projects` and `open_project`.
 - `autofocus` only works inside Modal/Popover.
 - Inline `<span>`s get no layout box, so they can't be clicked: make
   clickable spans `inline-block`.
-- There are no focus/blur events on raw inputs. Every text field lives in a
-  popover, and `Store::is_typing` (any popover open) keeps shortcuts such
-  as Space out of the way. Elsewhere, build the input as
-  its own node and call `.focus()` on it.
+- There are no focus/blur events on raw inputs. Text fields live in
+  popovers, and `Store::is_typing` (any popover open) keeps shortcuts such
+  as Space out of the way. The agent panel's box is always there, so it
+  asks `NodeHandle::active_element()` instead (`chat::composer_focused`).
+  Build the input as its own node and call `.focus()` on it.
 - Keyboard handling for a popup: `overlay_dismiss::arm_keys_while_open`
   (it gets keys only while focus is inside the owner).
 
@@ -198,8 +226,9 @@ creates projects; the agent has `list_projects` and `open_project`.
 
 1. ~~Audio~~ (done). Follow-ups: playhead auto-scroll, a loop range.
 2. ~~Recording~~ (done). Follow-ups listed under Recording.
-3. ~~Agent / music IDE~~ (done). Follow-ups: note-level selection in the
-   piano roll, an in-app terminal running `claude`, MCP resources for ABC.
+3. ~~Agent / music IDE~~ (done), with an in-app agent panel for any ACP
+   agent or Claude Code. Follow-ups: MCP resources for ABC, `session/load`
+   to resume an ACP conversation, rendering replies as Markdown.
 4. ~~Arranger view~~ (done): sections, clip rows, bar selection, duplicate /
    insert / delete bars (`core::arrange`), section naming.
 5. **Own synth**: a wavetable/mod-matrix synth in the spirit of Vital, to sit

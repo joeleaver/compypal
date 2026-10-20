@@ -104,6 +104,15 @@ pub struct Store {
     pub projects_open: Signal<bool>,
     pub project_list: Signal<Vec<crate::autosave::ProjectInfo>>,
     pub rename_draft: Signal<String>,
+    /// The agent panel's conversation.
+    pub chat: Signal<compypal_mcp::agent::Chat>,
+    pub chat_open: Signal<bool>,
+    /// What's typed in the agent panel's message box.
+    pub chat_draft: Signal<String>,
+    /// The agent picked in the panel, by id (see `agent::AgentSpec`).
+    pub agent_id: Signal<Option<String>>,
+    /// The agent picker is open.
+    pub agent_menu: Signal<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -253,6 +262,11 @@ impl Store {
             projects_open: Signal::new(false),
             project_list: Signal::new(Vec::new()),
             rename_draft: Signal::new(String::new()),
+            chat: Signal::new(Default::default()),
+            chat_open: Signal::new(false),
+            chat_draft: Signal::new(String::new()),
+            agent_id: Signal::new(crate::autosave::load_settings().agent),
+            agent_menu: Signal::new(false),
         }
     }
 
@@ -428,6 +442,7 @@ impl Store {
             || self.instrument_edit.get().is_some()
             || self.section_edit.get()
             || self.projects_open.get()
+            || crate::chat::composer_focused()
     }
 
     // --- arranging ----------------------------------------------------------

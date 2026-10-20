@@ -168,6 +168,10 @@ pub struct Settings {
     /// The project that was open, by file stem.
     #[serde(default)]
     pub current: Option<String>,
+    /// The agent the panel runs, by id: `claude`, `gemini`, … or
+    /// `custom:<command>`.
+    #[serde(default)]
+    pub agent: Option<String>,
 }
 
 fn settings_path() -> Option<PathBuf> {
