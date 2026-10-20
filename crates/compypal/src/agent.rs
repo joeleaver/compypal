@@ -93,8 +93,15 @@ impl App for StoreApp {
         self.0.journal.map(|j| j.sketches().into_iter().filter(|(s, _)| !j.is_hidden(s.id)).collect()).unwrap_or_default()
     }
 
-    fn played_events(&self, from: f64, to: f64) -> Vec<compypal_core::RawEvent> {
-        self.0.journal.map(|j| j.events(from, to)).unwrap_or_default()
+    fn sketch_events(&self, sketch: &compypal_core::jam::Sketch, from: f64, to: f64) -> Vec<compypal_core::RawEvent> {
+        self.0.journal.map(|j| j.sketch_events(sketch, from, to)).unwrap_or_default()
+    }
+
+    fn play_audio(&mut self, audio: compypal_core::AudioRef, from: f64, to: f64) -> Result<(), String> {
+        let engine = self.0.engine.ok_or("no audio output")?;
+        let samples = self.0.journal.and_then(|j| j.sketch_audio(audio, from, to)).ok_or("the recording isn't there")?;
+        engine.play_clip(samples, compypal_audio::analysis::RATE);
+        Ok(())
     }
 
     fn play_raw(&mut self, events: &[compypal_core::RawEvent]) -> Result<(), String> {

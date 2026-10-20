@@ -287,6 +287,26 @@ fn Sidebar() -> NodeHandle {
                     {short_port_name(&port.name)}
                 }
             }
+            div { class: "sidebar-heading", "Audio input" }
+            for (i, name) in store.audio_devices.get().into_iter().map(|d| d.name).enumerate() {
+                div {
+                    key: i,
+                    class: move || if store.audio_device_index() == Some(i) { "port-row selected" } else { "port-row" },
+                    onclick: move || store.toggle_audio_in(i),
+                    {name}
+                }
+            }
+            if store.audio_device.get().is_some() {
+                div { class: "level-meter",
+                    div { class: "level-fill",
+                        style: {|| {
+                            // -60 dB to 0 dB across the meter.
+                            let db = 20.0 * (store.audio_level.get() + 1e-6).log10();
+                            format!("width: {:.0}%;", ((db + 60.0) / 60.0 * 100.0).clamp(0.0, 100.0))
+                        }}
+                    }
+                }
+            }
         }
     }
 }
@@ -1167,8 +1187,40 @@ fn app() -> NodeHandle {
         },
         None => eprintln!("MIDI input: none found"),
     }
+    // A microphone or interface, for instruments without MIDI. Off until
+    // one is picked (or named in COMPYPAL_AUDIO_IN): a mic hears the room.
+    let audio_in: &'static compypal_audio::mic::AudioIn = Box::leak(Box::new(compypal_audio::mic::AudioIn::new(journal.cloned())));
     let (project, stem) = autosave::open_initial();
-    let store = create_store(Store::new(project, engine, Some(midi), journal.map(|j| &**j), stem));
+    let store = create_store(Store::new(project, engine, Some(midi), journal.map(|j| &**j), Some(audio_in), stem));
+    {
+        let (devices, device) = (store.audio_devices, store.audio_device);
+        std::thread::spawn(move || {
+            devices.send(compypal_audio::mic::devices());
+            if let Some(id) = compypal_audio::mic::default_device(autosave::load_settings().audio_in.as_deref()) {
+                match audio_in.connect(&id) {
+                    Ok(()) => {
+                        eprintln!("audio input: {id}");
+                        device.send(Some(id));
+                    }
+                    Err(e) => eprintln!("audio input: {e}"),
+                }
+            }
+        });
+        // The level meter: a few readings a second is plenty.
+        let level = store.audio_level;
+        std::thread::spawn(move || {
+            let mut shown = 0.0f32;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                // Falls back slowly, like a meter.
+                let now = audio_in.level().max(shown * 0.7);
+                if (now - shown).abs() > 0.002 {
+                    level.send(now);
+                }
+                shown = now;
+            }
+        });
+    }
     store.select_track(store.selected_track.get().unwrap_or_default());
     agent::start(store);
 
@@ -1187,7 +1239,7 @@ fn app() -> NodeHandle {
                     .map(|(sketch, live)| {
                         let thumb = thumbs
                             .entry((sketch.id, sketch.notes))
-                            .or_insert_with(|| sketches::thumb(&j.events(sketch.start - 0.01, sketch.end + 0.01)))
+                            .or_insert_with(|| sketches::thumb(&j.sketch_events(&sketch, sketch.start - 0.01, sketch.end + 0.01)))
                             .clone();
                         let hidden = j.is_hidden(sketch.id);
                         sketches::Played { sketch, live, hidden, thumb }

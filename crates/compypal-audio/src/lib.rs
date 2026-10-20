@@ -40,6 +40,9 @@ pub struct Engine {
     sample_rate: u32,
     /// What the engine is playing through, and how loading went.
     status: Arc<Mutex<String>>,
+    /// The recordings last sent to play, held here so the audio thread
+    /// never frees them.
+    clips: Mutex<Vec<Arc<Vec<f32>>>>,
 }
 
 impl Engine {
@@ -108,7 +111,7 @@ impl Engine {
             *sf_status.lock().unwrap() = msg;
         });
 
-        Ok(Self { tx: Mutex::new(tx), shared, sample_rate, status })
+        Ok(Self { tx: Mutex::new(tx), shared, sample_rate, status, clips: Mutex::new(Vec::new()) })
     }
 
     fn send(&self, cmd: Cmd) {
@@ -135,6 +138,20 @@ impl Engine {
 
     pub fn audition(&self, schedule: Schedule) {
         self.send(Cmd::Audition(Arc::new(schedule)));
+    }
+
+    /// Plays a recording (mono samples at `rate`) as it is.
+    pub fn play_clip(&self, samples: Vec<f32>, rate: u32) {
+        let clip = Arc::new(samples);
+        {
+            let mut held = self.clips.lock().unwrap();
+            held.push(clip.clone());
+            // The one playing and the one before it are enough.
+            if held.len() > 2 {
+                held.remove(0);
+            }
+        }
+        self.send(Cmd::Clip(clip, rate));
     }
 
     pub fn midi(&self, msg: [u8; 3]) {

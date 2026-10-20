@@ -92,6 +92,14 @@ pub struct Store {
     /// The song's chords, from all pitched tracks together.
     pub harmony: Memo<Vec<Figure>>,
     pub journal: Option<&'static compypal_audio::journal::Journal>,
+    /// A microphone or interface, for instruments without MIDI.
+    pub audio_in: Option<&'static compypal_audio::mic::AudioIn>,
+    /// Audio inputs to offer (listing them is slow, so once).
+    pub audio_devices: Signal<Vec<compypal_audio::mic::InputDevice>>,
+    /// The audio input in use, by device id.
+    pub audio_device: Signal<Option<String>>,
+    /// Its level, 0..1, polled.
+    pub audio_level: Signal<f32>,
     /// Logging everything played, whatever else is going on.
     pub listening: Signal<bool>,
     /// Sketches from the journal, refreshed by a thread.
@@ -212,6 +220,7 @@ impl Store {
         engine: Option<&'static Engine>,
         midi: Option<&'static MidiIn>,
         journal: Option<&'static compypal_audio::journal::Journal>,
+        audio_in: Option<&'static compypal_audio::mic::AudioIn>,
         project_file: String,
     ) -> Self {
         let first = project.tracks.first().map(|t| t.id);
@@ -264,6 +273,10 @@ impl Store {
             stacked: Signal::new(false),
             harmony,
             journal,
+            audio_in,
+            audio_devices: Signal::new(Vec::new()),
+            audio_device: Signal::new(audio_in.and_then(|a| a.connected())),
+            audio_level: Signal::new(0.0),
             listening: Signal::new(journal.is_some_and(|j| j.listening())),
             played: Signal::new(Vec::new()),
             sketch_sel: Signal::new(None),
@@ -731,6 +744,39 @@ impl Store {
             self.connect_midi("");
         } else if let Some(name) = compypal_audio::input::ports().get(index) {
             self.connect_midi(name);
+        }
+    }
+
+    /// Which of `audio_devices` is in use.
+    pub fn audio_device_index(self) -> Option<usize> {
+        let current = self.audio_device.get()?;
+        self.audio_devices.with(|d| d.iter().position(|d| d.id == current))
+    }
+
+    /// Starts hearing audio input `index` (of `audio_devices`), or stops if
+    /// it's the one in use; remembered for next time.
+    pub fn toggle_audio_in(self, index: usize) {
+        let Some(a) = self.audio_in else { return };
+        let Some((id, name)) = self.audio_devices.with(|d| d.get(index).map(|d| (d.id.clone(), d.name.clone()))) else { return };
+        let id = id.as_str();
+        if self.audio_device.get().as_deref() == Some(id) {
+            a.disconnect();
+            self.audio_device.set(None);
+            crate::autosave::update_settings(|s| s.audio_in = None);
+            self.status.set("Audio input off".into());
+            return;
+        }
+        match a.connect(id) {
+            Ok(()) => {
+                self.audio_device.set(Some(id.to_string()));
+                crate::autosave::update_settings(|s| s.audio_in = Some(id.to_string()));
+                self.status.set(if self.listening.get() {
+                    format!("Hearing {name}: what you play is kept as sketches")
+                } else {
+                    format!("Hearing {name}. Turn on Listen to keep what you play as sketches")
+                });
+            }
+            Err(e) => self.status.set(format!("Couldn't open that input: {e}")),
         }
     }
 

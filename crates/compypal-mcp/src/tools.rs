@@ -10,7 +10,7 @@ use compypal_core::figure::{self, FigureSettings};
 use compypal_core::text::{self, bar_of, bar_start, format_notes, format_position};
 use compypal_core::theory::{self, Chord, Spelling};
 use compypal_core::jam::{self, Sketch, TempoGuess};
-use compypal_core::{Id, KeySignature, MeterChange, Note, PPQ, Project, RawEvent, Session, Tick, gm};
+use compypal_core::{AudioRef, Id, KeySignature, MeterChange, Note, PPQ, Project, RawEvent, Session, Tick, gm};
 use serde_json::{Value, json};
 
 /// What the user is pointing at in the UI: a track, a figure on a track,
@@ -66,10 +66,13 @@ pub trait App {
     /// Jams from the always-on journal, newest first; `true` marks the one
     /// still being played.
     fn sketches(&self) -> Vec<(Sketch, bool)>;
-    /// Journal events between two unix times.
-    fn played_events(&self, from: f64, to: f64) -> Vec<RawEvent>;
+    /// A sketch's events between two unix times: the notes played, or the
+    /// transcription of what was heard.
+    fn sketch_events(&self, sketch: &Sketch, from: f64, to: f64) -> Vec<RawEvent>;
     /// Plays raw events as played, on a piano.
     fn play_raw(&mut self, events: &[RawEvent]) -> Result<(), String>;
+    /// Plays a stretch of the recording an audio sketch was heard in.
+    fn play_audio(&mut self, audio: AudioRef, from: f64, to: f64) -> Result<(), String>;
     /// Unix seconds now.
     fn now(&self) -> f64;
     /// Saved projects, most recent first: (file stem, name, last change in
@@ -130,9 +133,10 @@ pub fn list() -> Value {
         },
         {
             "name": "hear_sketch",
-            "description": "Plays a sketch (or part of it) to the user exactly as it was played, to check it's the right one.",
+            "description": "Plays a sketch (or part of it) to the user exactly as it was played, to check it's the right one. A sketch heard through a microphone plays its recording; as: \"notes\" plays the transcription instead, to check it.",
             "inputSchema": {"type": "object", "properties": {
-                "sketch": sketch_ref, "from": secs("Seconds into the sketch."), "to": secs("Seconds into the sketch.")
+                "sketch": sketch_ref, "from": secs("Seconds into the sketch."), "to": secs("Seconds into the sketch."),
+                "as": {"type": "string", "enum": ["recording", "notes"], "description": "For audio sketches: the recording (default) or the transcribed notes."}
             }}
         },
         {
@@ -735,6 +739,10 @@ pub fn mmss(secs: f64) -> String {
 }
 
 fn sketch_line(j: &Sketch, live: bool, now: f64) -> String {
+    if j.audio.is_some() && j.notes == 0 {
+        let state = if live { "being heard now" } else { "being written down" };
+        return format!("{}  (audio, {state})  {}  {}", j.id, when(j.start, now), mmss(j.duration()));
+    }
     let tempo = match j.tempo {
         Some(t) if t.confidence >= 0.35 => format!("~{:.0} BPM", t.bpm),
         Some(_) => "free time".into(),
@@ -751,7 +759,7 @@ fn sketch_line(j: &Sketch, live: bool, now: f64) -> String {
         j.key.as_deref().unwrap_or("?"),
         if j.chords.is_empty() { String::new() } else { format!("  {}", j.chords.iter().take(12).cloned().collect::<Vec<_>>().join(" ")) },
         if j.sustain_pedal { "  (pedal)" } else { "" }
-    )
+    ) + if j.audio.is_some() { "  (audio: heard through a microphone; notes transcribed)" } else { "" }
 }
 
 fn find_sketch(app: &dyn App, v: Option<&Value>) -> Result<(Sketch, bool), String> {
@@ -769,12 +777,20 @@ fn find_sketch(app: &dyn App, v: Option<&Value>) -> Result<(Sketch, bool), Strin
     }
 }
 
+/// A recording not yet written down has no notes to work with.
+fn still_heard(j: &Sketch) -> Result<(), String> {
+    if j.audio.is_some() && j.notes == 0 {
+        return Err("that recording is still being written down; ask again in a moment (hear_sketch plays it already)".into());
+    }
+    Ok(())
+}
+
 /// The sketch's events, optionally narrowed to `from..to` seconds into it.
 fn sketch_slice(app: &dyn App, j: &Sketch, args: &Value) -> (Vec<RawEvent>, f64, f64) {
     let from = args.get("from").and_then(Value::as_f64).unwrap_or(0.0).max(0.0);
     let to = args.get("to").and_then(Value::as_f64).unwrap_or(f64::INFINITY);
     let (a, b) = (j.start + from, (j.start + to).min(j.end + 1.0));
-    (app.played_events(a - 0.01, b), a, b)
+    (app.sketch_events(j, a - 0.01, b), a, b)
 }
 
 fn list_sketches(app: &mut dyn App, args: &Value) -> ToolResult {
@@ -796,6 +812,7 @@ fn list_sketches(app: &mut dyn App, args: &Value) -> ToolResult {
 
 fn get_sketch(app: &mut dyn App, args: &Value) -> ToolResult {
     let (j, live) = find_sketch(app, args.get("sketch"))?;
+    still_heard(&j)?;
     let (events, from, to) = sketch_slice(app, &j, args);
     if events.is_empty() {
         return Err("no notes there".into());
@@ -845,6 +862,11 @@ fn get_sketch(app: &mut dyn App, args: &Value) -> ToolResult {
 fn hear_sketch(app: &mut dyn App, args: &Value) -> ToolResult {
     let (j, _) = find_sketch(app, args.get("sketch"))?;
     let (events, from, to) = sketch_slice(app, &j, args);
+    let as_notes = args.get("as").and_then(Value::as_str) == Some("notes");
+    if let (Some(audio), false) = (j.audio, as_notes) {
+        app.play_audio(audio, from - 0.2, to.min(j.end + 1.5))?;
+        return Ok(format!("Playing the recording, {}–{} of {:?}.", mmss(from - j.start), mmss(to.min(j.end) - j.start), jam::sketch_name(&j)));
+    }
     if events.is_empty() {
         return Err("no notes there".into());
     }
@@ -855,6 +877,7 @@ fn hear_sketch(app: &mut dyn App, args: &Value) -> ToolResult {
 fn add_sketch(app: &mut dyn App, args: &Value) -> ToolResult {
     let p = app.project();
     let (j, _) = find_sketch(app, args.get("sketch"))?;
+    still_heard(&j)?;
     let (events, from, to) = sketch_slice(app, &j, args);
     let ons = jam::onsets(&events);
     if ons.len() < 2 {
@@ -889,6 +912,8 @@ fn add_sketch(app: &mut dyn App, args: &Value) -> ToolResult {
         let id = p.alloc_id();
         let mut session = jam::to_session(&events, from, to, id, label.clone(), tempo.as_ref(), p.meter_at(start_tick), start_tick);
         session.recorded_at = j.start as u64;
+        // Heard, not played: the session keeps its recording, in its clock.
+        session.audio = j.audio.map(|a| AudioRef { file: a.file, start: a.start - from });
         let imported = cleanup::import_session(&session, &p.tempo, true);
         let bar = p.meter_at(start_tick).ticks_per_bar();
         let clip_start = start_tick.saturating_sub(imported.pickup_bars as Tick * bar);
@@ -1606,12 +1631,15 @@ pub struct MemoryApp {
     pub selection: Option<Selection>,
     /// A journal: every event, unix-timed, and the sketches found in it.
     pub journal: Vec<RawEvent>,
+    /// When set, the journal was heard through a microphone: a
+    /// transcription of this recording.
+    pub heard: Option<AudioRef>,
     pub clock: f64,
 }
 
 impl MemoryApp {
     pub fn new(project: Project) -> Self {
-        Self { project, history: Default::default(), selection: None, journal: Vec::new(), clock: 0.0 }
+        Self { project, history: Default::default(), selection: None, journal: Vec::new(), heard: None, clock: 0.0 }
     }
 }
 
@@ -1645,12 +1673,15 @@ impl App for MemoryApp {
         // Split as the real journal does.
         let out: Vec<Sketch> = jam::split_sketches(&self.journal)
             .into_iter()
-            .filter_map(|(from, to)| jam::summarize(&self.played_events(from, to)))
+            .filter_map(|(from, to)| jam::summarize(&self.journal.iter().copied().filter(|e| e.t >= from && e.t <= to).collect::<Vec<_>>()))
             .collect();
-        out.into_iter().rev().map(|j| (j, false)).collect()
+        out.into_iter().rev().map(|j| (Sketch { audio: self.heard, ..j }, false)).collect()
     }
-    fn played_events(&self, from: f64, to: f64) -> Vec<RawEvent> {
+    fn sketch_events(&self, _: &Sketch, from: f64, to: f64) -> Vec<RawEvent> {
         self.journal.iter().copied().filter(|e| e.t >= from && e.t <= to).collect()
+    }
+    fn play_audio(&mut self, _: AudioRef, _: f64, _: f64) -> Result<(), String> {
+        Err("no recordings here".into())
     }
     fn play_raw(&mut self, _: &[RawEvent]) -> Result<(), String> {
         Ok(())
@@ -1858,6 +1889,26 @@ mod tests {
         assert!(figs.contains("Am (vi)") && figs.contains("G (V)"), "{figs}");
         let s = run(&mut app, "get_session", json!({}));
         assert!(s.contains("32 notes"), "{s}");
+    }
+
+    #[test]
+    fn a_heard_sketch_keeps_its_recording() {
+        let mut app = MemoryApp::new(Project::new("Empty"));
+        app.journal = journal();
+        app.clock = 1_800_000_000.0 + 3600.0;
+        let rec = AudioRef { file: 1_800_000_059, start: 1_800_000_059.5 };
+        app.heard = Some(rec);
+        let list = run(&mut app, "list_sketches", json!({}));
+        assert!(list.contains("(audio: heard through a microphone"), "{list}");
+        let e = call(&mut app, "hear_sketch", &json!({})).unwrap_err();
+        assert!(e.contains("no recordings"), "plays the recording, not notes: {e}");
+        run(&mut app, "add_sketch", json!({"from": 0, "to": 10.3}));
+        let session = app.project.sessions.last().unwrap();
+        let sketch = app.sketches()[0].0.clone();
+        // In the session's clock: its time zero is where the sketch starts.
+        let a = session.audio.expect("the session remembers the recording");
+        assert_eq!(a.file, rec.file);
+        assert!((a.start - (rec.start - sketch.start)).abs() < 0.02, "{a:?} {}", sketch.start);
     }
 
     #[test]

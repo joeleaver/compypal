@@ -83,6 +83,8 @@ pub struct Item {
     pub tag_class: &'static str,
     pub live: bool,
     pub hidden: bool,
+    /// Heard through a microphone: the notes are a transcription.
+    pub audio: bool,
     pub thumb: Vec<(f32, f32)>,
 }
 
@@ -145,6 +147,7 @@ pub fn items(p: &Project, played: &[Played], now: f64, filter: Filter) -> Vec<It
                 tag_class: "",
                 live: false,
                 hidden: false,
+                audio: s.audio.is_some(),
                 thumb: thumb(&s.events),
             },
         ));
@@ -157,6 +160,28 @@ pub fn items(p: &Project, played: &[Played], now: f64, filter: Filter) -> Vec<It
             at >= s.start - 3.0 && at <= s.end + 1.0
         });
         if taken {
+            continue;
+        }
+        // A recording not yet written down.
+        if s.audio.is_some() && s.notes == 0 {
+            out.push((
+                s.start,
+                Item {
+                    key: format!("a{}:{}", s.id, j.live),
+                    source: Source::Journal(s.id),
+                    name: if j.live { "Listening…".into() } else { "Writing it down…".into() },
+                    day: day_label(s.start, now),
+                    length: if j.live { "● now".into() } else { mmss(s.duration()) },
+                    detail: format!("{} · heard through the mic", when(s.start, now)),
+                    in_song: None,
+                    tag: String::new(),
+                    tag_class: "",
+                    live: j.live,
+                    hidden: j.hidden,
+                    audio: true,
+                    thumb: Vec::new(),
+                },
+            ));
             continue;
         }
         out.push((
@@ -173,6 +198,7 @@ pub fn items(p: &Project, played: &[Played], now: f64, filter: Filter) -> Vec<It
                 tag_class: "",
                 live: j.live,
                 hidden: j.hidden,
+                audio: s.audio.is_some(),
                 thumb: j.thumb.clone(),
             },
         ));
@@ -208,6 +234,10 @@ pub struct Detail {
     pub chords: Vec<(f32, f32, String)>,
     pub in_song: Option<String>,
     pub hidden: bool,
+    /// Heard through a microphone; "Hear it" plays the recording.
+    pub audio: bool,
+    /// Still being written down: no notes yet.
+    pub pending: bool,
 }
 
 fn events_of(store: Store, source: Source) -> Vec<RawEvent> {
@@ -215,13 +245,42 @@ fn events_of(store: Store, source: Source) -> Vec<RawEvent> {
         Source::Session(id) => store.project.with(|p| p.session(id).map(|s| s.events.clone()).unwrap_or_default()),
         Source::Journal(id) => store
             .journal
-            .and_then(|j| j.sketch(id))
-            .map(|(s, _)| store.journal.map(|j| j.events(s.start - 0.01, s.end + 0.01)).unwrap_or_default())
+            .and_then(|j| j.sketch(id).map(|(s, _)| j.sketch_events(&s, s.start - 0.01, s.end + 0.01)))
             .unwrap_or_default(),
     }
 }
 
+/// The recording behind a sketch, if it was heard rather than played,
+/// with the stretch its notes cover (in the recording's clock).
+fn recording_of(store: Store, source: Source) -> Option<(compypal_core::AudioRef, f64, f64)> {
+    match source {
+        Source::Session(id) => store.project.with(|p| {
+            let s = p.session(id)?;
+            let (a, b) = (s.events.first()?.t, s.events.last()?.t);
+            Some((s.audio?, a, b))
+        }),
+        Source::Journal(id) => {
+            let (s, _) = store.journal?.sketch(id)?;
+            Some((s.audio?, s.start, s.end))
+        }
+    }
+}
+
 pub fn detail(store: Store, source: Source) -> Option<Detail> {
+    let audio = recording_of(store, source).is_some();
+    if let Source::Journal(id) = source
+        && let Some((s, live)) = store.journal.and_then(|j| j.sketch(id)).filter(|(s, _)| s.audio.is_some() && s.notes == 0)
+    {
+        let now = compypal_audio::journal::now();
+        return Some(Detail {
+            name: if live { "Listening…".into() } else { "Writing it down…".into() },
+            sub: format!("{} · {}", when(s.start, now), mmss(s.duration())),
+            chips: vec!["audio".into(), if live { "still playing".into() } else { "finding the notes".into() }],
+            audio: true,
+            pending: true,
+            ..Default::default()
+        });
+    }
     let events = events_of(store, source);
     let sum = jam::summarize(&events)?;
     let notes = jam::jam_notes(&events, sum.tempo.as_ref().filter(|t| t.confidence >= 0.3));
@@ -245,14 +304,14 @@ pub fn detail(store: Store, source: Source) -> Option<Detail> {
         }
         Source::Journal(_) => (jam::sketch_name(&sum), None, when(sum.start, compypal_audio::journal::now())),
     });
-    let mut chips = vec![tempo_text(&sum)];
+    let mut chips = if audio { vec!["audio".to_string(), tempo_text(&sum)] } else { vec![tempo_text(&sum)] };
     chips.extend(sum.key.clone());
     chips.push(format!("{} notes", sum.notes));
     if sum.sustain_pedal {
         chips.push("pedal".into());
     }
     let hidden = matches!(source, Source::Journal(id) if store.journal.is_some_and(|j| j.is_hidden(id)));
-    Some(Detail { name, sub: format!("{when_text} · {}", mmss(sum.duration())), chips, notes: drawn, chords, in_song, hidden })
+    Some(Detail { name, sub: format!("{when_text} · {}", mmss(sum.duration())), chips, notes: drawn, chords, in_song, hidden, audio, pending: false })
 }
 
 /// Puts a journal sketch out of sight, or back. The list refreshes from the
@@ -273,8 +332,26 @@ fn set_hidden(store: Store, id: u64, hidden: bool) {
     }
 }
 
-/// Plays a sketch as it was played.
+/// Plays a sketch as it was played: the recording, if it was heard
+/// through a microphone.
 pub fn hear(store: Store, source: Source) {
+    if let Some((a, from, to)) = recording_of(store, source) {
+        let samples = store.journal.and_then(|j| j.sketch_audio(a, from - 0.2, to + 1.5));
+        match (store.engine, samples) {
+            (Some(e), Some(samples)) => {
+                e.play_clip(samples, compypal_audio::analysis::RATE);
+                store.status.set("Playing the recording".into());
+            }
+            (None, _) => store.status.set("No audio output".into()),
+            (_, None) => store.status.set("The recording isn't there any more".into()),
+        }
+        return;
+    }
+    hear_notes(store, source);
+}
+
+/// Plays a sketch's notes: for a heard sketch, what was written down.
+pub fn hear_notes(store: Store, source: Source) {
     let events = events_of(store, source);
     match store.engine {
         Some(e) if !events.is_empty() => {
@@ -428,6 +505,9 @@ pub fn SketchesView() -> NodeHandle {
                             }
                             div { class: "sketch-text",
                                 div { class: "sketch-title",
+                                    if row.item.audio {
+                                        span { class: "sketch-audio", "mic" }
+                                    }
                                     span { class: "sketch-name", {row.item.name.clone()} }
                                     span { class: "sketch-length", {row.item.length.clone()} }
                                 }
@@ -464,6 +544,9 @@ pub fn SketchesView() -> NodeHandle {
                     }
                     div { class: "sketch-actions",
                         Button { size: "sm", variant: "default", onclick: move || hear(store, source), "▶ Hear it" }
+                        if d.audio && !d.pending {
+                            Button { size: "sm", variant: "subtle", onclick: move || hear_notes(store, source), "Hear the notes" }
+                        }
                         Button { size: "sm", variant: "default",
                             onclick: {
                                 let name = d.name.clone();
@@ -473,6 +556,9 @@ pub fn SketchesView() -> NodeHandle {
                         }
                         div { class: "spacer" }
                         match (d.in_song.clone(), source) {
+                            _ if d.pending => div { class: "sketch-place",
+                                span { class: "sketch-tag", "The notes come when it's written down" }
+                            },
                             (Some(place), Source::Session(id)) => div { class: "sketch-place",
                                 span { class: "sketch-tag used", {format!("In the song: {place}")} }
                                 if place.contains("muted") {

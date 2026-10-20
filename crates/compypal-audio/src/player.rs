@@ -42,6 +42,8 @@ pub enum Cmd {
     SetLooping(Looping),
     /// Play a phrase now, alongside (or instead of) the transport.
     Audition(Arc<Schedule>),
+    /// Play a recording (mono, at its rate) now, over everything else.
+    Clip(Arc<Vec<f32>>, u32),
     /// A message straight to the synth: live input, clicking a key.
     Midi([u8; 3]),
     Panic,
@@ -185,11 +187,13 @@ pub struct Player {
     heard_at: Option<Instant>,
     /// A Play started in this buffer, from this position.
     started: Option<f64>,
+    /// A recording playing: samples, position in them, samples per frame.
+    clip: Option<(Arc<Vec<f32>>, f64, f64)>,
 }
 
 impl Player {
     pub fn new(synth: Box<dyn Synth>, rate: u32, cmds: Receiver<Cmd>, shared: Arc<Shared>) -> Self {
-        Self { synth, rate: rate as f64, transport: None, audition: None, cmds, shared, heard_at: None, started: None }
+        Self { synth, rate: rate as f64, transport: None, audition: None, cmds, shared, heard_at: None, started: None, clip: None }
     }
 
     /// Tells the player when the buffer it's about to fill will be heard:
@@ -225,7 +229,11 @@ impl Player {
                 if let Some(mut r) = self.transport.take() {
                     r.release(synth);
                 }
+                self.clip = None;
             }
+            // The engine keeps the samples alive, so dropping one here
+            // never frees memory on this thread.
+            Cmd::Clip(samples, rate) => self.clip = Some((samples, 0.0, rate as f64 / self.rate)),
             Cmd::SetLooping(looping) => {
                 if let Some(r) = self.transport.as_mut() {
                     r.looping = looping;
@@ -249,6 +257,7 @@ impl Player {
             Cmd::Panic => {
                 self.transport = None;
                 self.audition = None;
+                self.clip = None;
                 synth.panic();
             }
             Cmd::SetSynth(mut new) => {
@@ -300,6 +309,22 @@ impl Player {
                 r.pos += secs;
             }
             done += frames;
+        }
+        if let Some((samples, pos, step)) = self.clip.as_mut() {
+            for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+                let i = *pos as usize;
+                if i + 1 >= samples.len() {
+                    break;
+                }
+                let f = (*pos - i as f64) as f32;
+                let v = samples[i] * (1.0 - f) + samples[i + 1] * f;
+                *l += v;
+                *r += v;
+                *pos += *step;
+            }
+            if *pos as usize + 1 >= samples.len() {
+                self.clip = None;
+            }
         }
 
         match &self.transport {
@@ -384,6 +409,19 @@ mod tests {
         assert_eq!(log[0], (11, [0x90, 60, 100]));
         assert_eq!(log[1], (500, [0x80, 60, 0]));
         assert!((shared.position().unwrap() - 0.768).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_recording_plays_at_its_own_rate_and_stops() {
+        let (mut p, tx, _, _) = player();
+        // 500 Hz samples on a 1000 Hz player: each one lasts two frames.
+        tx.send(Cmd::Clip(Arc::new(vec![0.0, 0.5, 1.0, 0.5, 0.0]), 500)).unwrap();
+        let (mut l, mut r) = (vec![0.0; 16], vec![0.0; 16]);
+        p.process(&mut l, &mut r);
+        assert_eq!(&l[..8], &[0.0, 0.25, 0.5, 0.75, 1.0, 0.75, 0.5, 0.25]);
+        assert_eq!(l, r);
+        assert!(l[8..].iter().all(|v| *v == 0.0));
+        assert!(p.clip.is_none(), "done");
     }
 
     #[test]

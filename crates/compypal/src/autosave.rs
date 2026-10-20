@@ -172,6 +172,9 @@ pub struct Settings {
     /// `custom:<command>`.
     #[serde(default)]
     pub agent: Option<String>,
+    /// The audio input to hear, by device id.
+    #[serde(default)]
+    pub audio_in: Option<String>,
 }
 
 fn settings_path() -> Option<PathBuf> {

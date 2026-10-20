@@ -241,6 +241,8 @@
 }
 .port-row:hover { background: var(--rinch-color-dark-6); }
 .port-row.selected { color: var(--rinch-color-text); border-left-color: var(--rinch-color-green-5); }
+.level-meter { margin: 4px 12px 8px 15px; height: 4px; border-radius: 2px; background: var(--rinch-color-dark-5); overflow: hidden; }
+.level-fill { height: 4px; background: var(--rinch-color-green-6); }
 
 .heading-row { display: flex; justify-content: space-between; align-items: center; padding-top: 10px; }
 
@@ -738,4 +740,15 @@
     color: var(--rinch-color-text);
     border: 1px solid var(--rinch-color-green-7);
     background: rgba(81, 207, 102, 0.10);
+}
+
+/* A sketch heard through a microphone. */
+.sketch-audio {
+    display: inline-block;
+    font-size: 10px;
+    padding: 0 5px;
+    margin-right: 6px;
+    border-radius: 3px;
+    color: var(--rinch-color-orange-4);
+    border: 1px solid var(--rinch-color-orange-8);
 }
