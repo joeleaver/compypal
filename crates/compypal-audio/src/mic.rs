@@ -153,6 +153,10 @@ where
     let rate = config.sample_rate;
     let mut resampler = Resampler::new(rate);
     let mut mono: Vec<f32> = Vec::new();
+    // A DC blocker (a high-pass around 10 Hz): an input with an offset, or
+    // a stuck one pinned at full scale, reads as the silence it is.
+    let pole = 1.0 - std::f32::consts::TAU * 10.0 / rate as f32;
+    let (mut x1, mut y1) = (0.0f32, 0.0f32);
     device
         .build_input_stream::<T, _, _>(
             *config,
@@ -163,7 +167,9 @@ where
                 mono.clear();
                 let mut peak = 0.0f32;
                 for frame in data.chunks(channels) {
-                    let s = frame.iter().map(|x| <f32 as cpal::FromSample<T>>::from_sample_(*x)).sum::<f32>() / channels as f32;
+                    let x = frame.iter().map(|x| <f32 as cpal::FromSample<T>>::from_sample_(*x)).sum::<f32>() / channels as f32;
+                    let s = x - x1 + pole * y1;
+                    (x1, y1) = (x, s);
                     peak = peak.max(s.abs());
                     mono.push(s);
                 }

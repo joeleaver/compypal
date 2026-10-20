@@ -242,7 +242,7 @@ pub fn onsets(samples: &[f32], rate: u32) -> Vec<Onset> {
         let b = (i + 5).min(flux.len() - 1);
         let mean = flux[a..=b].iter().sum::<f32>() / (b - a + 1) as f32;
         let loudest = flux[i.saturating_sub(near)..(i + near).min(flux.len())].iter().cloned().fold(0.0f32, f32::max);
-        if flux[i] < 1.5 * mean || flux[i] < 0.2 * loudest || flux[i] < 0.02 * peak {
+        if flux[i] < 1.5 * mean || flux[i] < 0.13 * loudest || flux[i] < 0.02 * peak {
             continue;
         }
         let t = (i * ONSET_HOP) as f64 / rate as f64;
@@ -462,45 +462,77 @@ pub fn strums(samples: &[f32], rate: u32) -> Strums {
     strengths.sort_by(f32::total_cmp);
     let loud = strengths[(strengths.len() * 9 / 10).min(strengths.len() - 1)].max(1e-6);
 
+    // First what each onset sounds like: what's sounding, what was struck.
+    let read: Vec<(Vec<(u8, f32)>, Vec<u8>, Vec<u8>)> = (0..ons.len())
+        .map(|i| {
+            let (a, b) = spans[i];
+            let found = notes_in(&spectra[i], rate, tune);
+            // A window's magnitudes grow with its length: compare per second.
+            let read_len = (b.min(a + READ_SKIP + READ_LEN) - (a + READ_SKIP.min((b - a) / 4.0))).max(1e-3);
+            let before_len = (a - 0.005 - (a - 0.12).max(0.0)).max(1e-3);
+            let struck_now = |m: u8| {
+                let f = midi_freq(m as f32, tune);
+                // The fundamental alone: a low string's harmonics are often
+                // a new chord's own notes.
+                let now = peak_near(&spectra[i], f, bin_hz) / read_len as f32;
+                let was = peak_near(&before[i], f, bin_hz) / before_len as f32;
+                now > STRUCK_RISE * was
+            };
+            let mut sounding: Vec<u8> = found.iter().map(|n| n.0).collect();
+            sounding.sort();
+            let struck: Vec<u8> = sounding.iter().copied().filter(|&m| struck_now(m)).collect();
+            (found, sounding, struck)
+        })
+        .collect();
+    // Strummed playing: plenty of onsets clearly strike three strings or
+    // more (downstrokes; the upstrokes between barely raise some). Then a
+    // light stroke over a ringing chord strikes it all.
+    let strumming = read.iter().filter(|r| r.2.len() >= 3).count() * 5 >= read.len() * 2;
+
     let mut heard = Vec::new();
     let mut notes: Vec<HeardNote> = Vec::new();
     // Notes ringing: index into `notes`.
     let mut ringing: Vec<usize> = Vec::new();
     let mut strummed = 0usize;
+    // The bass of the last clear strum: a light stroke after it doesn't
+    // reach below it (what rings down there is left from before).
+    let mut last_bass: Option<(u8, f32)> = None;
     for (i, o) in ons.iter().enumerate() {
         let (a, b) = spans[i];
-        let found = notes_in(&spectra[i], rate, tune);
-        // A window.s magnitudes grow with its length: compare per second.
-        let read_len = (b.min(a + READ_SKIP + READ_LEN) - (a + READ_SKIP.min((b - a) / 4.0))).max(1e-3);
-        let before_len = (a - 0.005 - (a - 0.12).max(0.0)).max(1e-3);
-        let struck_now = |m: u8| {
-            let f = midi_freq(m as f32, tune);
-            let now = (peak_near(&spectra[i], f, bin_hz) + peak_near(&spectra[i], 2.0 * f, bin_hz)) / read_len as f32;
-            let was = (peak_near(&before[i], f, bin_hz) + peak_near(&before[i], 2.0 * f, bin_hz)) / before_len as f32;
-            now > STRUCK_RISE * was
-        };
-        let mut sounding: Vec<u8> = found.iter().map(|n| n.0).collect();
-        sounding.sort();
-        let mut struck: Vec<u8> = sounding.iter().copied().filter(|&m| struck_now(m)).collect();
-        if struck.is_empty() || (sounding.len() >= 3 && struck.len() * 2 >= sounding.len()) {
-            // Something was played here, or most of a chord: a strum
-            // strikes every string that sounds.
+        let (found, mut sounding, mut struck) = read[i].clone();
+        let light = last_bass.is_some_and(|(_, strength)| o.strength < 0.6 * strength);
+        if struck.len() >= 3 && !(strumming && light) {
+            last_bass = struck.first().map(|p| (*p, o.strength));
+        } else if strumming && sounding.len() >= 3 {
+            // In strummed playing a stroke strikes every string that
+            // sounds, from the last strum's bass up.
+            let floor = last_bass.map_or(0, |b| b.0);
+            sounding.retain(|p| *p >= floor);
+            struck = sounding.clone();
+        } else if struck.is_empty() {
+            // Something was played here.
             struck = sounding.clone();
         }
+        // A strum is named by the strings it struck: changing chords stops
+        // the old one, so what still rings counts only if it fits the new
+        // chord above its bass. Otherwise (a note over ringing strings) the
+        // chord is everything sounding.
+        let strum = struck.len() >= 3;
+        let named: Vec<(u8, f32)> = found.iter().copied().filter(|(p, _)| !strum || struck.contains(p)).collect();
         let mut chord = None;
-        if sounding.len() >= 3 {
+        if named.len() >= 3 {
             let mut w = [0.0f64; 12];
-            for (p, s) in &found {
+            for (p, s) in &named {
                 w[(p % 12) as usize] += *s as f64;
             }
-            let bass = sounding.first().map(|p| p % 12 as Pc);
+            let bass = named.iter().map(|n| n.0).min().map(|p| p % 12 as Pc);
             if let Some(fit) = theory::best_fit(&w, bass).filter(|f| f.score > 0.3) {
                 chord = Some(fit.chord);
-                // In a strum, what the chord doesn't explain is overtones
-                // and string noise.
-                if struck.len() >= 3 {
+                if strum {
+                    // What the chord doesn't explain is overtones and noise.
                     struck.retain(|p| fit.chord.contains(*p));
-                    sounding.retain(|p| fit.chord.contains(*p));
+                    let low = struck.first().copied().unwrap_or(0);
+                    sounding.retain(|p| struck.contains(p) || (fit.chord.contains(*p) && *p > low));
                 }
             }
         }
@@ -700,5 +732,41 @@ pub(crate) mod tests {
         let got: Vec<Vec<u8>> = s.heard.iter().map(|h| h.struck.clone()).collect();
         assert_eq!(got, line.iter().map(|p| vec![*p]).collect::<Vec<_>>());
         assert!(s.chordal < 0.1);
+    }
+
+    #[test]
+    fn down_and_up_strums() {
+        // Eighths: downstrokes on the beat, lighter upstrokes between, the
+        // strings in reverse; a chord a bar.
+        let beat = 60.0 / 96.0;
+        let mut audio = vec![0.0f32; ((0.5 + 16.0 * beat + 3.0) * RATE as f64) as usize];
+        let mut times = Vec::new();
+        for (bar, chord) in [G, C, D, EM].iter().enumerate() {
+            for e in 0..8 {
+                let t = 0.5 + (bar * 4) as f64 * beat + e as f64 * beat / 2.0;
+                times.push(t);
+                let amp = match e {
+                    0 | 4 => 0.12,
+                    _ if e % 2 == 0 => 0.08,
+                    _ => 0.04,
+                };
+                for (s, &p) in chord.iter().enumerate() {
+                    let string = if e % 2 == 0 { s } else { chord.len() - 1 - s };
+                    pluck(&mut audio, RATE, t + string as f64 * 0.007, p, amp);
+                }
+            }
+        }
+        let s = strums(&audio, RATE);
+        assert!(s.heard.len() >= 26, "most strokes heard: {}", s.heard.len());
+        for h in &s.heard {
+            assert!(times.iter().any(|t| (h.t - t).abs() < 0.05), "nothing was played at {}", h.t);
+        }
+        // Each bar's first strum names its chord, with nothing left over
+        // from the bar before.
+        for (bar, want) in ["G", "C", "D", "Em"].iter().enumerate() {
+            let t = times[bar * 8];
+            let h = s.heard.iter().find(|h| (h.t - t).abs() < 0.05).unwrap();
+            assert_eq!(h.chord.map(|c| c.name(theory::Spelling::Sharps)).as_deref(), Some(*want), "{h:?}");
+        }
     }
 }

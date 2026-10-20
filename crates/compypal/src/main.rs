@@ -300,9 +300,10 @@ fn Sidebar() -> NodeHandle {
                 div { class: "level-meter",
                     div { class: "level-fill",
                         style: {|| {
-                            // -60 dB to 0 dB across the meter.
+                            // -80 dB to 0 dB across the meter: a quiet room
+                            // shows a sliver, so you can see it's alive.
                             let db = 20.0 * (store.audio_level.get() + 1e-6).log10();
-                            format!("width: {:.0}%;", ((db + 60.0) / 60.0 * 100.0).clamp(0.0, 100.0))
+                            format!("width: {:.0}%;", ((db + 80.0) / 80.0 * 100.0).clamp(0.0, 100.0))
                         }}
                     }
                 }
