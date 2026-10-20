@@ -31,7 +31,18 @@ pub struct Played {
     pub sketch: Sketch,
     /// Still being played.
     pub live: bool,
+    /// Put out of sight; shown only under the Hidden filter.
+    pub hidden: bool,
     pub thumb: Vec<(f32, f32)>,
+}
+
+/// Which sketches the list shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Filter {
+    #[default]
+    All,
+    NotInSong,
+    Hidden,
 }
 
 /// A small picture of the notes: (time, pitch), both 0..1.
@@ -71,6 +82,7 @@ pub struct Item {
     pub tag: String,
     pub tag_class: &'static str,
     pub live: bool,
+    pub hidden: bool,
     pub thumb: Vec<(f32, f32)>,
 }
 
@@ -109,7 +121,7 @@ fn tempo_text(s: &Sketch) -> String {
 
 /// The list: the song's sessions and the journal's sketches, newest first,
 /// each played thing once.
-pub fn items(p: &Project, played: &[Played], now: f64) -> Vec<Item> {
+pub fn items(p: &Project, played: &[Played], now: f64, filter: Filter) -> Vec<Item> {
     let mut out: Vec<(f64, Item)> = Vec::new();
     for s in &p.sessions {
         let start = s.recorded_at as f64;
@@ -132,6 +144,7 @@ pub fn items(p: &Project, played: &[Played], now: f64) -> Vec<Item> {
                 tag: String::new(),
                 tag_class: "",
                 live: false,
+                hidden: false,
                 thumb: thumb(&s.events),
             },
         ));
@@ -159,11 +172,17 @@ pub fn items(p: &Project, played: &[Played], now: f64) -> Vec<Item> {
                 tag: String::new(),
                 tag_class: "",
                 live: j.live,
+                hidden: j.hidden,
                 thumb: j.thumb.clone(),
             },
         ));
     }
     out.sort_by(|a, b| b.0.total_cmp(&a.0));
+    out.retain(|(_, i)| match filter {
+        Filter::All => !i.hidden,
+        Filter::NotInSong => !i.hidden && i.in_song.is_none(),
+        Filter::Hidden => i.hidden,
+    });
     out.into_iter()
         .map(|(_, mut i)| {
             (i.tag, i.tag_class) = match &i.in_song {
@@ -188,6 +207,7 @@ pub struct Detail {
     /// left %, width %, name.
     pub chords: Vec<(f32, f32, String)>,
     pub in_song: Option<String>,
+    pub hidden: bool,
 }
 
 fn events_of(store: Store, source: Source) -> Vec<RawEvent> {
@@ -231,7 +251,26 @@ pub fn detail(store: Store, source: Source) -> Option<Detail> {
     if sum.sustain_pedal {
         chips.push("pedal".into());
     }
-    Some(Detail { name, sub: format!("{when_text} · {}", mmss(sum.duration())), chips, notes: drawn, chords, in_song })
+    let hidden = matches!(source, Source::Journal(id) if store.journal.is_some_and(|j| j.is_hidden(id)));
+    Some(Detail { name, sub: format!("{when_text} · {}", mmss(sum.duration())), chips, notes: drawn, chords, in_song, hidden })
+}
+
+/// Puts a journal sketch out of sight, or back. The list refreshes from the
+/// journal thread; meanwhile the flag is flipped here so it moves at once.
+fn set_hidden(store: Store, id: u64, hidden: bool) {
+    let Some(j) = store.journal else { return };
+    match j.set_hidden(id, hidden) {
+        Ok(()) => {
+            store.played.update(|ps| {
+                for p in ps.iter_mut().filter(|p| p.sketch.id == id) {
+                    p.hidden = hidden;
+                }
+            });
+            store.sketch_sel.set(None);
+            store.status.set(if hidden { "Hidden: it's under Hidden if you want it back".into() } else { "Back in the list".into() });
+        }
+        Err(e) => store.status.set(format!("Couldn't hide it: {e}")),
+    }
 }
 
 /// Plays a sketch as it was played.
@@ -316,7 +355,8 @@ pub fn SketchesView() -> NodeHandle {
     let list = Memo::new(move || {
         let played = store.played.get();
         let now = compypal_audio::journal::now();
-        let items = store.project.with(|p| items(p, &played, now));
+        let filter = store.sketch_filter.get();
+        let items = store.project.with(|p| items(p, &played, now, filter));
         let mut last_day = String::new();
         items
             .into_iter()
@@ -335,7 +375,22 @@ pub fn SketchesView() -> NodeHandle {
     rsx! {
         div { class: "sketches",
             div { class: "sketch-list",
-                if list.get().is_empty() {
+                div { class: "sketch-filters",
+                    for (f, label) in [(Filter::All, "All"), (Filter::NotInSong, "Not in the song"), (Filter::Hidden, "Hidden")] {
+                        span { key: label,
+                            class: {move || if store.sketch_filter.get() == f { "sketch-filter on" } else { "sketch-filter" }},
+                            onclick: move || {
+                                store.sketch_filter.set(f);
+                                store.sketch_sel.set(None);
+                            },
+                            {label}
+                        }
+                    }
+                }
+                if list.get().is_empty() && store.sketch_filter.get() != Filter::All {
+                    div { class: "empty", "Nothing here" }
+                }
+                if list.get().is_empty() && store.sketch_filter.get() == Filter::All {
                     div { class: "sketch-empty",
                         div { class: "chat-empty-title", "Nothing played yet" }
                         div { class: "chat-empty-body",
@@ -423,10 +478,23 @@ pub fn SketchesView() -> NodeHandle {
                                 if place.contains("muted") {
                                     Button { size: "sm", variant: "light", onclick: move || store.use_session(id), "Use this one" }
                                 }
+                                Button { size: "sm", variant: "subtle", onclick: move || store.take_out_session(id), "Take out" }
                                 Button { size: "sm", variant: "light", onclick: move || store.tidy_session(id), "Tidy" }
                                 Button { size: "sm", variant: "filled", onclick: move || show_in_song(store, id), "Show in song" }
                             },
+                            (None, Source::Journal(id)) if d.hidden => div { class: "sketch-place",
+                                span { class: "sketch-tag", "Hidden" }
+                                Button { size: "sm", variant: "light", onclick: move || set_hidden(store, id, false), "Unhide" }
+                            },
                             _ => div { class: "sketch-place",
+                                match source {
+                                    Source::Journal(id) => Button { size: "sm", variant: "subtle",
+                                        onclick: move || set_hidden(store, id, true), "Hide"
+                                    },
+                                    Source::Session(id) => Button { size: "sm", variant: "subtle",
+                                        onclick: move || store.remove_session(id), "Remove"
+                                    },
+                                }
                                 span { class: "toolbar-label", "to" }
                                 div { class: "agent-pick-anchor",
                                     Button { size: "sm", variant: "default",
@@ -526,8 +594,8 @@ mod tests {
             .collect();
         let at = 1_800_000_000.0;
         let heard: Vec<RawEvent> = ev.iter().map(|e| RawEvent { t: e.t + at, ..*e }).collect();
-        let played = vec![Played { sketch: jam::summarize(&heard).unwrap(), live: false, thumb: thumb(&heard) }];
-        assert_eq!(items(&p, &played, at + 60.0).len(), 1);
+        let played = vec![Played { sketch: jam::summarize(&heard).unwrap(), live: false, hidden: false, thumb: thumb(&heard) }];
+        assert_eq!(items(&p, &played, at + 60.0, Filter::All).len(), 1);
         let id = p.alloc_id();
         p.sessions.push(Session {
             id,
@@ -540,8 +608,14 @@ mod tests {
             own_tempo: false,
             events: ev,
         });
-        let list = items(&p, &played, at + 60.0);
+        let list = items(&p, &played, at + 60.0, Filter::All);
         assert_eq!(list.len(), 1, "{list:?}");
+        // Not on any track yet: it's what "Not in the song" shows.
+        assert_eq!(items(&p, &played, at + 60.0, Filter::NotInSong).len(), 1);
+        let mut gone = played.clone();
+        gone[0].hidden = true;
+        assert_eq!(items(&Project::new("Empty"), &gone, at + 60.0, Filter::All).len(), 0, "hidden is out of sight");
+        assert_eq!(items(&Project::new("Empty"), &gone, at + 60.0, Filter::Hidden).len(), 1);
         assert_eq!(list[0].source, Source::Session(id));
         assert_ne!(list[0].name, "Take 1", "named by its music");
     }

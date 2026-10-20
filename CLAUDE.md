@@ -27,11 +27,14 @@ with a built-in synth; export MIDI and ABC.
 - Clip note times are relative to the clip start.
 - Laying music over music (recording, adding a sketch) never mixes it in:
   `Track::add_over` cuts the clips underneath at its edges and mutes the
-  covered parts, kept as alternatives; `Track::prefer` (`use_sketch`,
-  "Use this one") switches back. `Track::absolute_notes` is what's heard;
-  `muted_notes` is what's under it (dashed in the roll, hatched in the
-  arranger). A split clip keeps `source_offset`, its place in its take,
-  so `Clip::refill` (Tidy, `clean_take`) refills only its window.
+  covered parts, kept as alternatives, each remembering what muted it
+  (`muted_by`); `Track::prefer` (`use_sketch`, "Use this one", a click in
+  the roll's Takes lanes) switches, per bar range. `Project::take_out`
+  removes a sketch's clips and brings back exactly what they muted.
+  `Track::absolute_notes` is what's heard; `muted_notes` is what's under
+  it (dashed in the roll, hatched in the arranger, listed as lanes above
+  the roll). A split clip keeps `source_offset`, its place in its take, so
+  `Clip::refill` (Tidy, `clean_take`) refills only its window.
 
 ## Figures
 
@@ -205,7 +208,10 @@ playing (not take, jam or session).
   song's sessions together by day, each once (a take recorded while
   listening is in both), with a thumbnail; the selected one is drawn whole,
   fitted to the width, with its chords, and can be heard, asked about, or
-  added to the song on a chosen track at the end or at the cursor.
+  added to the song on a chosen track at the end or at the cursor. A song's
+  sketch can be taken out (it stays a sketch) or, unused, removed; a
+  journal sketch can be hidden (`journal/hidden.json`; the playing stays,
+  and the agent doesn't see it). Filters: All, Not in the song, Hidden.
 - Added sketches are sessions with `own_tempo`: imported by their own pulse
   (beats, not seconds), so they sit on the song's grid at any song tempo.
 - Agent: `list_sketches`, `get_sketch` (chord timeline in mm:ss, activity
@@ -278,8 +284,8 @@ creates projects; the agent has `list_projects` and `open_project`.
 4. ~~Arranger view~~ (done): sections, clip rows, bar selection, duplicate /
    insert / delete bars (`core::arrange`), section naming.
 4b. ~~Sketches~~ (done): raw playing split into ideas, one list, alternative
-   lanes under music. Follow-ups: lane rows in the roll (pick a take per
-   bar range there, not only in Sketches), audio sketches (a guitar via
-   the mic, transcribed to notes), deleting or hiding sketches.
+   lanes under music, picked per bar range in the roll, hiding and taking
+   out. Follow-ups: audio sketches (a guitar via the mic, transcribed to
+   notes).
 5. **Own synth**: a wavetable/mod-matrix synth in the spirit of Vital, to sit
    alongside the SoundFont player.

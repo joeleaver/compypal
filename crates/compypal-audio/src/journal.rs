@@ -38,6 +38,8 @@ struct State {
     /// Events of the jam in progress, if any.
     current: Vec<RawEvent>,
     index: Vec<Sketch>,
+    /// Sketches put out of sight, by id. Nothing is deleted.
+    hidden: Vec<u64>,
 }
 
 pub struct Journal {
@@ -53,7 +55,8 @@ impl Journal {
     pub fn open(dir: PathBuf) -> std::io::Result<Arc<Self>> {
         std::fs::create_dir_all(&dir)?;
         let index = load_index(&dir);
-        let state = Arc::new(Mutex::new(State { current: Vec::new(), index }));
+        let hidden = std::fs::read_to_string(dir.join("hidden.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let state = Arc::new(Mutex::new(State { current: Vec::new(), index, hidden }));
         let (tx, rx) = channel();
         let (dir2, state2) = (dir.clone(), state.clone());
         std::thread::Builder::new().name("compypal-journal".into()).spawn(move || writer(dir2, rx, state2))?;
@@ -119,6 +122,22 @@ impl Journal {
         }
         out.sort_by(|a, b| a.t.total_cmp(&b.t));
         out
+    }
+
+    /// Puts a sketch out of sight, or back. The playing itself stays in the
+    /// journal either way.
+    pub fn set_hidden(&self, id: u64, hidden: bool) -> std::io::Result<()> {
+        let mut st = self.state.lock().unwrap();
+        st.hidden.retain(|h| *h != id);
+        if hidden {
+            st.hidden.push(id);
+        }
+        let text = serde_json::to_string(&st.hidden).map_err(std::io::Error::other)?;
+        std::fs::write(self.dir.join("hidden.json"), text)
+    }
+
+    pub fn is_hidden(&self, id: u64) -> bool {
+        self.state.lock().unwrap().hidden.contains(&id)
     }
 
     pub fn dir(&self) -> &Path {
@@ -234,6 +253,11 @@ mod tests {
         assert_eq!(sketches.len(), 1);
         assert!(sketches[0].1, "still live: no gap has passed");
         assert_eq!(sketches[0].0.notes, 8);
+        let id = sketches[0].0.id;
+        j.set_hidden(id, true).unwrap();
+        assert!(Journal::open(dir.clone()).unwrap().is_hidden(id), "remembered");
+        j.set_hidden(id, false).unwrap();
+        assert!(!j.is_hidden(id));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

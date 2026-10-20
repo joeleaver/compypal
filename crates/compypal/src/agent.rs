@@ -89,7 +89,8 @@ impl App for StoreApp {
     }
 
     fn sketches(&self) -> Vec<(compypal_core::jam::Sketch, bool)> {
-        self.0.journal.map(|j| j.sketches()).unwrap_or_default()
+        // Hidden sketches are out of sight for the agent too.
+        self.0.journal.map(|j| j.sketches().into_iter().filter(|(s, _)| !j.is_hidden(s.id)).collect()).unwrap_or_default()
     }
 
     fn played_events(&self, from: f64, to: f64) -> Vec<compypal_core::RawEvent> {

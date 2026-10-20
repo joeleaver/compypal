@@ -703,3 +703,39 @@
     border-color: var(--rinch-color-dark-2);
     top: 55%;
 }
+.sketch-filters { display: flex; gap: 6px; padding: 12px 12px 2px; }
+.sketch-filter {
+    display: inline-block;
+    padding: 2px 9px;
+    border-radius: 10px;
+    border: 1px solid var(--rinch-color-dark-4);
+    font-size: 11px;
+    color: var(--rinch-color-dimmed);
+    cursor: pointer;
+}
+.sketch-filter.on { background: var(--rinch-color-dark-4); color: var(--rinch-color-text); }
+
+/* Takes over the same bars: heard on top, alternatives below. */
+.take-lanes { position: relative; background: var(--rinch-color-dark-8); border-bottom: 1px solid var(--rinch-color-dark-4); }
+.take-lanes .lane-label { padding-top: 4px; }
+.take-block {
+    position: absolute;
+    height: 17px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    line-height: 14px;
+    white-space: nowrap;
+    overflow: hidden;
+    color: var(--rinch-color-dimmed);
+    border: 1px dashed var(--rinch-color-dark-2);
+    background: repeating-linear-gradient(45deg, rgba(134, 142, 150, 0.10) 0 6px, transparent 6px 12px);
+    cursor: pointer;
+}
+.take-block:hover { border-color: var(--rinch-color-violet-5); color: var(--rinch-color-text); }
+.take-block.heard {
+    cursor: default;
+    color: var(--rinch-color-text);
+    border: 1px solid var(--rinch-color-green-7);
+    background: rgba(81, 207, 102, 0.10);
+}

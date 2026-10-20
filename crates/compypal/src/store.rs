@@ -104,6 +104,7 @@ pub struct Store {
     pub sketch_at_cursor: Signal<bool>,
     /// The track menu in the Sketches view is open.
     pub sketch_menu: Signal<bool>,
+    pub sketch_filter: Signal<crate::sketches::Filter>,
     /// The export menu is open.
     pub export_menu: Signal<bool>,
     /// Notes selected in the piano roll, absolute, on the selected track.
@@ -268,6 +269,7 @@ impl Store {
             sketch_track: Signal::new(None),
             sketch_at_cursor: Signal::new(false),
             sketch_menu: Signal::new(false),
+            sketch_filter: Signal::new(Default::default()),
             export_menu: Signal::new(false),
             note_sel: Signal::new(Vec::new()),
             note_drag: Signal::new(None),
@@ -883,6 +885,82 @@ impl Store {
         msg
     }
 
+    /// Takes a sketch's music out of the song; what it covered is heard
+    /// again. The sketch stays, as not in the song.
+    pub fn take_out_session(self, session: Id) {
+        let name = self.project.with(|p| p.session(session).map(crate::sketches::session_name)).unwrap_or_default();
+        self.edit(&format!("take out {name}"), |p| {
+            p.take_out(session);
+        });
+        self.status.set(format!("Took {name:?} out of the song; it's still in Sketches"));
+    }
+
+    /// Removes a sketch the song doesn't use. Undo brings it back.
+    pub fn remove_session(self, session: Id) {
+        let name = self.project.with(|p| p.session(session).map(crate::sketches::session_name)).unwrap_or_default();
+        self.edit(&format!("remove {name}"), |p| {
+            p.take_out(session);
+            p.sessions.retain(|s| s.id != session);
+        });
+        self.sketch_sel.set(None);
+        self.status.set(format!("Removed {name:?} (Undo brings it back)"));
+    }
+
+    /// The selected track's takes as lanes, and how many rows they need;
+    /// nothing unless the track has alternatives (muted clips).
+    pub fn lanes(self) -> (Vec<LaneBlock>, usize) {
+        let (Some(track), zoom) = (self.selected_track.get(), self.zoom.get()) else { return (Vec::new(), 0) };
+        let px = zoom / PPQ as f64;
+        self.project.with(|p| {
+            let Some(t) = p.track(track) else { return (Vec::new(), 0) };
+            if !t.clips.iter().any(|c| c.muted) {
+                return (Vec::new(), 0);
+            }
+            let mut rows: Vec<Vec<(Tick, Tick)>> = vec![Vec::new()];
+            let mut out = Vec::new();
+            let mut clips: Vec<&Clip> = t.clips.iter().collect();
+            clips.sort_by_key(|c| (c.muted, c.start));
+            for c in clips {
+                let span = (c.start, c.start + c.length);
+                // Heard clips share the top row; each alternative takes the
+                // first row below where it fits.
+                let row = if !c.muted {
+                    0
+                } else {
+                    match (1..rows.len()).find(|&r| rows[r].iter().all(|(a, b)| span.1 <= *a || span.0 >= *b)) {
+                        Some(r) => r,
+                        None => {
+                            rows.push(Vec::new());
+                            rows.len() - 1
+                        }
+                    }
+                };
+                rows[row].push(span);
+                let (left, width) = (c.start as f64 * px, (c.length as f64 * px).max(6.0));
+                out.push(LaneBlock {
+                    key: format!("{}:{row}:{}:{left}:{width}", c.id, c.muted),
+                    clip: c.id,
+                    row,
+                    left,
+                    width,
+                    name: c.name.clone(),
+                    label: if c.muted { format!("{} · use this", c.name) } else { c.name.clone() },
+                    heard: !c.muted,
+                });
+            }
+            (out, rows.len())
+        })
+    }
+
+    /// Makes a clip the one heard over its bars.
+    pub fn prefer_clip(self, clip: Id) {
+        let name = self.project.with(|p| p.tracks.iter().flat_map(|t| &t.clips).find(|c| c.id == clip).map(|c| c.name.clone())).unwrap_or_default();
+        self.edit(&format!("use {name}"), |p| {
+            p.prefer_clip(clip);
+        });
+        self.status.set(format!("{name:?} is heard there now; the other take is kept, muted"));
+    }
+
     /// Makes `session`'s clips the ones heard where they sit.
     pub fn use_session(self, session: Id) {
         let name = self.project.with(|p| p.session(session).map(crate::sketches::session_name)).unwrap_or_default();
@@ -1443,6 +1521,23 @@ fn write_export(name: &str, ext: &str, bytes: &[u8]) -> Result<PathBuf, String> 
 }
 
 pub const ROW: f64 = 12.0;
+/// Height of one row in the roll's take lanes.
+pub const LANE_ROW: f64 = 20.0;
+
+/// A clip in the roll's take lanes: heard ones on the top row, the
+/// alternatives under them below.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LaneBlock {
+    pub key: String,
+    pub clip: Id,
+    pub row: usize,
+    pub left: f64,
+    pub width: f64,
+    pub name: String,
+    /// What the block says: an alternative offers itself.
+    pub label: String,
+    pub heard: bool,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LaneItem {
@@ -1533,6 +1628,9 @@ impl Roll {
         let raw: Vec<Note> = if show_raw {
             t.clips
                 .iter()
+                // Only takes that are heard: a muted one's raw notes would
+                // read as part of the music.
+                .filter(|c| !c.muted)
                 .filter_map(|c| {
                     let s = p.session(c.source_session?)?;
                     // Only this clip's window of the take.

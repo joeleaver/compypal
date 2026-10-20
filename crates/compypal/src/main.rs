@@ -13,7 +13,7 @@ use compypal_core::{Id, Project, gm};
 use chat::AgentPanel;
 use sketches::SketchesView;
 use rinch::prelude::*;
-use store::{ARR_ROW, ROW, Slot, Store, View};
+use store::{ARR_ROW, LANE_ROW, ROW, Slot, Store, View};
 
 /// Width of the key labels down the left of the roll.
 const KEYS: f64 = 64.0;
@@ -363,6 +363,7 @@ fn PianoRoll() -> NodeHandle {
                 class: "roll roll-fixed",
                 style: {|| format!("width: {}px;", roll.get().width + 64.0)},
                 FigureLane {}
+                TakeLanes {}
                 div {
                     class: "ruler",
                     onclick: move || {
@@ -985,6 +986,33 @@ fn InstrumentPicker() -> NodeHandle {
     root
 }
 
+/// The selected track's takes, when it has alternatives: what's heard on
+/// top, what's muted under it. Click an alternative to hear it there.
+#[component]
+fn TakeLanes() -> NodeHandle {
+    let store = use_store::<Store>();
+    let lanes = Memo::new(move || store.lanes());
+    rsx! {
+        div {
+            class: "take-lanes",
+            style: {|| match lanes.get().1 {
+                0 => "display: none;".to_string(),
+                rows => format!("height: {}px;", rows as f64 * LANE_ROW + 4.0),
+            }},
+            div { class: "lane-label", "Takes" }
+            for b in lanes.get().0 {
+                div {
+                    key: b.key.clone(),
+                    class: {if b.heard { "take-block heard" } else { "take-block" }},
+                    style: {format!("left: {}px; top: {}px; width: {}px;", b.left + KEYS, 2.0 + b.row as f64 * LANE_ROW, b.width - 2.0)},
+                    onclick: move || if !b.heard { store.prefer_clip(b.clip) },
+                    {b.label.clone()}
+                }
+            }
+        }
+    }
+}
+
 /// One box per figure, labelled with its chord, above the roll. Click one to
 /// retype its chord; click "+" to continue the music with a new chord.
 #[component]
@@ -1161,7 +1189,8 @@ fn app() -> NodeHandle {
                             .entry((sketch.id, sketch.notes))
                             .or_insert_with(|| sketches::thumb(&j.events(sketch.start - 0.01, sketch.end + 0.01)))
                             .clone();
-                        sketches::Played { sketch, live, thumb }
+                        let hidden = j.is_hidden(sketch.id);
+                        sketches::Played { sketch, live, hidden, thumb }
                     })
                     .collect();
                 if rows != last {

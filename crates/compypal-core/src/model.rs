@@ -76,6 +76,42 @@ impl Project {
         })
     }
 
+    /// Takes a session's music out of the song: its clips go, and whatever
+    /// they had muted is heard again. The session itself stays. Returns how
+    /// many clips went.
+    pub fn take_out(&mut self, session: Id) -> usize {
+        let mut gone = 0;
+        for t in &mut self.tracks {
+            let spans: Vec<(Tick, Tick)> =
+                t.clips.iter().filter(|c| c.source_session == Some(session)).map(|c| (c.start, c.start + c.length)).collect();
+            let ids: Vec<Id> = t.clips.iter().filter(|c| c.source_session == Some(session)).map(|c| c.id).collect();
+            gone += spans.len();
+            t.clips.retain(|c| c.source_session != Some(session));
+            // What these clips muted, exactly, is heard again.
+            for c in t.clips.iter_mut().filter(|c| c.muted_by.is_some_and(|by| ids.contains(&by))) {
+                c.muted = false;
+                c.muted_by = None;
+            }
+            // What was under it comes back only where nothing else is heard,
+            // the newest alternative first: never two takes at once.
+            let mut under: Vec<usize> = (0..t.clips.len())
+                .filter(|&i| {
+                    let c = &t.clips[i];
+                    c.muted && spans.iter().any(|(a, b)| c.start < *b && c.start + c.length > *a)
+                })
+                .collect();
+            under.sort_by_key(|&i| std::cmp::Reverse(t.clips[i].id));
+            for i in under {
+                let (from, to) = (t.clips[i].start, t.clips[i].start + t.clips[i].length);
+                let covered = t.clips.iter().any(|o| !o.muted && o.start < to && o.start + o.length > from && o.absolute_notes().next().is_some());
+                if !covered {
+                    t.clips[i].muted = false;
+                }
+            }
+        }
+        gone
+    }
+
     /// Makes clip `clip` the one heard on its track over its span.
     pub fn prefer_clip(&mut self, clip: Id) -> usize {
         let next = &mut self.next_id;
@@ -243,8 +279,10 @@ impl Track {
         for c in &mut self.clips {
             if c.id == id {
                 c.muted = false;
+                c.muted_by = None;
             } else if c.start < to && c.start + c.length > from && !c.muted && c.absolute_notes().next().is_some() {
                 c.muted = true;
+                c.muted_by = Some(id);
                 muted += 1;
             }
         }
@@ -270,6 +308,10 @@ pub struct Clip {
     /// Not heard: something else was laid over it. Kept as an alternative.
     #[serde(default, skip_serializing_if = "is_false")]
     pub muted: bool,
+    /// The clip whose arrival muted this one: taking that out brings this
+    /// back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub muted_by: Option<Id>,
 }
 
 fn is_zero(t: &Tick) -> bool {
@@ -296,6 +338,7 @@ impl Clip {
             source_session: self.source_session,
             source_offset: self.source_offset + rel,
             muted: self.muted,
+            muted_by: self.muted_by,
         };
         self.notes = before.into_iter().map(|n| Note { duration: n.duration.min(rel - n.start).max(1), ..n }).collect();
         self.length = rel;
@@ -542,6 +585,38 @@ mod tests {
         let track = p.track(t).unwrap();
         assert_eq!(track.absolute_notes().len(), 16);
         assert_eq!(track.muted_notes().len(), 16);
+    }
+
+    #[test]
+    fn taking_a_sketch_out_brings_back_what_it_covered() {
+        let mut p = Project::new("t");
+        let t = p.add_track("Keys", 0);
+        let q = PPQ as Tick;
+        p.track_mut(t).unwrap().clips.push(clip(100, 0, 16 * q, q));
+        let over = Clip { source_session: Some(Id(7)), ..clip(200, 8 * q, 8 * q, q / 2) };
+        p.add_clip_over(t, over);
+        assert_eq!(p.take_out(Id(7)), 1);
+        let track = p.track(t).unwrap();
+        assert_eq!(track.absolute_notes().len(), 16, "all of the old part is heard again");
+        assert!(track.muted_notes().is_empty());
+    }
+
+    #[test]
+    fn taking_out_never_leaves_two_takes_heard() {
+        // Three takes of bars 3-4: A (oldest), B over it, then A preferred
+        // again; then C over both. Taking C out brings back A only.
+        let mut p = Project::new("t");
+        let t = p.add_track("Keys", 0);
+        let q = PPQ as Tick;
+        p.track_mut(t).unwrap().clips.push(Clip { source_session: Some(Id(1)), ..clip(100, 8 * q, 8 * q, q) });
+        p.add_clip_over(t, Clip { source_session: Some(Id(2)), ..clip(200, 8 * q, 8 * q, q) });
+        p.prefer_clip(Id(100));
+        p.add_clip_over(t, Clip { source_session: Some(Id(3)), ..clip(300, 8 * q, 8 * q, q) });
+        p.take_out(Id(3));
+        let heard: Vec<&Clip> = p.track(t).unwrap().clips.iter().filter(|c| !c.muted).collect();
+        assert_eq!(heard.len(), 1, "{heard:?}");
+        assert_eq!(heard[0].id, Id(100), "what was heard before C");
+        assert_eq!(p.track(t).unwrap().absolute_notes().len(), 8);
     }
 
     #[test]
