@@ -26,8 +26,14 @@ fn main() {
     let home = std::env::var("HOME").unwrap_or_default();
     let model = model_path(Some(&std::path::Path::new(&home).join(".local/share/compypal"))).and_then(|p| BasicPitch::load(&p).ok());
     let track = analysis::pitch_track(&samples, RATE);
-    println!("pitch every 100 ms (time, pitch, clarity, dB):");
-    for f in track.iter().step_by(10) {
+    // `transcribe_wav <file> <from> <to>`: every 10 ms frame in that span.
+    let span: Vec<f64> = std::env::args().skip(2).filter_map(|a| a.parse().ok()).collect();
+    let (step, from, to) = match span[..] {
+        [a, b] => (1, a, b),
+        _ => (10, 0.0, f64::INFINITY),
+    };
+    println!("pitch every {} ms (time, pitch, clarity, dB):", step * 10);
+    for f in track.iter().filter(|f| f.t >= from && f.t <= to).step_by(step) {
         let p = f.pitch.map_or("   -  ".to_string(), |p| format!("{p:6.2}"));
         println!("  {:5.2} {p} {:.2} {:5.1}", f.t, f.clarity, f.level);
     }

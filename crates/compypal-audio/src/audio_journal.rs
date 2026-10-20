@@ -43,7 +43,7 @@ pub enum Reading {
 /// Which version of the transcription a transcript was made by. Raise it
 /// when reading changes enough to be worth redoing old recordings: they
 /// are written down again at the next start (the audio stays as it was).
-pub const TRANSCRIPT_VERSION: u32 = 2;
+pub const TRANSCRIPT_VERSION: u32 = 3;
 
 /// A recording, written down.
 #[derive(Clone, Debug, Serialize, Deserialize)]

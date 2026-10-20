@@ -581,10 +581,18 @@ const LINE_LOWEST_HZ: f32 = 70.0;
 const LINE_HIGHEST_HZ: f32 = 1_400.0;
 /// YIN's threshold on the normalised difference: below it, a period.
 const YIN_THRESHOLD: f32 = 0.25;
-/// The longest a voice may leave its note before it's a new one: a note
-/// is held through vibrato and scoops, and only a new pitch held this
-/// long counts as moving on.
-const SETTLE: usize = 6;
+/// What a note costs when cutting a voice's pitch into notes, in
+/// semitone-frames (a frame 1 semitone off its note costs 1): an extra
+/// note must fit the pitch that much better to be worth it. A held note
+/// that wavers stays one note; a step to a new note held a few tenths of
+/// a second pays for itself.
+const NOTE_COST: f32 = 25.0;
+/// A frame further off its note than this costs no more: a scoop or a
+/// slide into a note doesn't make it a different one.
+const FRAME_COST_CAP: f32 = 2.0;
+/// The longest stretch weighed as one note; longer held notes join up
+/// afterwards.
+const LONGEST_PIECE: usize = 300;
 const MIN_LINE_NOTE: f64 = 0.07;
 
 /// One frame of the pitch track.
@@ -700,32 +708,20 @@ pub fn monophony(track: &[PitchFrame]) -> f32 {
 }
 
 /// Notes of one line (a voice, a whistle, a single string) from its pitch
-/// track. A note holds through vibrato and scoops; a new one starts when
-/// the pitch settles a semitone or more away for 60 ms (from where it
-/// left), at a break in the sound, or at an attack in the middle of it
-/// (`onsets`: a consonant, a re-picked string). Its pitch is where it
-/// spent its time; its velocity follows its level.
+/// track. Sounding stretches are cut at breaks in the sound and at onsets
+/// where the level jumps (a consonant, a re-picked string); each stretch
+/// is then cut into the fewest notes that explain its pitch, every note
+/// costing [`NOTE_COST`] and every frame its distance from its note's
+/// semitone (capped). So vibrato, wavering and scoops stay inside a note,
+/// and a note is what the voice dwelt on. Velocity follows the level.
 pub fn line_notes(track: &[PitchFrame], onsets: &[Onset]) -> Vec<HeardNote> {
     let loudest = track.iter().map(|f| f.level).fold(-120.0f32, f32::max);
     let velocity = |level: f32| (40.0 + 87.0 * ((level - (loudest - 30.0)) / 30.0).clamp(0.0, 1.0)) as u8;
-    let mut out = Vec::new();
-    // The note being sung: first frame, its frames' pitches, its peak.
-    let mut current: Option<(usize, Vec<f32>, f32)> = None;
-    let mut away = 0usize;
+    // Sounding stretches, as frame ranges.
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut run_start: Option<usize> = None;
     let mut next_onset = 0;
-    let close = |cur: &mut Option<(usize, Vec<f32>, f32)>, end: f64, out: &mut Vec<HeardNote>| {
-        if let Some((first, pitches, peak)) = cur.take() {
-            let start = track[first].t - LINE_HOP_SECS / 2.0;
-            let mut sorted = pitches.clone();
-            sorted.sort_by(f32::total_cmp);
-            let pitch = sorted[sorted.len() / 2].round().clamp(0.0, 127.0) as u8;
-            if end - start >= MIN_LINE_NOTE {
-                out.push(HeardNote { start, end, pitch, velocity: velocity(peak) });
-            }
-        }
-    };
     for (i, f) in track.iter().enumerate() {
-        let edge = f.t - LINE_HOP_SECS / 2.0;
         // An attack that is one: the sound got louder (a gliding voice
         // makes spectral flux too, but no jump in level).
         let louder = i >= 4 && f.level > track[i - 4..i].iter().map(|r| r.level).fold(f32::MAX, f32::min) + 4.0;
@@ -733,60 +729,76 @@ pub fn line_notes(track: &[PitchFrame], onsets: &[Onset]) -> Vec<HeardNote> {
         while onsets.get(next_onset).is_some_and(|o| o.t <= f.t) {
             next_onset += 1;
         }
-        let Some(p) = f.pitch else {
-            close(&mut current, edge, &mut out);
-            away = 0;
-            continue;
-        };
-        match current.as_mut() {
-            Some((first, pitches, _)) if attack && i - *first > 3 => {
-                let _ = pitches;
-                close(&mut current, edge, &mut out);
-                current = Some((i, vec![p], f.level));
+        match (f.pitch, run_start) {
+            (None, Some(a)) => {
+                runs.push((a, i));
+                run_start = None;
             }
-            Some((first, pitches, peak)) => {
-                let mut held: Vec<f32> = pitches.clone();
-                held.sort_by(f32::total_cmp);
-                let centre = held[held.len() / 2];
-                if (p - centre).abs() < 0.75 {
-                    pitches.push(p);
-                    *peak = peak.max(f.level);
-                    away = 0;
-                } else {
-                    away += 1;
-                    // Settled somewhere new: the new note starts where the
-                    // voice left the old one.
-                    // The last 60 ms agree on a pitch: the new note starts
-                    // where the voice reached it.
-                    let last = &track[i + 1 - SETTLE.min(away)..=i];
-                    let mut there: Vec<f32> = last.iter().filter_map(|r| r.pitch).collect();
-                    there.sort_by(f32::total_cmp);
-                    let mid = there.get(there.len() / 2).copied().unwrap_or(p);
-                    let settled = away >= SETTLE && there.len() == last.len() && there.iter().all(|q| (q - mid).abs() < 0.75);
-                    if settled {
-                        let mut from = i;
-                        while from > i + 1 - away && track[from - 1].pitch.is_some_and(|q| (q - mid).abs() < 0.75) {
-                            from -= 1;
-                        }
-                        let _ = first;
-                        close(&mut current, track[from].t - LINE_HOP_SECS / 2.0, &mut out);
-                        let recent = &track[from..=i];
-                        let pitches: Vec<f32> = recent.iter().filter_map(|r| r.pitch).collect();
-                        let peak = recent.iter().map(|r| r.level).fold(-120.0f32, f32::max);
-                        current = Some((from, pitches, peak));
-                        away = 0;
-                    } else if away >= SETTLE * 3 {
-                        // Wandering, not settling (a long slide): stop here.
-                        close(&mut current, edge, &mut out);
-                        away = 0;
-                    }
-                }
+            (Some(_), Some(a)) if attack && i - a > 3 => {
+                runs.push((a, i));
+                run_start = Some(i);
             }
-            None => current = Some((i, vec![p], f.level)),
+            (Some(_), None) => run_start = Some(i),
+            _ => {}
         }
     }
-    let end = track.last().map_or(0.0, |f| f.t + LINE_HOP_SECS / 2.0);
-    close(&mut current, end, &mut out);
+    if let Some(a) = run_start {
+        runs.push((a, track.len()));
+    }
+    let half = LINE_HOP_SECS / 2.0;
+    let mut out: Vec<HeardNote> = Vec::new();
+    for (a, b) in runs {
+        let pitches: Vec<f32> = track[a..b].iter().map(|f| f.pitch.unwrap_or(0.0)).collect();
+        let n = pitches.len();
+        // best[j]: cheapest way to cut the first j frames; from[j]: where
+        // its last note starts, and that note's pitch.
+        let mut best = vec![f32::INFINITY; n + 1];
+        let mut from = vec![(0usize, 0u8); n + 1];
+        best[0] = 0.0;
+        for i in 0..n {
+            if !best[i].is_finite() {
+                continue;
+            }
+            let mut sorted: Vec<f32> = Vec::with_capacity(LONGEST_PIECE);
+            for j in i + 1..=(i + LONGEST_PIECE).min(n) {
+                let p = pitches[j - 1];
+                let at = sorted.partition_point(|q| *q < p);
+                sorted.insert(at, p);
+                let note = sorted[sorted.len() / 2].round();
+                let fit: f32 = sorted.iter().map(|q| (q - note).abs().min(FRAME_COST_CAP)).sum();
+                let cost = best[i] + fit + NOTE_COST;
+                if cost < best[j] {
+                    best[j] = cost;
+                    from[j] = (i, note.clamp(0.0, 127.0) as u8);
+                }
+            }
+        }
+        let mut cuts: Vec<(usize, usize, u8)> = Vec::new();
+        let mut j = n;
+        while j > 0 {
+            let (i, note) = from[j];
+            cuts.push((i, j, note));
+            j = i;
+        }
+        cuts.reverse();
+        let first = out.len();
+        for (i, j, pitch) in cuts {
+            let start = track[a + i].t - half;
+            let end = track[a + j - 1].t + half;
+            let peak = track[a + i..a + j].iter().map(|f| f.level).fold(-120.0f32, f32::max);
+            let len = out.len();
+            match out.last_mut() {
+                // The same note going on (a long one weighed in pieces);
+                // not across an attack, which starts a stretch of its own.
+                Some(last) if len > first && last.pitch == pitch => {
+                    last.end = end;
+                    last.velocity = last.velocity.max(velocity(peak));
+                }
+                _ => out.push(HeardNote { start, end, pitch, velocity: velocity(peak) }),
+            }
+        }
+    }
+    out.retain(|n| n.end - n.start >= MIN_LINE_NOTE);
     out
 }
 
@@ -1061,5 +1073,24 @@ pub(crate) mod tests {
         let notes = line(&plucked, RATE).notes;
         assert_eq!(notes.iter().map(|n| n.pitch).collect::<Vec<_>>(), [57, 57], "{notes:?}");
         assert!((notes[1].start - 0.9).abs() < 0.05, "{notes:?}");
+    }
+
+    #[test]
+    fn a_wavering_held_note_is_one_note() {
+        // A held E3 that wavers a semitone either way, twice a second
+        // (wider and slower than vibrato), then a real step up to G3.
+        let rate = RATE;
+        let len = (1.6 * rate as f64) as usize;
+        let mut audio = vec![0.0f32; len + rate as usize / 2];
+        let mut phase = 0.0f64;
+        for (i, s) in audio.iter_mut().enumerate().take(len) {
+            let t = i as f64 / rate as f64;
+            let pitch = if t < 1.1 { 52.0 + 1.0 * (std::f64::consts::TAU * 2.0 * t).sin() } else { 55.0 };
+            phase += std::f64::consts::TAU * 440.0 * 2f64.powf((pitch - 69.0) / 12.0) / rate as f64;
+            let fade = (t / 0.05).min(1.0) * ((1.6 - t) / 0.05).min(1.0);
+            *s = (0.2 * fade * (1..=5).map(|h| (phase * h as f64).sin() / (h * h) as f64).sum::<f64>()) as f32;
+        }
+        let notes = line(&audio, rate).notes;
+        assert_eq!(notes.iter().map(|n| n.pitch).collect::<Vec<_>>(), [52, 55], "{notes:?}");
     }
 }
