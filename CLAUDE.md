@@ -275,6 +275,10 @@ mic hears the room.
   their PipeWire names, "System input" is the default source. Output
   stays on ALSA (`output_host`), whose timestamps the latency correction
   was measured against. Without PipeWire it falls back to ALSA cards.
+- `AudioIn::keep_open` reopens the picked input by name when its stream
+  stops delivering for 2 s: cpal pins a PipeWire stream to the node id it
+  started on (and marks it don't-reconnect), and the node is re-created
+  when the interface is replugged or its settings change.
 
 ## Persistence
 

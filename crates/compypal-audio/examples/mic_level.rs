@@ -14,13 +14,25 @@ fn main() {
         eprintln!("no input matching {want:?}");
         return;
     };
-    let input = AudioIn::new(None);
+    // `mic_level <name> engine`: with the synth's output running too, as
+    // in the app.
+    let _engine = (std::env::args().nth(2).as_deref() == Some("engine")).then(|| compypal_audio::Engine::start().unwrap());
+    let input: &'static AudioIn = Box::leak(Box::new(AudioIn::new(None)));
+    input.keep_open();
+    // `mic_level <name> again`: open, close and open again, as the app
+    // does when an input is picked twice.
+    if std::env::args().nth(2).as_deref() == Some("again") {
+        input.connect(&d.id).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        input.disconnect();
+    }
     if let Err(e) = input.connect(&d.id) {
         eprintln!("{}: {e}", d.name);
         return;
     }
     println!("hearing {}", d.name);
-    for _ in 0..25 {
+    let seconds: usize = std::env::var("MIC_LEVEL_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    for _ in 0..seconds * 5 {
         std::thread::sleep(std::time::Duration::from_millis(200));
         let db = 20.0 * (input.level() + 1e-9).log10();
         println!("{db:6.1} dBFS {}", "#".repeat(((db + 80.0).max(0.0) / 2.0) as usize));

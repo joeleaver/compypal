@@ -3,7 +3,7 @@
 //! level meter moves; what it hears goes to the journal, which keeps it
 //! while listening, at [`RATE`] mono.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 
@@ -37,7 +37,8 @@ pub fn devices() -> Vec<InputDevice> {
             "pipewire" => {
                 if raw == "input_default" {
                     out.insert(0, InputDevice { id, name: "System input".into() });
-                } else if raw.starts_with("alsa_input") || !(raw.starts_with("alsa_output") || raw.contains("sink") || raw == "output_default") {
+                } else if ["alsa_input", "bluez_input"].iter().any(|p| raw.starts_with(p)) || (raw.contains("source") && !raw.contains("sink")) {
+                    // Sources only: not outputs, nor other apps' streams.
                     out.push(InputDevice { id, name });
                 }
             }
@@ -78,19 +79,34 @@ pub fn default_device(remembered: Option<&str>) -> Option<String> {
 
 pub struct AudioIn {
     journal: Option<Arc<Journal>>,
+    /// The input picked, kept while it's gone (unplugged, or re-created by
+    /// the sound server) so it can be reopened.
+    wanted: Mutex<Option<String>>,
     /// The stream's thread, told to stop through this.
-    running: Mutex<Option<(String, Sender<()>)>>,
+    running: Mutex<Option<Sender<()>>>,
     /// Peak level of the latest block, as f32 bits (linear, 0..1).
     level: Arc<AtomicU32>,
+    /// When audio last arrived (unix seconds, f64 bits).
+    heard: Arc<AtomicU64>,
 }
+
+/// Silence from the stream itself (no callbacks, not quiet audio) this
+/// long means it has lost its device.
+const DEAD_AFTER: f64 = 2.0;
 
 impl AudioIn {
     pub fn new(journal: Option<Arc<Journal>>) -> Self {
-        Self { journal, running: Mutex::new(None), level: Arc::new(AtomicU32::new(0)) }
+        Self {
+            journal,
+            wanted: Mutex::new(None),
+            running: Mutex::new(None),
+            level: Arc::new(AtomicU32::new(0)),
+            heard: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     pub fn connected(&self) -> Option<String> {
-        self.running.lock().unwrap().as_ref().map(|(id, _)| id.clone())
+        self.wanted.lock().unwrap().clone()
     }
 
     /// Peak level of the latest block, 0..1.
@@ -98,8 +114,14 @@ impl AudioIn {
         f32::from_bits(self.level.load(Ordering::Relaxed))
     }
 
+    /// Stops hearing the input, and forgets it.
     pub fn disconnect(&self) {
-        if let Some((_, stop)) = self.running.lock().unwrap().take() {
+        *self.wanted.lock().unwrap() = None;
+        self.stop();
+    }
+
+    fn stop(&self) {
+        if let Some(stop) = self.running.lock().unwrap().take() {
             let _ = stop.send(());
         }
         self.level.store(0, Ordering::Relaxed);
@@ -108,15 +130,22 @@ impl AudioIn {
     /// Opens device `id` (from [`devices`]) and starts hearing it.
     pub fn connect(&self, id: &str) -> Result<(), String> {
         self.disconnect();
+        self.start(id)?;
+        *self.wanted.lock().unwrap() = Some(id.to_string());
+        Ok(())
+    }
+
+    fn start(&self, id: &str) -> Result<(), String> {
+        self.stop();
         let (ready_tx, ready_rx) = channel::<Result<(), String>>();
         let (stop_tx, stop_rx) = channel::<()>();
-        let (id2, level, journal) = (id.to_string(), self.level.clone(), self.journal.clone());
+        let (id2, level, heard, journal) = (id.to_string(), self.level.clone(), self.heard.clone(), self.journal.clone());
         // cpal streams aren't Send everywhere: one thread opens the stream
         // and holds it until told to stop.
         std::thread::Builder::new()
             .name("compypal-mic".into())
             .spawn(move || {
-                let opened = open(&id2, level, journal);
+                let opened = open(&id2, level, heard, journal);
                 match opened {
                     Ok(stream) => {
                         let _ = ready_tx.send(Ok(()));
@@ -130,12 +159,44 @@ impl AudioIn {
             })
             .map_err(|e| e.to_string())?;
         ready_rx.recv().map_err(|_| "audio input thread died".to_string())??;
-        *self.running.lock().unwrap() = Some((id.to_string(), stop_tx));
+        // A grace period before its silence counts.
+        self.heard.store(crate::journal::now().to_bits(), Ordering::Relaxed);
+        *self.running.lock().unwrap() = Some(stop_tx);
         Ok(())
+    }
+
+    /// Keeps the picked input open: when its stream stops delivering (the
+    /// device was unplugged, or the sound server re-created it and the
+    /// stream is left pointing at the old one), it's reopened by name, as
+    /// soon as the device is back.
+    pub fn keep_open(&'static self) {
+        std::thread::Builder::new()
+            .name("compypal-mic-watch".into())
+            .spawn(move || {
+                let mut said = false;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let Some(id) = self.connected() else { continue };
+                    let last = f64::from_bits(self.heard.load(Ordering::Relaxed));
+                    if crate::journal::now() - last < DEAD_AFTER {
+                        said = false;
+                        continue;
+                    }
+                    match self.start(&id) {
+                        Ok(()) => eprintln!("audio input: reopened {id}"),
+                        Err(e) if !said => {
+                            eprintln!("audio input: {id} is gone ({e}); waiting for it");
+                            said = true;
+                        }
+                        Err(_) => {}
+                    }
+                }
+            })
+            .expect("audio input watcher");
     }
 }
 
-fn open(id: &str, level: Arc<AtomicU32>, journal: Option<Arc<Journal>>) -> Result<cpal::Stream, String> {
+fn open(id: &str, level: Arc<AtomicU32>, heard: Arc<AtomicU64>, journal: Option<Arc<Journal>>) -> Result<cpal::Stream, String> {
     let host = cpal::default_host();
     let parsed: cpal::DeviceId = id.parse().map_err(|e: cpal::Error| e.to_string())?;
     let device = host.device_by_id(&parsed).ok_or_else(|| format!("no audio input {id}"))?;
@@ -143,17 +204,23 @@ fn open(id: &str, level: Arc<AtomicU32>, journal: Option<Arc<Journal>>) -> Resul
     let format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
     let stream = match format {
-        cpal::SampleFormat::F32 => build::<f32>(&device, &config, level, journal),
-        cpal::SampleFormat::I16 => build::<i16>(&device, &config, level, journal),
-        cpal::SampleFormat::I32 => build::<i32>(&device, &config, level, journal),
-        cpal::SampleFormat::U16 => build::<u16>(&device, &config, level, journal),
+        cpal::SampleFormat::F32 => build::<f32>(&device, &config, level, heard.clone(), journal.clone()),
+        cpal::SampleFormat::I16 => build::<i16>(&device, &config, level, heard.clone(), journal.clone()),
+        cpal::SampleFormat::I32 => build::<i32>(&device, &config, level, heard.clone(), journal.clone()),
+        cpal::SampleFormat::U16 => build::<u16>(&device, &config, level, heard.clone(), journal.clone()),
         other => return Err(format!("unsupported input format {other}")),
     }?;
     stream.play().map_err(|e| e.to_string())?;
     Ok(stream)
 }
 
-fn build<T>(device: &cpal::Device, config: &cpal::StreamConfig, level: Arc<AtomicU32>, journal: Option<Arc<Journal>>) -> Result<cpal::Stream, String>
+fn build<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    level: Arc<AtomicU32>,
+    heard: Arc<AtomicU64>,
+    journal: Option<Arc<Journal>>,
+) -> Result<cpal::Stream, String>
 where
     T: cpal::SizedSample,
     f32: cpal::FromSample<T>,
@@ -171,6 +238,7 @@ where
             *config,
             move |data: &[T], _: &cpal::InputCallbackInfo| {
                 let now = crate::journal::now();
+                heard.store(now.to_bits(), Ordering::Relaxed);
                 // Mixed to mono: a guitar on one input of two is heard at
                 // half level, which the gate doesn't mind.
                 mono.clear();

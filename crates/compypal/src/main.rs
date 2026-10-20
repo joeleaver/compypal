@@ -1191,6 +1191,7 @@ fn app() -> NodeHandle {
     // A microphone or interface, for instruments without MIDI. Off until
     // one is picked (or named in COMPYPAL_AUDIO_IN): a mic hears the room.
     let audio_in: &'static compypal_audio::mic::AudioIn = Box::leak(Box::new(compypal_audio::mic::AudioIn::new(journal.cloned())));
+    audio_in.keep_open();
     let (project, stem) = autosave::open_initial();
     let store = create_store(Store::new(project, engine, Some(midi), journal.map(|j| &**j), Some(audio_in), stem));
     {
