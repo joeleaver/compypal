@@ -5,6 +5,11 @@ use serde_json::{Value, json};
 /// Runs a tool call somewhere that can touch the app, and waits for it.
 pub trait Dispatch: Send + Sync + 'static {
     fn call_tool(&self, name: &str, args: Value) -> Result<String, String>;
+
+    /// The project as it stands, for resources; `None` if there's no app.
+    fn project(&self) -> Option<compypal_core::Project> {
+        None
+    }
 }
 
 const INSTRUCTIONS: &str = "compypal is a MIDI composer. The user plays ideas into it from a \
@@ -29,7 +34,7 @@ pub fn handle(msg: &Value, dispatch: &dyn Dispatch) -> Option<Value> {
                 .unwrap_or("2025-06-18");
             Ok(json!({
                 "protocolVersion": version,
-                "capabilities": {"tools": {"listChanged": false}},
+                "capabilities": {"tools": {"listChanged": false}, "resources": {"listChanged": false}},
                 "serverInfo": {"name": "compypal", "version": env!("CARGO_PKG_VERSION")},
                 "instructions": INSTRUCTIONS,
             }))
@@ -45,7 +50,14 @@ pub fn handle(msg: &Value, dispatch: &dyn Dispatch) -> Option<Value> {
             };
             Ok(json!({"content": [{"type": "text", "text": text}], "isError": is_error}))
         }
-        "resources/list" => Ok(json!({"resources": []})),
+        "resources/list" => Ok(json!({"resources": dispatch.project().map(|p| crate::resources::list(&p)).unwrap_or_default()})),
+        "resources/read" => {
+            let uri = msg.pointer("/params/uri").and_then(Value::as_str).unwrap_or("");
+            match dispatch.project().ok_or("compypal is still starting".to_string()).and_then(|p| crate::resources::read(&p, uri)) {
+                Ok((mime, text)) => Ok(json!({"contents": [{"uri": uri, "mimeType": mime, "text": text}]})),
+                Err(e) => Err(json!({"code": -32002, "message": e})),
+            }
+        }
         "prompts/list" => Ok(json!({"prompts": []})),
         other => Err(json!({"code": -32601, "message": format!("method not found: {other}")})),
     };

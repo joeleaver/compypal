@@ -150,6 +150,14 @@ impl Dispatch for UiDispatch {
         });
         rx.recv_timeout(Duration::from_secs(30)).unwrap_or_else(|_| Err("compypal didn't answer in time".into()))
     }
+
+    fn project(&self) -> Option<Project> {
+        let (tx, rx) = channel();
+        run_on_main_thread(move || {
+            let _ = tx.send(STORE.with(Cell::get).map(|s| s.project.get()));
+        });
+        rx.recv_timeout(Duration::from_secs(10)).ok().flatten()
+    }
 }
 
 /// Runs a tool from the UI, exactly as the agent would.

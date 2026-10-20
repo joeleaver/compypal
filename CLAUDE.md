@@ -163,6 +163,8 @@ the song goes through MCP tools, whichever way it's connected:
   named section). Tools that take bars also take `section: "Chorus"` or
   `selection: true`; `get_selection`, the panel and the `/ide` push share
   `tools::selection_text`.
+- Resources (`resources.rs`): `compypal://song.abc` and
+  `compypal://track/<id>.abc`, read through `Dispatch::project()`.
 - Add tools in `compypal-mcp/src/tools.rs`: schema in `list()`, a match arm
   in `call()`, a test against `MemoryApp`. Keep answers short, positional
   (`bar.beat.tick`), and in note names.
@@ -240,7 +242,7 @@ creates projects; the agent has `list_projects` and `open_project`.
 1. ~~Audio~~ (done), with playhead follow and loop ranges.
 2. ~~Recording~~ (done). Follow-ups listed under Recording.
 3. ~~Agent / music IDE~~ (done), with an in-app agent panel for any ACP
-   agent or Claude Code. Follow-ups: MCP resources for ABC, `session/load`
+   agent or Claude Code. Follow-ups: `session/load`
    to resume an ACP conversation, rendering replies as Markdown.
 4. ~~Arranger view~~ (done): sections, clip rows, bar selection, duplicate /
    insert / delete bars (`core::arrange`), section naming.

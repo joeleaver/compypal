@@ -8,6 +8,7 @@ pub mod agent;
 pub mod http;
 pub mod ide;
 pub mod protocol;
+pub mod resources;
 pub mod tools;
 
 pub use protocol::Dispatch;
