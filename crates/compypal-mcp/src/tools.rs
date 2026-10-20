@@ -963,8 +963,25 @@ fn get_session(app: &mut dyn App, args: &Value) -> ToolResult {
         s.click_bpm.map_or("free time".into(), |b| format!("{b:.0}")),
         if imported.pickup_bars > 0 { format!(", with {} pickup bar(s)", imported.pickup_bars) } else { String::new() }
     );
+    // Did the playing keep to the click? A take a few BPM off it drifts
+    // against every grid, which no amount of quantizing hides.
+    if let (Some(click), Some(t)) = (s.click_bpm, jam::estimate_tempo(&jam::onsets(&s.events))) {
+        // The estimate may land on half or double time; take the reading
+        // nearest the click.
+        let played = [t.bpm / 2.0, t.bpm, t.bpm * 2.0].into_iter().min_by(|a, b| (a - click).abs().total_cmp(&(b - click).abs())).unwrap_or(t.bpm);
+        let off = (played - click) / click;
+        if t.confidence >= 0.35 && off.abs() >= 0.03 {
+            out.push_str(&format!(
+                "\nPulse: played at about {played:.0} BPM against a {click:.0} BPM click ({}), so it drifts against the grid. \
+                 Quantizing pulls it back bar by bar; to keep the feel, change the song's tempo to {played:.0} first.\n",
+                if off < 0.0 { "slower" } else { "faster" }
+            ));
+        } else if t.confidence >= 0.35 {
+            out.push_str(&format!("\nPulse: steady with the {click:.0} BPM click.\n"));
+        }
+    }
     out.push_str("\nTiming (ticks; 960 per beat; + means late):\n");
-    for (name, grid) in [("1/8", q / 2), ("1/16", q / 4)] {
+    for (name, grid) in [("1/8", q / 2), ("1/16", q / 4), ("1/8t", q / 3)] {
         let r = cleanup::timing_report(&notes, grid);
         out.push_str(&format!(
             "  vs {name}: mean distance {:.0}, mean offset {:+.0}, {:.0}% within a 1/64, offbeat lag {:.2} of a step\n",
@@ -1654,6 +1671,17 @@ mod tests {
         let s = run(&mut app, "get_session", json!({}));
         assert!(s.contains("Suspected mistakes (3)"), "{s}");
         assert!(s.contains("C#4 vel 22"), "{s}");
+    }
+
+    #[test]
+    fn session_report_compares_the_pulse_with_the_click() {
+        let mut app = demo();
+        let s = run(&mut app, "get_session", json!({}));
+        assert!(s.contains("steady with the 100 BPM click"), "{s}");
+        // The same playing against a faster click drifts.
+        app.project.sessions[0].click_bpm = Some(120.0);
+        let s = run(&mut app, "get_session", json!({}));
+        assert!(s.contains("played at about 100 BPM against a 120 BPM click (slower)"), "{s}");
     }
 
     #[test]

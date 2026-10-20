@@ -15,6 +15,7 @@ pub mod acp;
 pub mod bridge;
 pub mod claude;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -164,6 +165,16 @@ pub fn find_program(program: &str) -> Option<PathBuf> {
         return p.is_file().then(|| p.to_path_buf());
     }
     std::env::split_paths(&std::env::var_os("PATH")?).map(|dir| dir.join(program)).find(|c| c.is_file())
+}
+
+/// With `COMPYPAL_AGENT_LOG=<file>`, every protocol message both ways is appended
+/// there: the way to see what an agent actually says.
+pub(crate) fn log(dir: &str, line: &str) {
+    if let Some(path) = std::env::var_os("COMPYPAL_AGENT_LOG")
+        && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path)
+    {
+        let _ = writeln!(f, "{dir} {line}");
+    }
 }
 
 /// What a session needs from the app.

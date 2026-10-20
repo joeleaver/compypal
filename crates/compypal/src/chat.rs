@@ -28,7 +28,9 @@ Use the compypal MCP tools to read and change the song: your edits appear in \
 the app as you make them, and the user can undo each one. A message may start \
 with a <selection> block saying what the user has selected; \"this\" means that. \
 Answer briefly and musically: positions as bar.beat, pitches as note names, \
-chords as symbols. Don't describe tool calls the user can already see.";
+chords as symbols. The panel is narrow: two or three short sentences unless \
+the user asks for more, no headings or tables. Don't describe tool calls \
+the user can already see.";
 
 /// Whether keys are going into the message box: shortcuts keep out of the
 /// way then, as they do for the popovers.
@@ -297,7 +299,14 @@ fn rows(chat: &Chat) -> Vec<Row> {
 fn plain(md: &str) -> String {
     md.lines()
         .filter(|l| !l.trim_start().starts_with("```"))
+        // A table's rule row ("|---|:--|") carries nothing.
+        .filter(|l| !(l.trim_start().starts_with('|') && l.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))))
         .map(|l| {
+            // A table row reads as its cells in a line.
+            if let Some(row) = l.trim().strip_prefix('|') {
+                let cells: Vec<&str> = row.trim_end_matches('|').split('|').map(str::trim).collect();
+                return cells.join("  ·  ").replace("**", "").replace('`', "");
+            }
             let l = l.trim_start_matches('#').trim_start_matches(' ');
             let l = match l.strip_prefix("- ").or_else(|| l.strip_prefix("* ")) {
                 Some(rest) => format!("• {rest}"),
@@ -568,4 +577,15 @@ fn AgentMenu() -> NodeHandle {
         Rc::new(move || store.agent_menu.set(false)),
     );
     root
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plain;
+
+    #[test]
+    fn markdown_reads_as_text() {
+        let md = "**Done.** Here:\n\n| Bars | Chord |\n|---|:--|\n| 5 | `C` |\n- one\n## Next";
+        assert_eq!(plain(md), "Done. Here:\n\nBars  ·  Chord\n5  ·  C\n• one\nNext");
+    }
 }

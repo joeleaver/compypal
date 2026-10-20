@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 
 use super::claude::{exit_reason, kill_group, last_line_of, own_group};
-use super::{Ask, Backend, Choice, ChoiceKind, Event, Options, SERVER, content_text, first_line, short_tool, tool_detail};
+use super::{log, Ask, Backend, Choice, ChoiceKind, Event, Options, SERVER, content_text, first_line, short_tool, tool_detail};
 
 pub const PROTOCOL_VERSION: u64 = 1;
 
@@ -46,16 +46,6 @@ struct Conn {
     out: Mutex<ChildStdin>,
     state: Mutex<State>,
     opts: Options,
-}
-
-/// With `COMPYPAL_AGENT_LOG=<file>`, every message both ways is appended
-/// there: the way to see what an agent actually says.
-fn log(dir: &str, line: &str) {
-    if let Some(path) = std::env::var_os("COMPYPAL_AGENT_LOG")
-        && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path)
-    {
-        let _ = writeln!(f, "{dir} {line}");
-    }
 }
 
 impl Conn {

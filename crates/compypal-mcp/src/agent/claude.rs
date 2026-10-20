@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
-use super::{Ask, Backend, Choice, ChoiceKind, Event, Options, SERVER, content_text, first_line, short_tool, tool_detail};
+use super::{log, Ask, Backend, Choice, ChoiceKind, Event, Options, SERVER, content_text, first_line, short_tool, tool_detail};
 
 /// Tools that are plumbing rather than work: loading tool schemas, keeping
 /// a todo list.
@@ -128,6 +128,7 @@ impl ClaudeCode {
             let child = child.clone();
             std::thread::spawn(move || {
                 for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    log("<", &line);
                     for e in parse(&line) {
                         sink(e);
                     }
@@ -141,6 +142,7 @@ impl ClaudeCode {
     }
 
     fn write(&self, v: Value) -> std::io::Result<()> {
+        log(">", &v.to_string());
         let mut w = self.stdin.lock().unwrap();
         writeln!(w, "{v}")?;
         w.flush()
