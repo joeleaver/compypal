@@ -44,3 +44,19 @@ opt-level = 3
 
 [profile.dev.package.rustysynth]
 opt-level = 3
+
+# Transcribing audio sketches runs a network; unoptimized it crawls.
+[profile.dev.package.tract-core]
+opt-level = 3
+[profile.dev.package.tract-linalg]
+opt-level = 3
+[profile.dev.package.tract-onnx]
+opt-level = 3
+[profile.dev.package.tract-hir]
+opt-level = 3
+[profile.dev.package.tract-data]
+opt-level = 3
+[profile.dev.package.realfft]
+opt-level = 3
+[profile.dev.package.rustfft]
+opt-level = 3

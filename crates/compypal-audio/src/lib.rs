@@ -6,8 +6,11 @@
 //! loaded in the background, then switches over.
 
 pub mod analysis;
+pub mod audio_journal;
+pub mod basic_pitch;
 pub mod input;
 pub mod journal;
+pub mod mic;
 pub mod player;
 pub mod schedule;
 pub mod synth;

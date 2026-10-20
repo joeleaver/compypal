@@ -41,7 +41,7 @@ pub struct TempoGuess {
 /// Finds a beat grid in free playing from note onsets (seconds) and
 /// velocities. For each tempo from 50 to 200 BPM it asks two things: do
 /// the notes sit on this tempo's eighth-note grid, and do the accents
-/// (notes louder than average) fall on its beats? The grid settles the
+/// (notes louder than average) fall on its beats, or on every other beat? The grid settles the
 /// speed of the pulse; the accents settle which level of it is the beat,
 /// the usual half/double-time ambiguity. A gentle preference for moderate
 /// tempos breaks remaining ties.
@@ -70,7 +70,9 @@ pub fn estimate_tempo(onsets: &[(f64, u8)]) -> Option<TempoGuess> {
     while bpm <= 200.0 {
         let beat = 60.0 / bpm;
         let (grid, _) = align(beat / 2.0, &plain, n);
-        let (acc, _) = align(beat, &accent, accent_total);
+        // Accents on every beat, or on every other one (a strummer's 1
+        // and 3, with the 2 and 4 lighter).
+        let acc = align(beat, &accent, accent_total).0.max(align(2.0 * beat, &accent, accent_total).0);
         let prior = -0.12 * (bpm / 105.0).log2().powi(2);
         let score = 0.6 * grid + 0.4 * acc + prior;
         if best.is_none_or(|b| score > b.0) {

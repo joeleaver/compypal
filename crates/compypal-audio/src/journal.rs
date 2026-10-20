@@ -8,17 +8,22 @@
 //! `journal/<day>.jsonl` (one [`RawEvent`] per line, unix-time `t`), and
 //! `journal/sketches.jsonl` (one [`Sketch`] per line). An older
 //! `jams.jsonl` (a summary per whole jam) is split into sketches once.
+//! Audio from a microphone is kept under `journal/audio/` and turns into
+//! sketches once it's written down ([`crate::audio_journal`]).
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use compypal_core::jam::{self, GAP_SECONDS, Sketch};
-use compypal_core::{RawEvent, RawMsg};
+use compypal_core::{AudioRef, RawEvent, RawMsg};
+
+use crate::audio_journal::{self, Chunk, Transcript};
 
 pub fn now() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
@@ -34,18 +39,24 @@ fn day_file(dir: &Path, day: i64) -> PathBuf {
     dir.join(format!("{day}.jsonl"))
 }
 
-struct State {
+pub struct State {
     /// Events of the jam in progress, if any.
     current: Vec<RawEvent>,
-    index: Vec<Sketch>,
+    pub(crate) index: Vec<Sketch>,
     /// Sketches put out of sight, by id. Nothing is deleted.
     hidden: Vec<u64>,
+    /// The recording in progress: file, start, when it was last loud.
+    pub(crate) audio_live: Option<(u64, f64, f64)>,
+    /// Recordings being written down: file, start, end.
+    pub(crate) audio_pending: Vec<(u64, f64, f64)>,
+    pub(crate) transcripts: HashMap<u64, Arc<Transcript>>,
 }
 
 pub struct Journal {
     dir: PathBuf,
     listening: AtomicBool,
     tx: Mutex<Sender<RawEvent>>,
+    audio_tx: Mutex<Sender<Chunk>>,
     state: Arc<Mutex<State>>,
 }
 
@@ -56,11 +67,35 @@ impl Journal {
         std::fs::create_dir_all(&dir)?;
         let index = load_index(&dir);
         let hidden = std::fs::read_to_string(dir.join("hidden.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-        let state = Arc::new(Mutex::new(State { current: Vec::new(), index, hidden }));
+        let state = Arc::new(Mutex::new(State {
+            current: Vec::new(),
+            index,
+            hidden,
+            audio_live: None,
+            audio_pending: Vec::new(),
+            transcripts: HashMap::new(),
+        }));
         let (tx, rx) = channel();
         let (dir2, state2) = (dir.clone(), state.clone());
         std::thread::Builder::new().name("compypal-journal".into()).spawn(move || writer(dir2, rx, state2))?;
-        Ok(Arc::new(Self { dir, listening: AtomicBool::new(false), tx: Mutex::new(tx), state }))
+
+        let audio = dir.join("audio");
+        std::fs::create_dir_all(&audio)?;
+        let (jobs_tx, jobs_rx) = channel();
+        for job in audio_journal::unfinished(&audio) {
+            let _ = jobs_tx.send(job);
+        }
+        let (audio_tx, audio_rx) = channel();
+        let (audio2, state2) = (audio.clone(), state.clone());
+        std::thread::Builder::new()
+            .name("compypal-journal-audio".into())
+            .spawn(move || audio_journal::writer(audio2, audio_rx, state2, jobs_tx))?;
+        let (audio2, state2, index_path) = (audio.clone(), state.clone(), dir.join("sketches.jsonl"));
+        let model = crate::basic_pitch::model_path(dir.parent());
+        std::thread::Builder::new()
+            .name("compypal-transcribe".into())
+            .spawn(move || audio_journal::transcriber(audio2, index_path, jobs_rx, state2, model))?;
+        Ok(Arc::new(Self { dir, listening: AtomicBool::new(false), tx: Mutex::new(tx), audio_tx: Mutex::new(audio_tx), state }))
     }
 
     pub fn set_listening(&self, on: bool) {
@@ -78,12 +113,42 @@ impl Journal {
         }
     }
 
+    /// Records audio heard from the input, `t` the unix time of its first
+    /// sample, at [`crate::analysis::RATE`].
+    pub fn log_audio(&self, t: f64, samples: Vec<f32>) {
+        if self.listening() {
+            let _ = self.audio_tx.lock().unwrap().send(Chunk { t, samples });
+        }
+    }
+
     /// Sketches, newest first. Those of the jam still going come first: all
     /// but its last are over (a pause ended them); the last, if it has
-    /// enough notes, is `live`.
+    /// enough notes, is `live`. A recording still going, or still being
+    /// written down, is listed as a sketch with no notes yet (`live` while
+    /// it's going).
     pub fn sketches(&self) -> Vec<(Sketch, bool)> {
         let st = self.state.lock().unwrap();
         let mut out: Vec<(Sketch, bool)> = Vec::new();
+        let waiting = |file: u64, start: f64, end: f64| Sketch {
+            id: file,
+            start,
+            end,
+            notes: 0,
+            lowest: 0,
+            highest: 0,
+            mean_velocity: 0,
+            tempo: None,
+            key: None,
+            chords: Vec::new(),
+            sustain_pedal: false,
+            audio: Some(AudioRef { file, start }),
+        };
+        if let Some((file, start, loud)) = st.audio_live {
+            out.push((waiting(file, start, loud), true));
+        }
+        for &(file, start, end) in st.audio_pending.iter().rev() {
+            out.push((waiting(file, start, end), false));
+        }
         let parts = jam::split_sketches(&st.current);
         for (i, (from, to)) in parts.iter().enumerate().rev() {
             let slice: Vec<RawEvent> = st.current.iter().filter(|e| e.t >= *from && e.t <= *to).copied().collect();
@@ -92,7 +157,45 @@ impl Journal {
             }
         }
         out.extend(st.index.iter().rev().cloned().map(|j| (j, false)));
+        // Listed newest first, whichever ear heard them.
+        out.sort_by(|a, b| b.0.start.total_cmp(&a.0.start));
         out
+    }
+
+    /// A recording's transcript, if it has been written down.
+    pub fn transcript(&self, file: u64) -> Option<Arc<Transcript>> {
+        if let Some(t) = self.state.lock().unwrap().transcripts.get(&file) {
+            return Some(t.clone());
+        }
+        let text = std::fs::read_to_string(audio_journal::transcript_path(&self.audio_dir(), file)).ok()?;
+        let t: Arc<Transcript> = Arc::new(serde_json::from_str(&text).ok()?);
+        self.state.lock().unwrap().transcripts.insert(file, t.clone());
+        Some(t)
+    }
+
+    /// A sketch's events: the notes played, or the transcription of what
+    /// was heard. `from`/`to` (unix seconds) narrow it.
+    pub fn sketch_events(&self, s: &Sketch, from: f64, to: f64) -> Vec<RawEvent> {
+        match s.audio {
+            Some(a) => self
+                .transcript(a.file)
+                .map(|t| t.events().iter().filter(|e| e.t >= from && e.t <= to).copied().collect())
+                .unwrap_or_default(),
+            None => self.events(from, to),
+        }
+    }
+
+    /// The sound of an audio sketch between `from` and `to` (unix
+    /// seconds), at [`crate::analysis::RATE`].
+    pub fn sketch_audio(&self, a: AudioRef, from: f64, to: f64) -> Option<Vec<f32>> {
+        let (rate, samples) = crate::wav::read(&audio_journal::wav_path(&self.audio_dir(), a.file)).ok()?;
+        let at = |t: f64| (((t - a.start).max(0.0) * rate as f64) as usize).min(samples.len());
+        let (i, j) = (at(from), at(to));
+        (j > i).then(|| samples[i..j].to_vec())
+    }
+
+    pub fn audio_dir(&self) -> PathBuf {
+        self.dir.join("audio")
     }
 
     pub fn sketch(&self, id: u64) -> Option<(Sketch, bool)> {
@@ -194,7 +297,7 @@ fn read_lines<T: serde::de::DeserializeOwned>(path: &Path) -> Vec<T> {
     BufReader::new(f).lines().map_while(Result::ok).filter_map(|l| serde_json::from_str(&l).ok()).collect()
 }
 
-fn append(path: &Path, line: &str) -> std::io::Result<()> {
+pub(crate) fn append(path: &Path, line: &str) -> std::io::Result<()> {
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(f, "{line}")
 }
@@ -258,6 +361,45 @@ mod tests {
         assert!(Journal::open(dir.clone()).unwrap().is_hidden(id), "remembered");
         j.set_hidden(id, false).unwrap();
         assert!(!j.is_hidden(id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heard_audio_becomes_a_sketch() {
+        use crate::analysis::RATE;
+        use crate::analysis::tests::{C, D, EM, G, strummed};
+        let dir = std::env::temp_dir().join(format!("compypal-journal-audio-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let j = Journal::open(dir.clone()).unwrap();
+        j.set_listening(true);
+        // Strummed a minute ago, then quiet: as the input would hand it on.
+        let (mut audio, _) = strummed(&[G, C, D, EM, G, C, D, EM], 100.0, RATE);
+        audio.extend(vec![0.0; RATE as usize * 9]);
+        let t0 = now() - 60.0;
+        for (i, block) in audio.chunks(1024).enumerate() {
+            j.log_audio(t0 + (i * 1024) as f64 / RATE as f64, block.to_vec());
+        }
+        let mut found = None;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            found = j.sketches().into_iter().find(|(s, _)| s.notes > 0);
+            if found.is_some() {
+                break;
+            }
+        }
+        let (s, live) = found.expect("a sketch from the audio");
+        assert!(!live);
+        assert_eq!(jam::sketch_name(&s), "G C D Em loop", "{s:?}");
+        let a = s.audio.unwrap();
+        assert!((a.start - (t0 + 0.5 - 0.5)).abs() < 0.1, "{a:?} vs {t0}");
+        assert_eq!(j.sketch_events(&s, s.start - 0.01, s.end + 0.01).len(), s.notes * 2);
+        let sound = j.sketch_audio(a, s.start, s.start + 2.0).unwrap();
+        assert_eq!(sound.len(), RATE as usize * 2);
+        // Reopened, it's all still there.
+        drop(j);
+        let again = Journal::open(dir.clone()).unwrap();
+        let (back, _) = again.sketches().into_iter().find(|(x, _)| x.id == s.id).unwrap();
+        assert_eq!(again.sketch_events(&back, back.start - 0.01, back.end + 0.01).len(), s.notes * 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
