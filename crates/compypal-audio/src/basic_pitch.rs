@@ -61,23 +61,22 @@ impl BasicPitch {
             .with_input_fact(0, f32::fact([1, WINDOW, 1]).into())
             .map_err(err)?;
         // Outputs: contour (264 bins), note and onset (88 keys each). The
-        // converted model names them; fall back to the reference order.
+        // converted model lists them as `StatefulPartitionedCall:N`, N in
+        // TensorFlow's (alphabetical) order: 0 contour, 1 note, 2 onset;
+        // not necessarily in that order. A model naming them says so.
         let names: Vec<String> = model.output_outlets().map_err(err)?.iter().map(|o| model.node(o.node).name.clone()).collect();
-        let find = |want: &str| names.iter().position(|n| n.to_lowercase().contains(want));
-        let (note, onset) = match (find("note"), find("onset")) {
+        let find = |want: &str, n: &str| {
+            names.iter().position(|x| x.to_lowercase().contains(want)).or_else(|| names.iter().position(|x| x.ends_with(n)))
+        };
+        let (note, onset) = match (find("note", ":1"), find("onset", ":2")) {
             (Some(n), Some(o)) => (n, o),
-            _ => (1, 2),
+            _ => return Err(format!("Basic Pitch model {}: can't tell its outputs apart ({names:?})", path.display())),
         };
         let plan = model.into_optimized().map_err(err)?.into_runnable().map_err(err)?;
-        let mut bp = Self { plan, note, onset };
-        // Make sure: the contour output has 264 bins, the others 88.
+        let bp = Self { plan, note, onset };
         let probe = bp.run_window(&vec![0.0; WINDOW])?;
-        if probe.len() < 3 {
-            return Err("Basic Pitch model: expected three outputs".into());
-        }
-        let keyed: Vec<usize> = (0..probe.len()).filter(|&i| probe[i].shape().last() == Some(&KEYS)).collect();
-        if !(keyed.contains(&bp.note) && keyed.contains(&bp.onset)) && keyed.len() == 2 {
-            (bp.note, bp.onset) = (keyed[0], keyed[1]);
+        if [note, onset].iter().any(|&i| probe.get(i).and_then(|t| t.shape().last().copied()) != Some(KEYS)) {
+            return Err("Basic Pitch model: unexpected output shapes".into());
         }
         Ok(bp)
     }
@@ -311,11 +310,11 @@ mod tests {
             crate::analysis::tests::pluck(&mut audio, RATE, 0.3 + i as f64 * 0.8, p, 0.2);
         }
         let got = bp.transcribe(&audio).unwrap();
-        let pitches: Vec<u8> = got.iter().map(|n| n.pitch).collect();
         for (i, &p) in line.iter().enumerate() {
             let n = got.iter().find(|n| n.pitch == p).unwrap_or_else(|| panic!("{p} missing: {got:?}"));
             assert!((n.start - (0.3 + i as f64 * 0.8)).abs() < 0.05, "{n:?}");
         }
-        assert!(pitches.len() <= line.len() + 2, "{got:?}");
+        // Anything else is quiet: harmonics heard faintly as notes.
+        assert!(got.iter().all(|n| line.contains(&n.pitch) || n.velocity < 60), "{got:?}");
     }
 }
