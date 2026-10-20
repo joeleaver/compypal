@@ -31,6 +31,22 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub own_tempo: bool,
     pub events: Vec<RawEvent>,
+    /// For playing heard through a microphone: the recording the events
+    /// were transcribed from, kept as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<AudioRef>,
+}
+
+/// A recording in the journal's audio folder, for sketches played on an
+/// acoustic instrument: the notes are a transcription, the sound is the
+/// original.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AudioRef {
+    /// Which recording: its file is `audio/<file>.wav` in the journal.
+    pub file: u64,
+    /// Where its first sample falls, in the clock of the events that
+    /// refer to it (unix seconds for a sketch, seconds into a session).
+    pub start: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -187,6 +203,7 @@ mod tests {
             start_tick: 0,
             own_tempo: false,
             events,
+            audio: None,
         }
     }
 

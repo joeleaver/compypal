@@ -53,6 +53,7 @@ pub fn sloppy_take(id: crate::model::Id) -> Session {
         start_tick: 0,
         own_tempo: false,
         events,
+        audio: None,
     }
 }
 

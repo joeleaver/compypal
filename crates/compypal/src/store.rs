@@ -201,6 +201,7 @@ impl Recording {
             start_tick: self.start_tick,
             own_tempo: false,
             events,
+            audio: None,
         }
     }
 }

@@ -5,11 +5,13 @@
 //! It plays through [`synth::BasicSynth`] until a General MIDI SoundFont has
 //! loaded in the background, then switches over.
 
+pub mod analysis;
 pub mod input;
 pub mod journal;
 pub mod player;
 pub mod schedule;
 pub mod synth;
+pub mod wav;
 
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};

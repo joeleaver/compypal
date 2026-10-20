@@ -607,6 +607,7 @@ mod tests {
             start_tick: 0,
             own_tempo: false,
             events: ev,
+            audio: None,
         });
         let list = items(&p, &played, at + 60.0, Filter::All);
         assert_eq!(list.len(), 1, "{list:?}");

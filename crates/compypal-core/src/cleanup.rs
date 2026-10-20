@@ -387,6 +387,7 @@ mod tests {
             downbeat_offset: 2.0,
             start_tick: 0,
             own_tempo: false,
+            audio: None,
             events: vec![
                 // A beat before the downbeat.
                 RawEvent { t: 1.5, channel: 0, msg: RawMsg::NoteOn { pitch: 60, velocity: 90 } },
@@ -411,6 +412,7 @@ mod tests {
             downbeat_offset: 2.0,
             start_tick: 7680,
             own_tempo: false,
+            audio: None,
             events: vec![
                 RawEvent { t: 2.5, channel: 0, msg: RawMsg::NoteOn { pitch: 60, velocity: 90 } },
                 RawEvent { t: 3.0, channel: 0, msg: RawMsg::NoteOff { pitch: 60 } },

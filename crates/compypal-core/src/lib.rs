@@ -15,4 +15,4 @@ pub mod theory;
 
 pub use history::History;
 pub use model::*;
-pub use session::{RawEvent, RawMsg, RawNote, Session};
+pub use session::{AudioRef, RawEvent, RawMsg, RawNote, Session};

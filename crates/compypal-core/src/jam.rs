@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::figure::{self, FigureSettings};
 use crate::model::{Id, MeterChange, Note, TempoMap, Tick};
-use crate::session::{RawEvent, RawMsg, Session};
+use crate::session::{AudioRef, RawEvent, RawMsg, Session};
 use crate::theory::{self, Spelling};
 
 /// A silence this long ends a jam.
@@ -166,6 +166,10 @@ pub struct Sketch {
     /// meaningful when there is a tempo.
     pub chords: Vec<String>,
     pub sustain_pedal: bool,
+    /// Heard through a microphone rather than played on MIDI: the notes
+    /// are a transcription of this recording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<AudioRef>,
 }
 
 impl Sketch {
@@ -233,6 +237,7 @@ pub fn summarize(events: &[RawEvent]) -> Option<Sketch> {
         key,
         chords,
         sustain_pedal: events.iter().any(|e| matches!(e.msg, RawMsg::Cc { controller: 64, value } if value >= 64)),
+        audio: None,
     })
 }
 
@@ -451,6 +456,7 @@ pub fn to_session(
         start_tick,
         own_tempo: tempo.is_some(),
         events: slice,
+        audio: None,
     }
 }
 
