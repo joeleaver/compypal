@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
+pub use player::Looping;
 use player::{Cmd, Player, Shared};
 pub use schedule::{Schedule, ScheduleOptions, Timed};
 use synth::{BasicSynth, SoundFontSynth, Synth};
@@ -109,7 +110,7 @@ impl Engine {
         let _ = self.tx.lock().unwrap().send(cmd);
     }
 
-    pub fn play(&self, schedule: Schedule, from: f64, looping: bool) {
+    pub fn play(&self, schedule: Schedule, from: f64, looping: Looping) {
         self.shared.forget_heard_zero();
         self.send(Cmd::Play { schedule: Arc::new(schedule), from, looping });
     }
@@ -123,8 +124,8 @@ impl Engine {
         self.send(Cmd::Stop);
     }
 
-    pub fn set_looping(&self, on: bool) {
-        self.send(Cmd::SetLooping(on));
+    pub fn set_looping(&self, looping: Looping) {
+        self.send(Cmd::SetLooping(looping));
     }
 
     pub fn audition(&self, schedule: Schedule) {

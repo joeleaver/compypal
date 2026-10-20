@@ -755,7 +755,7 @@ impl Store {
         self.monitor_selected();
         let started = std::time::Instant::now();
         midi.start_take(started);
-        engine.play(take, 0.0, false);
+        engine.play(take, 0.0, compypal_audio::Looping::Off);
         self.play_offset.set(lead - from);
         self.playhead.set(Some(0.0));
         self.recording.set(Some(Recording { track, start_tick, lead, bpm, meter, started }));
@@ -844,6 +844,34 @@ impl Store {
         self.playhead.get().is_some()
     }
 
+    /// The bars Loop goes round, as ticks: the selected bars, if any.
+    pub fn loop_ticks(self) -> Option<(Tick, Tick)> {
+        let (a, b) = self.bar_sel.get()?;
+        Some(self.project.with(|p| (text::bar_start(p, a), text::bar_start(p, b + 1))))
+    }
+
+    /// How the transport loops: round the selected bars, else the song.
+    pub fn loop_mode(self) -> compypal_audio::Looping {
+        use compypal_audio::Looping;
+        if !self.looping.get() {
+            return Looping::Off;
+        }
+        match self.loop_ticks() {
+            Some((a, b)) => self.project.with(|p| Looping::Range(p.tempo.tick_to_seconds(a as f64), p.tempo.tick_to_seconds(b as f64))),
+            None => Looping::Song,
+        }
+    }
+
+    /// Where playing from `tick` really starts: a loop range begins at its
+    /// first bar unless the cursor is already inside it.
+    fn play_from(self, tick: Tick) -> f64 {
+        let tick = match (self.looping.get(), self.loop_ticks()) {
+            (true, Some((a, b))) if tick < a || tick >= b => a,
+            _ => tick,
+        };
+        self.project.with(|p| p.tempo.tick_to_seconds(tick as f64))
+    }
+
     pub fn toggle_play(self) {
         let Some(engine) = self.engine else { return };
         if untracked(|| self.is_recording()) {
@@ -855,9 +883,8 @@ impl Store {
             engine.stop();
             self.playhead.set(None);
         } else {
-            let cursor = self.cursor.get();
-            let from = self.project.with(|p| p.tempo.tick_to_seconds(cursor as f64));
-            engine.play(self.schedule(), from, self.looping.get());
+            let from = self.play_from(self.cursor.get());
+            engine.play(self.schedule(), from, self.loop_mode());
             // Show the playhead right away rather than on the next poll.
             self.playhead.set(Some(from));
         }
@@ -869,16 +896,14 @@ impl Store {
         if let (Some(engine), true, false) =
             (self.engine, untracked(|| self.playhead.get()).is_some(), untracked(|| self.is_recording()))
         {
-            let from = self.project.with(|p| p.tempo.tick_to_seconds(tick as f64));
-            engine.play(self.schedule(), from, self.looping.get());
+            engine.play(self.schedule(), self.play_from(tick), self.loop_mode());
         }
     }
 
+    /// Turns Loop on or off; the app passes it (and any change to the
+    /// range) to the engine as it happens.
     pub fn toggle_looping(self) {
         self.looping.update(|l| *l = !*l);
-        if let Some(e) = self.engine {
-            e.set_looping(self.looping.get());
-        }
     }
 
     /// Plays `notes` on `track`'s instrument, now.

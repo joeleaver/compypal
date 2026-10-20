@@ -10,13 +10,36 @@ use std::time::{Duration, Instant};
 use crate::schedule::{Schedule, Timed};
 use crate::synth::Synth;
 
+/// Where the transport goes round.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Looping {
+    /// Play to the end and stop.
+    #[default]
+    Off,
+    /// Back to the start at the end.
+    Song,
+    /// Round between two times, in seconds.
+    Range(f64, f64),
+}
+
+impl Looping {
+    /// Where a loop starts and ends in a schedule `length` long.
+    fn bounds(self, length: f64) -> Option<(f64, f64)> {
+        match self {
+            Looping::Off => None,
+            Looping::Range(a, b) if b - a > 1e-6 && a < length => Some((a.max(0.0), b.min(length))),
+            _ => Some((0.0, length)),
+        }
+    }
+}
+
 pub enum Cmd {
     /// Start the transport at `from` seconds.
-    Play { schedule: Arc<Schedule>, from: f64, looping: bool },
+    Play { schedule: Arc<Schedule>, from: f64, looping: Looping },
     /// Swap in an edited schedule without stopping.
     Update(Arc<Schedule>),
     Stop,
-    SetLooping(bool),
+    SetLooping(Looping),
     /// Play a phrase now, alongside (or instead of) the transport.
     Audition(Arc<Schedule>),
     /// A message straight to the synth: live input, clicking a key.
@@ -70,21 +93,31 @@ struct Run {
     schedule: Arc<Schedule>,
     pos: f64,
     next: usize,
-    looping: bool,
+    looping: Looping,
     /// Notes this run has started and not yet stopped, to release on stop.
     sounding: Vec<[u8; 2]>,
 }
 
 impl Run {
-    fn new(schedule: Arc<Schedule>, from: f64, looping: bool) -> Self {
+    fn new(schedule: Arc<Schedule>, from: f64, looping: Looping) -> Self {
+        // Starting outside a loop range starts at its beginning.
+        let from = match looping.bounds(schedule.length) {
+            Some((a, b)) if from < a || from >= b => a,
+            _ => from,
+        };
         let next = schedule.events.partition_point(|e| e.t < from);
         Self { schedule, pos: from, next, looping, sounding: Vec::new() }
     }
 
+    /// Where this run turns round or stops.
+    fn end(&self) -> f64 {
+        self.looping.bounds(self.schedule.length).map_or(self.schedule.length, |(_, b)| b)
+    }
+
     fn next_time(&self) -> f64 {
         match self.schedule.events.get(self.next) {
-            Some(e) => e.t.min(self.schedule.length),
-            None => self.schedule.length,
+            Some(e) => e.t.min(self.end()),
+            None => self.end(),
         }
     }
 
@@ -109,21 +142,22 @@ impl Run {
     /// Fires every event due at or before `pos`. Returns false when the run
     /// has finished.
     fn fire_due(&mut self, synth: &mut dyn Synth) -> bool {
+        let end = self.end();
+        // An event right on a loop's end belongs to what comes after it.
+        let looped = self.looping.bounds(self.schedule.length).is_some();
         while let Some(e) = self.schedule.events.get(self.next) {
-            if e.t > self.pos + 1e-9 {
+            if e.t > self.pos + 1e-9 || (looped && e.t >= end - 1e-9) {
                 break;
             }
             let e = *e;
             self.next += 1;
             self.fire(&e, synth);
         }
-        if self.pos + 1e-9 >= self.schedule.length {
+        if self.pos + 1e-9 >= end {
             self.release(synth);
-            if !self.looping {
-                return false;
-            }
-            self.pos -= self.schedule.length;
-            self.next = 0;
+            let Some((start, _)) = self.looping.bounds(self.schedule.length) else { return false };
+            self.pos = start + (self.pos - end).max(0.0);
+            self.next = self.schedule.events.partition_point(|e| e.t < self.pos - 1e-9);
             return self.fire_due(synth);
         }
         true
@@ -178,8 +212,11 @@ impl Player {
             Cmd::Update(schedule) => {
                 if let Some(r) = self.transport.as_mut() {
                     r.release(synth);
-                    let pos = if r.looping && schedule.length > 0.0 { r.pos % schedule.length } else { r.pos };
                     let looping = r.looping;
+                    let pos = match looping.bounds(schedule.length) {
+                        Some((a, b)) if r.pos >= b => a,
+                        _ => r.pos,
+                    };
                     chase(&schedule, pos, synth);
                     *r = Run::new(schedule, pos, looping);
                 }
@@ -189,16 +226,24 @@ impl Player {
                     r.release(synth);
                 }
             }
-            Cmd::SetLooping(on) => {
+            Cmd::SetLooping(looping) => {
                 if let Some(r) = self.transport.as_mut() {
-                    r.looping = on;
+                    r.looping = looping;
+                    // A new range the playhead is outside of starts now.
+                    if let Some((a, b)) = looping.bounds(r.schedule.length)
+                        && (r.pos < a || r.pos >= b)
+                    {
+                        r.release(synth);
+                        r.pos = a;
+                        r.next = r.schedule.events.partition_point(|e| e.t < a);
+                    }
                 }
             }
             Cmd::Audition(schedule) => {
                 if let Some(mut r) = self.audition.take() {
                     r.release(synth);
                 }
-                self.audition = Some(Run::new(schedule, 0.0, false));
+                self.audition = Some(Run::new(schedule, 0.0, Looping::Off));
             }
             Cmd::Midi([a, b, c]) => synth.midi(a, b, c),
             Cmd::Panic => {
@@ -278,7 +323,7 @@ mod tests {
         let mut p = Player::new(Box::new(crate::synth::BasicSynth::new(48_000)), 48_000, rx, shared.clone());
         let at = shared.epoch + Duration::from_millis(500);
         p.set_clock(at);
-        tx.send(Cmd::Play { schedule: Arc::new(Schedule::default()), from: 0.25, looping: false }).unwrap();
+        tx.send(Cmd::Play { schedule: Arc::new(Schedule::default()), from: 0.25, looping: Looping::Off }).unwrap();
         let (mut l, mut r) = (vec![0.0; 64], vec![0.0; 64]);
         p.process(&mut l, &mut r);
         // Position 0.25 is heard at `at`, so position zero a quarter second before.
@@ -327,7 +372,7 @@ mod tests {
         tx.send(Cmd::Play {
             schedule: sched(&[(0.0105, [0x90, 60, 100]), (0.5, [0x80, 60, 0])], 1.0),
             from: 0.0,
-            looping: false,
+            looping: Looping::Off,
         })
         .unwrap();
         let (mut l, mut r) = (vec![0.0; 256], vec![0.0; 256]);
@@ -344,7 +389,7 @@ mod tests {
     #[test]
     fn stop_releases_held_notes_and_loop_wraps() {
         let (mut p, tx, log, _) = player();
-        tx.send(Cmd::Play { schedule: sched(&[(0.0, [0x91, 64, 90])], 0.1), from: 0.0, looping: true }).unwrap();
+        tx.send(Cmd::Play { schedule: sched(&[(0.0, [0x91, 64, 90])], 0.1), from: 0.0, looping: Looping::Song }).unwrap();
         let (mut l, mut r) = (vec![0.0; 250], vec![0.0; 250]);
         p.process(&mut l, &mut r);
         tx.send(Cmd::Stop).unwrap();
@@ -353,5 +398,19 @@ mod tests {
         let ons = log.iter().filter(|(_, m)| m[0] == 0x91).count();
         assert_eq!(ons, 3, "0.1s loop over 0.25s plays three times: {log:?}");
         assert_eq!(log.last().unwrap().1, [0x81, 64, 0]);
+    }
+
+    #[test]
+    fn a_loop_range_goes_round_inside_the_song() {
+        let (mut p, tx, log, shared) = player();
+        // Notes at 0.0, 0.2 and 0.4; loop 0.2–0.4, starting from 0 (outside it).
+        let s = sched(&[(0.0, [0x90, 60, 90]), (0.2, [0x90, 62, 90]), (0.4, [0x90, 64, 90])], 1.0);
+        tx.send(Cmd::Play { schedule: s, from: 0.0, looping: Looping::Range(0.2, 0.4) }).unwrap();
+        let (mut l, mut r) = (vec![0.0; 500], vec![0.0; 500]);
+        p.process(&mut l, &mut r);
+        let keys: Vec<u8> = log.lock().unwrap().iter().filter(|(_, m)| m[0] == 0x90).map(|(_, m)| m[1]).collect();
+        assert_eq!(keys, [62, 62, 62], "only the looped note, every 0.2 s");
+        let pos = shared.position().unwrap();
+        assert!((0.2..0.4).contains(&pos), "{pos}");
     }
 }

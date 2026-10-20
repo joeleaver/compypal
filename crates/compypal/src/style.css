@@ -587,3 +587,14 @@
 .chat-ask-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--rinch-color-yellow-5); }
 .agent-pick { max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; }
 .chat-state { white-space: nowrap; }
+
+/* The bars Loop goes round, on the rulers. */
+.loop-band {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    background: rgba(81, 207, 102, 0.16);
+    border-left: 2px solid var(--rinch-color-green-6);
+    border-right: 2px solid var(--rinch-color-green-6);
+    pointer-events: none;
+}

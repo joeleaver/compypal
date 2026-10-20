@@ -62,6 +62,13 @@ It has a chord and a shape (block, arpeggio, run, melody, note, mixed).
   what is there.
 - Any project change while playing rebuilds the schedule and sends
   `Cmd::Update`, which keeps the position (an Effect in `app`).
+- Looping is `player::Looping` (`Off`, `Song`, `Range`): Loop goes round
+  the selected bars if there are any (`Store::loop_mode`; shift-click the
+  roll's ruler, or select in the arranger; Escape lets go), else the song.
+  Changing either while playing takes effect at once; the rulers show the
+  range as a green band. An event exactly on a loop's end belongs after it.
+- Rolls and the arranger follow the playhead a page at a time, and when
+  stopped keep the cursor in view.
 - `compypal-audio` and `rustysynth` build at opt-level 3 even in dev;
   unoptimized, the synth can't keep up with the callback.
 - `cargo run -p compypal-audio --example play_demo` checks the device
@@ -230,7 +237,7 @@ creates projects; the agent has `list_projects` and `open_project`.
 
 ## Roadmap
 
-1. ~~Audio~~ (done). Follow-ups: playhead auto-scroll, a loop range.
+1. ~~Audio~~ (done), with playhead follow and loop ranges.
 2. ~~Recording~~ (done). Follow-ups listed under Recording.
 3. ~~Agent / music IDE~~ (done), with an in-app agent panel for any ACP
    agent or Claude Code. Follow-ups: MCP resources for ABC, `session/load`

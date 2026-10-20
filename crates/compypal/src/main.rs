@@ -138,7 +138,11 @@ fn Transport() -> NodeHandle {
             Button { size: "xs",
                 variant: {|| if store.looping.get() { "filled" } else { "default" }},
                 onclick: move || store.toggle_looping(),
-                "Loop"
+                {|| match (store.looping.get(), store.bar_sel.get()) {
+                    (true, Some((a, b))) if a == b => format!("Loop bar {a}"),
+                    (true, Some((a, b))) => format!("Loop bars {a}–{b}"),
+                    _ => "Loop".to_string(),
+                }}
             }
             Button { size: "xs",
                 variant: {|| if store.metronome.get() { "filled" } else { "default" }},
@@ -367,11 +371,20 @@ fn PianoRoll() -> NodeHandle {
                         let c = get_click_context();
                         let x = (c.mouse_x - c.element_x) as f64 - KEYS;
                         let px = store.zoom.get() / compypal_core::PPQ as f64;
+                        // Shift-click picks bars (what Loop goes round).
+                        if c.modifiers.shift {
+                            let bar = store.project.with(|p| compypal_core::text::bar_of(p, (x / px).max(0.0) as u64));
+                            store.select_bar(bar, true);
+                            return;
+                        }
                         // Snap to the beat: you'd count in from a beat, not a tick.
                         let beat = compypal_core::PPQ as f64;
                         let tick = ((x / px) / beat).round().max(0.0) * beat;
                         store.seek(tick as u64);
                     },
+                    div { class: "loop-band",
+                        style: {|| loop_band(store, store.zoom.get() / compypal_core::PPQ as f64, KEYS)},
+                    }
                     for b in roll.get().bars {
                         div { key: b.key.clone(), class: "bar-number",
                             style: {format!("left: {}px;", b.left + 64.0)},
@@ -592,12 +605,24 @@ fn grid_press(store: Store) {
         .start();
 }
 
+/// Where the loop band goes on a ruler, if Loop is on and bars are selected.
+fn loop_band(store: Store, px_per_tick: f64, offset: f64) -> String {
+    match (store.looping.get(), store.loop_ticks()) {
+        (true, Some((a, b))) => format!("left: {}px; width: {}px;", a as f64 * px_per_tick + offset, (b - a) as f64 * px_per_tick),
+        _ => "display: none;".into(),
+    }
+}
+
 /// Keeps the playhead in view while playing, scrolling a page at a time.
 fn follow_playhead(scroller: &NodeHandle, store: Store, px_per_tick: impl Fn() -> f64 + 'static, offset: f64) {
     let scroller = scroller.clone();
     rinch::core::Effect::new(move || {
-        let Some(secs) = store.song_seconds() else { return };
-        let tick = store.project.with(|p| p.tempo.seconds_to_tick(secs));
+        // Stopped: the cursor is where play would start, so keep it in sight
+        // (after a long take the view is otherwise left far past the music).
+        let tick = match store.song_seconds() {
+            Some(secs) => store.project.with(|p| p.tempo.seconds_to_tick(secs)),
+            None => store.cursor.get() as f64,
+        };
         let x = tick * untracked(&px_per_tick) + offset;
         let (left, width) = (scroller.scroll_left(), scroller.client_width());
         if width > 0.0 && (x > left + width - 40.0 || x < left + offset) {
@@ -638,6 +663,12 @@ fn Arranger() -> NodeHandle {
                         let bar = store.project.with(|p| compypal_core::text::bar_of(p, tick));
                         store.select_bar(bar, c.modifiers.shift);
                     },
+                    div { class: "loop-band",
+                        style: {|| {
+                            let px = arr.get().px;
+                            loop_band(store, px, 0.0)
+                        }},
+                    }
                     for b in arr.get().bars {
                         div { key: b.key.clone(), class: "bar-number", style: {format!("left: {}px;", b.left)},
                             {b.number.to_string()}
@@ -1167,6 +1198,14 @@ fn app() -> NodeHandle {
         }
     });
 
+    // Loop on or off, or a new range, takes effect while playing.
+    rinch::core::Effect::new(move || {
+        let looping = store.loop_mode();
+        if let (Some(e), false) = (store.engine, untracked(|| store.is_recording())) {
+            e.set_looping(looping);
+        }
+    });
+
     // The audio thread can't touch signals; poll it from a plain thread and
     // send() the results across.
     if let Some(engine) = engine {
@@ -1216,6 +1255,11 @@ fn app() -> NodeHandle {
             && !k.is_space()
             && store.roll_key(&k.key, k.shift, k.ctrl || k.meta)
         {
+            return true;
+        }
+        // Escape with nothing else to cancel lets go of the selected bars.
+        if k.is_down() && k.key == "Escape" && !store.is_typing() && store.bar_sel.get().is_some() {
+            store.bar_sel.set(None);
             return true;
         }
         if k.is_space() && k.is_down() && !store.is_typing() {
