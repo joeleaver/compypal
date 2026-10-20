@@ -883,6 +883,18 @@ impl Store {
         msg
     }
 
+    /// Makes `session`'s clips the ones heard where they sit.
+    pub fn use_session(self, session: Id) {
+        let name = self.project.with(|p| p.session(session).map(crate::sketches::session_name)).unwrap_or_default();
+        self.edit(&format!("use {name}"), |p| {
+            let clips: Vec<Id> = p.tracks.iter().flat_map(|t| &t.clips).filter(|c| c.source_session == Some(session)).map(|c| c.id).collect();
+            for c in clips {
+                p.prefer_clip(c);
+            }
+        });
+        self.status.set(format!("{name:?} is heard now; what it covers is muted"));
+    }
+
     /// Re-derives every clip made from `session` with the default cleanup.
     pub fn tidy_session(self, session: Id) {
         let mut report = cleanup::TidyReport::default();
@@ -891,9 +903,8 @@ impl Store {
             let fresh = cleanup::import_session(&s, &p.tempo, true).notes;
             for t in &mut p.tracks {
                 for c in t.clips.iter_mut().filter(|c| c.source_session == Some(session)) {
-                    let mut notes = fresh.clone();
-                    report = cleanup::tidy(&mut notes);
-                    c.notes = notes;
+                    c.refill(&fresh);
+                    report = cleanup::tidy(&mut c.notes);
                 }
             }
         });
@@ -1405,17 +1416,19 @@ fn lay_take(p: &mut Project, track: Id, session: &Session, start_tick: Tick, nam
     let end = imported.notes.iter().map(|n| n.end()).max().unwrap_or(0);
     let count = imported.notes.len();
     let clip_id = p.alloc_id();
-    if let Some(t) = p.track_mut(track) {
-        t.clips.push(Clip {
+    // Over existing music, what was there is muted, not mixed in.
+    p.add_clip_over(
+        track,
+        Clip {
             id: clip_id,
             name: name.to_string(),
             start,
             length: end.div_ceil(bar).max(1) * bar,
             notes: imported.notes,
             source_session: Some(session.id),
-        });
-        t.clips.sort_by_key(|c| c.start);
-    }
+            ..Default::default()
+        },
+    );
     count
 }
 
@@ -1485,6 +1498,8 @@ pub struct Roll {
     pub notes: Vec<RollNote>,
     /// Notes exactly as played, before cleanup.
     pub raw: Vec<RollNote>,
+    /// Notes of muted clips: the part something else was laid over.
+    pub muted: Vec<RollNote>,
     /// The take being recorded.
     pub live: Vec<RollNote>,
     /// Pixels per tick, and the pitch of the top row: for turning a click
@@ -1520,9 +1535,10 @@ impl Roll {
                 .iter()
                 .filter_map(|c| {
                     let s = p.session(c.source_session?)?;
-                    let mut ns = cleanup::import_session(s, &p.tempo, true).notes;
-                    cleanup::shift(&mut ns, c.start as i64);
-                    Some(ns)
+                    // Only this clip's window of the take.
+                    let mut window = c.clone();
+                    window.refill(&cleanup::import_session(s, &p.tempo, true).notes);
+                    Some(window.absolute_notes().collect::<Vec<_>>())
                 })
                 .flatten()
                 .collect()
@@ -1597,6 +1613,7 @@ impl Roll {
             bars,
             notes: notes.iter().map(|n| place(n, "n")).collect(),
             raw: raw.iter().map(|n| place(n, "r")).collect(),
+            muted: t.muted_notes().iter().map(|n| place(n, "m")).collect(),
             live: live.iter().map(|n| place(n, "l")).collect(),
             px,
             top_pitch: hi,
@@ -1636,6 +1653,8 @@ pub struct ArrClip {
     pub width: f64,
     pub name: String,
     pub recorded: bool,
+    /// Something else is heard here.
+    pub muted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1722,6 +1741,7 @@ impl Arrangement {
                                 width,
                                 name: c.name.clone(),
                                 recorded: c.source_session.is_some(),
+                                muted: c.muted,
                             }
                         })
                         .collect(),

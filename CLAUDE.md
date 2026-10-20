@@ -25,6 +25,13 @@ with a built-in synth; export MIDI and ABC.
   agent can compose them, inspect `timing_report`, and retry. Add new ones
   in the same style rather than one big "fix it" function.
 - Clip note times are relative to the clip start.
+- Laying music over music (recording, adding a sketch) never mixes it in:
+  `Track::add_over` cuts the clips underneath at its edges and mutes the
+  covered parts, kept as alternatives; `Track::prefer` (`use_sketch`,
+  "Use this one") switches back. `Track::absolute_notes` is what's heard;
+  `muted_notes` is what's under it (dashed in the roll, hatched in the
+  arranger). A split clip keeps `source_offset`, its place in its take,
+  so `Clip::refill` (Tidy, `clean_take`) refills only its window.
 
 ## Figures
 
@@ -113,7 +120,7 @@ It has a chord and a shape (block, arpeggio, run, melody, note, mixed).
   the pulse is found (`jam::estimate_tempo`, refined by a least-squares
   line through the eighths so long takes don't drift off the grid) and the
   take is laid on the song's grid by its own beats at the cursor's bar
-  (`jam::to_session`, as `keep_jam` does). An empty song takes the tempo.
+  (`jam::to_session`, as `add_sketch` does). An empty song takes the tempo.
 - Not yet: the KeyLab's DAW-port transport buttons.
 
 ## Agent (MCP)
@@ -174,23 +181,39 @@ the song goes through MCP tools, whichever way it's connected:
   in `call()`, a test against `MemoryApp`. Keep answers short, positional
   (`bar.beat.tick`), and in note names.
 
-## Listening (the journal)
+## Sketches (the journal)
+
+A sketch is one idea you played; it's the only word the UI uses for raw
+playing (not take, jam or session).
 
 - With Listen on (remembered in `settings.json`), every MIDI message goes to
   `journal/<utc-day>.jsonl` with unix time, whatever the transport is doing.
   The writer thread (`compypal-audio::journal`) cuts the stream into jams at
-  8 s silences and appends each finished jam's `JamSummary` to
-  `journal/jams.jsonl`, so listing jams never reads the raw log.
-- `core::jam` has no I/O: `estimate_tempo` (grid fit on eighths plus
-  accent alignment on beats, to settle half/double time), `summarize`,
-  `activity`, `to_session`.
-- Kept jams are sessions with `own_tempo`: imported by their own pulse
+  8 s silences, splits each jam into sketches (`jam::split_sketches`:
+  pauses of 2.5 s, and long stretches at a phrase break where the key or
+  tempo changes; scraps join a neighbour), and appends each sketch's
+  summary to `journal/sketches.jsonl`. An old `jams.jsonl` is split once.
+  Sketches of the jam still going are listed as they finish.
+- `jam::sketch_name` names a sketch by its music ("Am F C G loop"); takes
+  recorded with Rec are named the same way.
+- `core::jam` has no I/O: `estimate_tempo` (grid fit on eighths plus accent
+  alignment on beats, refined by a least-squares line through the eighths),
+  `summarize`, `activity`, `to_session` (a sketch starts on its first note
+  when that note falls on the found grid's off-beat: without accents the
+  beat can't be told from the off-beat).
+- The Sketches tab (`sketches.rs`) lists the journal's sketches and the
+  song's sessions together by day, each once (a take recorded while
+  listening is in both), with a thumbnail; the selected one is drawn whole,
+  fitted to the width, with its chords, and can be heard, asked about, or
+  added to the song on a chosen track at the end or at the cursor.
+- Added sketches are sessions with `own_tempo`: imported by their own pulse
   (beats, not seconds), so they sit on the song's grid at any song tempo.
-- Agent: `list_jams`, `get_jam` (chord timeline in mm:ss, activity map),
-  `audition_jam`, `keep_jam` (a stretch, re-timed on that stretch). The
-  sidebar's ▶ and Keep buttons call the same tools via `agent::run_tool`.
+- Agent: `list_sketches`, `get_sketch` (chord timeline in mm:ss, activity
+  map), `hear_sketch`, `add_sketch` (a stretch, re-timed on that stretch),
+  `use_sketch`.
 - To test without disturbing your own journal, run with
-  `XDG_DATA_HOME=/some/tmp` and the `fake_keys` example.
+  `XDG_DATA_HOME=/some/tmp` and the `fake_keys` example (`fake_keys 12 3 4`
+  plays three ideas a step apart with 4 s pauses: three sketches).
 
 ## Persistence
 
@@ -228,9 +251,12 @@ creates projects; the agent has `list_projects` and `open_project`.
   `Copy` data in attribute closures.
 - A `Vec<NodeHandle>` child is wrapped in a `display: contents` box, so
   `<option>`s built that way are not seen by a native `<select>`.
-- Never call a `Memo`'s `.get()` inside `Signal::with`: if the memo has to
-  recompute there, rinch panics with "RefCell already borrowed". Read memos
-  first, then borrow.
+- Never call a `Memo`'s `.get()`, or even a `Signal`'s, inside another
+  `Signal::with`: rinch panics with "RefCell already borrowed". Read
+  signals and memos first, then borrow.
+- An `if let Some(x) = sig.get() { … }` in rsx keeps its old body while it
+  stays `Some`: to redraw for a new value, iterate it as a keyed `for`
+  (`for x in sig.get().into_iter() { div { key: … } }`).
 - `autofocus` only works inside Modal/Popover.
 - Inline `<span>`s get no layout box, so they can't be clicked: make
   clickable spans `inline-block`.
@@ -251,5 +277,9 @@ creates projects; the agent has `list_projects` and `open_project`.
    to resume an ACP conversation, rendering replies as Markdown.
 4. ~~Arranger view~~ (done): sections, clip rows, bar selection, duplicate /
    insert / delete bars (`core::arrange`), section naming.
+4b. ~~Sketches~~ (done): raw playing split into ideas, one list, alternative
+   lanes under music. Follow-ups: lane rows in the roll (pick a take per
+   bar range there, not only in Sketches), audio sketches (a guitar via
+   the mic, transcribed to notes), deleting or hiding sketches.
 5. **Own synth**: a wavetable/mod-matrix synth in the spirit of Vital, to sit
    alongside the SoundFont player.

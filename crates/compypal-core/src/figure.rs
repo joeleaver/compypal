@@ -569,19 +569,22 @@ impl Project {
                 length: 0,
                 notes: Vec::new(),
                 source_session: None,
+                ..Default::default()
             });
         }
         for n in new {
+            // Into a clip that's heard there, before a muted alternative.
             let i = t
                 .clips
                 .iter()
-                .position(|c| n.start >= c.start && n.start < c.start + c.length)
+                .position(|c| !c.muted && n.start >= c.start && n.start < c.start + c.length)
+                .or_else(|| t.clips.iter().position(|c| n.start >= c.start && n.start < c.start + c.length))
                 .or_else(|| {
                     t.clips
                         .iter()
                         .enumerate()
                         .filter(|(_, c)| c.start <= n.start)
-                        .max_by_key(|(_, c)| c.start + c.length)
+                        .max_by_key(|(_, c)| (!c.muted, c.start + c.length))
                         .map(|(i, _)| i)
                 })
                 .expect("a clip starts at or before every new note");

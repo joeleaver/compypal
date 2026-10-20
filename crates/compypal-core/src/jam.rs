@@ -107,7 +107,8 @@ fn refine(onsets: &[(f64, u8)], bpm: f64, beat0: f64) -> (f64, f64) {
             break;
         }
         let slope = pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum::<f64>() / sxx;
-        if !(slope > 0.0) || (slope / step - 1.0).abs() > 0.03 {
+        // NaN (no spread to fit) fails `is_sign_positive` or the ratio test.
+        if slope.is_nan() || slope <= 0.0 || (slope / step - 1.0).abs() > 0.03 {
             return (bpm, beat0);
         }
         // An eighth-note line through the notes; a beat is every other one,

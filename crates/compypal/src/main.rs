@@ -36,7 +36,8 @@ fn track_rows(p: &Project) -> Vec<TrackRow> {
         .iter()
         .map(|t| {
             let instrument: String = if t.is_drums() { "Drums".into() } else { gm::program_name(t.program).into() };
-            let notes = t.clips.iter().map(|c| c.notes.len()).sum();
+            // What is heard: a muted clip (laid over by another) is not part of it.
+            let notes = t.absolute_notes().len();
             TrackRow {
                 key: format!("{}:{}:{instrument}:{notes}", t.id, t.name),
                 id: t.id,
@@ -337,6 +338,12 @@ fn PianoRoll() -> NodeHandle {
                 }
                 for n in roll.get().live {
                     div { key: n.key.clone(), class: "note live",
+                        style: {format!("left: {}px; top: {}px; width: {}px; height: {}px;",
+                            n.left + KEYS, n.top + 1.0, n.width, ROW - 2.0)},
+                    }
+                }
+                for n in roll.get().muted {
+                    div { key: n.key.clone(), class: "note muted",
                         style: {format!("left: {}px; top: {}px; width: {}px; height: {}px;",
                             n.left + KEYS, n.top + 1.0, n.width, ROW - 2.0)},
                     }
@@ -678,7 +685,11 @@ fn Arranger() -> NodeHandle {
                             for clip in row.clips.clone() {
                                 div {
                                     key: clip.key.clone(),
-                                    class: {if clip.recorded { "arr-clip recorded" } else { "arr-clip" }},
+                                    class: {match (clip.muted, clip.recorded) {
+                                        (true, _) => "arr-clip muted",
+                                        (false, true) => "arr-clip recorded",
+                                        _ => "arr-clip",
+                                    }},
                                     style: {format!("left: {}px; width: {}px;", clip.left, clip.width - 2.0)},
                                     onclick: {
                                         let (track, start) = (clip.track, clip.start);

@@ -147,6 +147,13 @@ pub fn list() -> Value {
             }}
         },
         {
+            "name": "use_sketch",
+            "description": "Makes a sketch (a session of the song, by id or name from get_project) the one heard where it sits; whatever else is on its track there is muted, not lost. For choosing between takes of the same bars.",
+            "inputSchema": {"type": "object", "properties": {
+                "session": {"type": ["string", "integer"]}
+            }, "required": ["session"]}
+        },
+        {
             "name": "get_selection",
             "description": "What the user has selected in the app (a figure, a track, or bars across all tracks, possibly a named section), with the chords and notes in it. When the user says \"this\", \"here\" or \"the selection\", start here.",
             "inputSchema": {"type": "object", "properties": {}}
@@ -388,6 +395,7 @@ pub fn call(app: &mut dyn App, name: &str, args: &Value) -> ToolResult {
         "get_sketch" => get_sketch(app, args),
         "hear_sketch" => hear_sketch(app, args),
         "add_sketch" => add_sketch(app, args),
+        "use_sketch" => use_sketch(app, args),
         "clean_take" => clean_take(app, args),
         "set_notes" => set_notes(app, args),
         "transform" => transform(app, args),
@@ -614,7 +622,10 @@ fn get_project(app: &mut dyn App) -> ToolResult {
             .tracks
             .iter()
             .filter(|t| t.clips.iter().any(|c| c.source_session == Some(s.id)))
-            .map(|t| format!("{:?}", t.name))
+            .map(|t| {
+                let heard = t.clips.iter().any(|c| c.source_session == Some(s.id) && !c.muted);
+                if heard { format!("{:?}", t.name) } else { format!("{:?} (muted: something else is heard there; use_sketch brings it back)", t.name) }
+            })
             .collect();
         out.push_str(&format!(
             "  {} {:?}: {} notes, {:.1}s, from bar {}, on {}\n",
@@ -868,6 +879,7 @@ fn add_sketch(app: &mut dyn App, args: &Value) -> ToolResult {
     let new_name = args.get("track").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| label.clone());
     let program = args.get("instrument").map(instrument_arg).transpose()?.unwrap_or(0);
     let mut placed = (0, 0, 0usize, String::new());
+    let mut muted = 0;
     app.edit(&format!("add sketch {label}"), &mut |p| {
         if let (Some(t), true) = (tempo, empty) {
             p.tempo = compypal_core::TempoMap::constant(t.bpm.round());
@@ -888,29 +900,33 @@ fn add_sketch(app: &mut dyn App, args: &Value) -> ToolResult {
             imported.notes.len(),
             p.track(track).map(|t| t.name.clone()).unwrap_or_default(),
         );
-        let t = p.track_mut(track).ok_or("no such track")?;
-        t.clips.push(compypal_core::Clip {
-            id: clip_id,
-            name: label.clone(),
-            start: clip_start,
-            length: end.div_ceil(bar).max(1) * bar,
-            notes: imported.notes,
-            source_session: Some(id),
-        });
-        t.clips.sort_by_key(|c| c.start);
+        // Over existing music, what was there is muted, not mixed in.
+        muted = p.add_clip_over(
+            track,
+            compypal_core::Clip {
+                id: clip_id,
+                name: label.clone(),
+                start: clip_start,
+                length: end.div_ceil(bar).max(1) * bar,
+                notes: imported.notes,
+                source_session: Some(id),
+                ..Default::default()
+            },
+        );
         p.sessions.push(session);
         Ok(())
     })?;
     let (first, last, notes, track) = placed;
     Ok(format!(
-        "Added {}–{} of sketch {} as session {label:?}: {notes} notes on track {track:?}, bars {first}-{last}, {}. It's as played; get_session and clean_take work on it now.",
+        "Added {}–{} of sketch {} as session {label:?}: {notes} notes on track {track:?}, bars {first}-{last}, {}.{} It's as played; get_session and clean_take work on it now.",
         mmss(from - j.start),
         mmss(to.min(j.end) - j.start),
         j.id,
         match tempo {
             Some(t) => format!("at {:.1} BPM (confidence {:.2})", t.bpm, t.confidence),
             None => "in free time (no steady beat found), at the song's tempo".into(),
-        }
+        },
+        if muted > 0 { " What was already on the track there is muted, kept as an alternative (use_sketch switches back)." } else { "" }
     ))
 }
 
@@ -958,6 +974,21 @@ pub fn selection_text(p: &Project, sel: &Selection) -> String {
         }
     }
     out
+}
+
+fn use_sketch(app: &mut dyn App, args: &Value) -> ToolResult {
+    let p = app.project();
+    let s = find_session(&p, args.get("session"))?;
+    let clips: Vec<Id> = p.tracks.iter().flat_map(|t| &t.clips).filter(|c| c.source_session == Some(s.id)).map(|c| c.id).collect();
+    if clips.is_empty() {
+        return Err(format!("{:?} isn't in the song; add it first", s.name));
+    }
+    let mut muted = 0;
+    app.edit(&format!("use {}", s.name), &mut |p| {
+        muted = clips.iter().map(|c| p.prefer_clip(*c)).sum();
+        Ok(())
+    })?;
+    Ok(format!("{:?} is heard now; {muted} clip(s) under it muted.", s.name))
 }
 
 fn get_session(app: &mut dyn App, args: &Value) -> ToolResult {
@@ -1075,7 +1106,7 @@ fn clean_take(app: &mut dyn App, args: &Value) -> ToolResult {
         clips = 0;
         for t in &mut p.tracks {
             for c in t.clips.iter_mut().filter(|c| c.source_session == Some(s.id)) {
-                c.notes = fresh.clone();
+                c.refill(&fresh);
                 clips += 1;
             }
         }

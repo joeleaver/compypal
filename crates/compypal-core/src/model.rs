@@ -64,6 +64,28 @@ impl Project {
         id
     }
 
+    /// Lays `clip` on `track` over whatever plays there, which is muted
+    /// rather than lost (see [`Track::add_over`]). Returns how many clips
+    /// it muted.
+    pub fn add_clip_over(&mut self, track: Id, clip: Clip) -> usize {
+        let next = &mut self.next_id;
+        let Some(t) = self.tracks.iter_mut().find(|t| t.id == track) else { return 0 };
+        t.add_over(clip, &mut || {
+            *next += 1;
+            Id(*next - 1)
+        })
+    }
+
+    /// Makes clip `clip` the one heard on its track over its span.
+    pub fn prefer_clip(&mut self, clip: Id) -> usize {
+        let next = &mut self.next_id;
+        let Some(t) = self.tracks.iter_mut().find(|t| t.clips.iter().any(|c| c.id == clip)) else { return 0 };
+        t.prefer(clip, &mut || {
+            *next += 1;
+            Id(*next - 1)
+        })
+    }
+
     pub fn add_track(&mut self, name: impl Into<String>, program: u8) -> Id {
         let id = self.alloc_id();
         let channel = self.next_free_channel();
@@ -170,15 +192,67 @@ impl Track {
         self.channel == DRUM_CHANNEL
     }
 
-    /// All notes on the track in absolute ticks, sorted by start.
+    /// The notes that are heard, in absolute ticks, sorted by start.
+    /// Muted clips (the alternatives under something laid over them) are
+    /// left out.
     pub fn absolute_notes(&self) -> Vec<Note> {
-        let mut notes: Vec<Note> = self.clips.iter().flat_map(|c| c.absolute_notes()).collect();
+        let mut notes: Vec<Note> = self.clips.iter().filter(|c| !c.muted).flat_map(|c| c.absolute_notes()).collect();
         notes.sort_by_key(|n| (n.start, n.pitch));
         notes
     }
+
+    /// The notes of muted clips: what was there before something was laid
+    /// over it.
+    pub fn muted_notes(&self) -> Vec<Note> {
+        let mut notes: Vec<Note> = self.clips.iter().filter(|c| c.muted).flat_map(|c| c.absolute_notes()).collect();
+        notes.sort_by_key(|n| (n.start, n.pitch));
+        notes
+    }
+
+    /// Splits clips running across `at` in two, so that `at` is an edge.
+    fn cut_at(&mut self, at: Tick, alloc: &mut dyn FnMut() -> Id) {
+        let mut added = Vec::new();
+        for c in &mut self.clips {
+            if c.start < at && c.start + c.length > at {
+                added.push(c.split_at(at, alloc()));
+            }
+        }
+        self.clips.extend(added);
+        self.clips.sort_by_key(|c| c.start);
+    }
+
+    /// Lays `clip` over whatever plays there. What it covers isn't lost:
+    /// those clips are cut at its edges and the covered parts muted, kept
+    /// as alternatives (see [`Track::prefer`]). Returns how many clips were
+    /// muted.
+    pub fn add_over(&mut self, clip: Clip, alloc: &mut dyn FnMut() -> Id) -> usize {
+        let id = clip.id;
+        self.clips.push(clip);
+        self.clips.sort_by_key(|c| c.start);
+        self.prefer(id, alloc)
+    }
+
+    /// Makes clip `id` the one heard over its span: it's unmuted, and
+    /// every other clip there is cut at its edges and muted. Returns how
+    /// many clips were muted.
+    pub fn prefer(&mut self, id: Id, alloc: &mut dyn FnMut() -> Id) -> usize {
+        let Some((from, to)) = self.clips.iter().find(|c| c.id == id).map(|c| (c.start, c.start + c.length)) else { return 0 };
+        self.cut_at(from, alloc);
+        self.cut_at(to, alloc);
+        let mut muted = 0;
+        for c in &mut self.clips {
+            if c.id == id {
+                c.muted = false;
+            } else if c.start < to && c.start + c.length > from && !c.muted && c.absolute_notes().next().is_some() {
+                c.muted = true;
+                muted += 1;
+            }
+        }
+        muted
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Clip {
     pub id: Id,
     pub name: String,
@@ -189,9 +263,52 @@ pub struct Clip {
     /// The session this clip was derived from, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_session: Option<Id>,
+    /// How far into its session's notes this clip begins, once split:
+    /// re-deriving it from the take refills only its own window.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub source_offset: Tick,
+    /// Not heard: something else was laid over it. Kept as an alternative.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub muted: bool,
+}
+
+fn is_zero(t: &Tick) -> bool {
+    *t == 0
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Clip {
+    /// Splits off the part from `at` (absolute) on, as a new clip `id`;
+    /// this one keeps what's before. Notes sounding across `at` are cut
+    /// there.
+    pub fn split_at(&mut self, at: Tick, id: Id) -> Clip {
+        let rel = at.saturating_sub(self.start).min(self.length);
+        let (before, after): (Vec<Note>, Vec<Note>) = self.notes.iter().partition(|n| n.start < rel);
+        let right = Clip {
+            id,
+            name: self.name.clone(),
+            start: self.start + rel,
+            length: self.length - rel,
+            notes: after.into_iter().map(|n| Note { start: n.start - rel, ..n }).collect(),
+            source_session: self.source_session,
+            source_offset: self.source_offset + rel,
+            muted: self.muted,
+        };
+        self.notes = before.into_iter().map(|n| Note { duration: n.duration.min(rel - n.start).max(1), ..n }).collect();
+        self.length = rel;
+        right
+    }
+
+    /// Refills the clip from its take's notes (as imported, relative to
+    /// the take's own start), keeping to this clip's window.
+    pub fn refill(&mut self, fresh: &[Note]) {
+        let (from, to) = (self.source_offset, self.source_offset + self.length);
+        self.notes = fresh.iter().filter(|n| n.start >= from && n.start < to).map(|n| Note { start: n.start - from, ..*n }).collect();
+    }
+
     /// Notes in absolute ticks. Notes that start past the clip end are
     /// hidden; notes that run past it are cut at the boundary.
     pub fn absolute_notes(&self) -> impl Iterator<Item = Note> + '_ {
@@ -388,8 +505,55 @@ mod tests {
                 Note { pitch: 62, velocity: 90, start: 60, duration: 10 },
             ],
             source_session: None,
+            ..Default::default()
         };
         let notes: Vec<_> = clip.absolute_notes().collect();
         assert_eq!(notes, vec![Note { pitch: 60, velocity: 90, start: 140, duration: 10 }]);
+    }
+
+    fn clip(id: u64, start: Tick, length: Tick, every: Tick) -> Clip {
+        let notes = (0..length / every).map(|i| Note { pitch: 60, velocity: 90, start: i * every, duration: every / 2 }).collect();
+        Clip { id: Id(id), name: format!("c{id}"), start, length, notes, ..Default::default() }
+    }
+
+    #[test]
+    fn laying_over_music_mutes_only_what_it_covers() {
+        let mut p = Project::new("t");
+        let t = p.add_track("Keys", 0);
+        let q = PPQ as Tick;
+        // Bars 1-4 played; a new take over bars 3-4.
+        let old = clip(100, 0, 16 * q, q);
+        p.track_mut(t).unwrap().clips.push(old);
+        let muted = p.add_clip_over(t, clip(200, 8 * q, 8 * q, q / 2));
+        assert_eq!(muted, 1);
+        let track = p.track(t).unwrap();
+        let heard = track.absolute_notes();
+        // Bars 1-2 of the old part, then the new one: nothing doubled.
+        assert_eq!(heard.iter().filter(|n| n.start < 8 * q).count(), 8);
+        assert_eq!(heard.iter().filter(|n| n.start >= 8 * q).count(), 16);
+        assert_eq!(track.muted_notes().len(), 8, "the covered half of the old part is kept, muted");
+        // The old half keeps its place in the take, for re-deriving.
+        let half = track.clips.iter().find(|c| c.muted).unwrap();
+        assert_eq!((half.start, half.source_offset), (8 * q, 8 * q));
+
+        // Changing your mind: the old part again.
+        let id = half.id;
+        p.prefer_clip(id);
+        let track = p.track(t).unwrap();
+        assert_eq!(track.absolute_notes().len(), 16);
+        assert_eq!(track.muted_notes().len(), 16);
+    }
+
+    #[test]
+    fn a_split_clip_refills_only_its_window() {
+        let q = PPQ as Tick;
+        let mut c = clip(1, 0, 8 * q, q);
+        let mut right = c.split_at(4 * q, Id(2));
+        let fresh: Vec<Note> = (0..8).map(|i| Note { pitch: 64, velocity: 80, start: i * q, duration: q }).collect();
+        c.refill(&fresh);
+        right.refill(&fresh);
+        assert_eq!(c.notes.iter().map(|n| n.start).collect::<Vec<_>>(), [0, q, 2 * q, 3 * q]);
+        assert_eq!(right.notes.iter().map(|n| n.start).collect::<Vec<_>>(), [0, q, 2 * q, 3 * q]);
+        assert!(right.notes.iter().all(|n| n.pitch == 64));
     }
 }

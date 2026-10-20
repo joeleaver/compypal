@@ -133,6 +133,7 @@ pub fn duplicate_time(p: &mut Project, from: Tick, len: Tick) {
                     length: len,
                     notes: notes.iter().map(|n| Note { start: n.start - to, ..*n }).collect(),
                     source_session: None,
+                    ..Default::default()
                 });
                 t.clips.sort_by_key(|c| c.start);
             }

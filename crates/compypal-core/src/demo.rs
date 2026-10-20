@@ -80,6 +80,7 @@ pub fn project() -> Project {
         length: 4 * bar,
         notes,
         source_session: Some(session_id),
+        ..Default::default()
     });
 
     let bass = p.add_track("Bass", 33);
@@ -104,6 +105,7 @@ pub fn project() -> Project {
         length: 4 * bar,
         notes: bass_notes,
         source_session: None,
+        ..Default::default()
     });
 
     let drums = p.add_drum_track("Drums");
@@ -124,6 +126,7 @@ pub fn project() -> Project {
         length: 4 * bar,
         notes: drum_notes,
         source_session: None,
+        ..Default::default()
     });
 
     let id = p.alloc_id();

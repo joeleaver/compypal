@@ -25,7 +25,7 @@ Early. Working today:
 - Arranger: sections and clips across tracks; duplicate, insert or delete bars song-wide
 - Playback through a General MIDI SoundFont, metronome, looping
 - Recording from a MIDI controller into raw sessions, with live display
-- Listen mode: leave it running and everything you play is journaled and split into jams; keep the good bits later, or ask the agent to find them
+- Sketches: leave Listen on and everything you play is kept and split into ideas automatically, named by their chords; add the good ones to the song, or ask the agent to find them. Music added over music becomes an alternative, not a mix
 - An agent panel inside the app (Ctrl+L) that runs Claude Code, Gemini CLI, Qwen Code, opencode, goose, or any agent that speaks the [Agent Client Protocol](https://agentclientprotocol.com)
 - MCP tools for reading, cleaning, composing and arranging, usable from any MCP client
 

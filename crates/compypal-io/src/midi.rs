@@ -193,6 +193,7 @@ pub fn import(bytes: &[u8], name: &str) -> Result<Project, MidiError> {
                 length,
                 notes: ns,
                 source_session: None,
+                ..Default::default()
             });
         }
     }

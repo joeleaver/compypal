@@ -301,6 +301,7 @@ mod tests {
             length: len,
             notes,
             source_session: None,
+            ..Default::default()
         });
         p
     }

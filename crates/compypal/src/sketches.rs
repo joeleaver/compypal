@@ -76,7 +76,7 @@ pub struct Item {
 
 /// What a session is called in the list. Takes recorded before sketches
 /// had names ("Take 3") are named by their music.
-fn session_name(s: &Session) -> String {
+pub fn session_name(s: &Session) -> String {
     let numbered = s.name.strip_prefix("Take ").is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()));
     match (numbered, jam::summarize(&s.events)) {
         (true, Some(sum)) => jam::sketch_name(&sum),
@@ -84,12 +84,19 @@ fn session_name(s: &Session) -> String {
     }
 }
 
-/// Where a session's music is in the song, if anywhere.
+/// Where a session's music is in the song, if anywhere, and whether it's
+/// heard there (something laid over it mutes it).
 fn used_in(p: &Project, session: Id) -> Option<String> {
     p.tracks.iter().find_map(|t| {
-        let c = t.clips.iter().find(|c| c.source_session == Some(session))?;
-        let (a, b) = (text::bar_of(p, c.start), text::bar_of(p, (c.start + c.length).saturating_sub(1)));
-        Some(if a == b { format!("{}, bar {a}", t.name) } else { format!("{}, bars {a}–{b}", t.name) })
+        let clips: Vec<_> = t.clips.iter().filter(|c| c.source_session == Some(session)).collect();
+        let (first, last) = (clips.first()?, clips.last()?);
+        let (a, b) = (text::bar_of(p, first.start), text::bar_of(p, (last.start + last.length).saturating_sub(1)));
+        let bars = if a == b { format!("bar {a}") } else { format!("bars {a}–{b}") };
+        Some(match clips.iter().filter(|c| c.muted).count() {
+            0 => format!("{}, {bars}", t.name),
+            n if n == clips.len() => format!("{}, {bars} (muted)", t.name),
+            _ => format!("{}, {bars} (partly muted)", t.name),
+        })
     })
 }
 
@@ -160,6 +167,7 @@ pub fn items(p: &Project, played: &[Played], now: f64) -> Vec<Item> {
     out.into_iter()
         .map(|(_, mut i)| {
             (i.tag, i.tag_class) = match &i.in_song {
+                Some(place) if place.ends_with("(muted)") => (format!("In the song: {place}"), "sketch-tag"),
                 Some(place) => (format!("In the song: {place}"), "sketch-tag used"),
                 None => ("Not in the song".into(), "sketch-tag"),
             };
@@ -412,6 +420,9 @@ pub fn SketchesView() -> NodeHandle {
                         match (d.in_song.clone(), source) {
                             (Some(place), Source::Session(id)) => div { class: "sketch-place",
                                 span { class: "sketch-tag used", {format!("In the song: {place}")} }
+                                if place.contains("muted") {
+                                    Button { size: "sm", variant: "light", onclick: move || store.use_session(id), "Use this one" }
+                                }
                                 Button { size: "sm", variant: "light", onclick: move || store.tidy_session(id), "Tidy" }
                                 Button { size: "sm", variant: "filled", onclick: move || show_in_song(store, id), "Show in song" }
                             },
