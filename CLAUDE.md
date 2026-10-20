@@ -247,10 +247,11 @@ mic hears the room.
   by their rise; the chord via `theory::best_fit`; in strummed playing a
   light stroke strikes everything ringing from the last strum's bass up),
   `analysis::line` (one voice or line: YIN pitch every 10 ms, voiced
-  only above the recording's own noise floor so low gain still works, a
-  note held
-  through vibrato and scoops until the pitch settles a semitone away for
-  60 ms, split at breaks and at onsets where the level jumps) and Basic
+  only above the recording's own noise floor so low gain still works;
+  stretches split at breaks and at onsets where the level jumps, then cut
+  by a DP into the fewest notes that explain the pitch: each note costs
+  `NOTE_COST`, each frame its capped distance from its semitone, so
+  wavering and scoops stay in a note) and Basic
   Pitch's notes (`basic_pitch`, tract, the reference's note
   post-processing). Strummed playing (`chordal` >= 0.5) reads as strums,
   one clear pitch at a time (`monophony` >= 0.6) as a line, anything else
