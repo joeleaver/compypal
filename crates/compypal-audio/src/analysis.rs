@@ -571,6 +571,216 @@ pub fn strums(samples: &[f32], rate: u32) -> Strums {
     Strums { heard, notes, chordal }
 }
 
+// --- one line: a voice, a whistle, a single string ------------------------
+
+/// Pitch frames every 10 ms.
+const LINE_HOP_SECS: f64 = 0.01;
+/// Two periods of the lowest pitch tracked, with room.
+const LINE_WINDOW: usize = 1024;
+const LINE_LOWEST_HZ: f32 = 70.0;
+const LINE_HIGHEST_HZ: f32 = 1_400.0;
+/// YIN's threshold on the normalised difference: below it, a period.
+const YIN_THRESHOLD: f32 = 0.15;
+/// The longest a voice may leave its note before it's a new one: a note
+/// is held through vibrato and scoops, and only a new pitch held this
+/// long counts as moving on.
+const SETTLE: usize = 6;
+const MIN_LINE_NOTE: f64 = 0.07;
+
+/// One frame of the pitch track.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PitchFrame {
+    pub t: f64,
+    /// MIDI pitch with cents (60.25 is a quarter tone above C4), when the
+    /// frame is voiced: a clear period, loud enough.
+    pub pitch: Option<f32>,
+    /// 0..1: how periodic the frame is.
+    pub clarity: f32,
+    /// dBFS.
+    pub level: f32,
+}
+
+/// The fundamental of one window by YIN (de Cheveigné & Kawahara): the
+/// first lag whose cumulative-mean-normalised difference dips under the
+/// threshold, refined between samples. (frequency, clarity)
+fn yin(frame: &[f32], rate: u32) -> Option<(f32, f32)> {
+    let min_lag = (rate as f32 / LINE_HIGHEST_HZ) as usize;
+    let max_lag = ((rate as f32 / LINE_LOWEST_HZ) as usize).min(frame.len() / 2);
+    let w = frame.len() - max_lag;
+    let mut d = vec![0.0f32; max_lag + 1];
+    for (lag, slot) in d.iter_mut().enumerate().skip(1) {
+        *slot = (0..w).map(|i| (frame[i] - frame[i + lag]).powi(2)).sum();
+    }
+    let mut cmnd = vec![1.0f32; max_lag + 1];
+    let mut running = 0.0;
+    for lag in 1..=max_lag {
+        running += d[lag];
+        cmnd[lag] = if running > 0.0 { d[lag] * lag as f32 / running } else { 1.0 };
+    }
+    let mut lag = (min_lag.max(2)..max_lag).find(|&l| cmnd[l] < YIN_THRESHOLD)?;
+    while lag + 1 < max_lag && cmnd[lag + 1] < cmnd[lag] {
+        lag += 1;
+    }
+    let (a, b, c) = (cmnd[lag - 1], cmnd[lag], cmnd[lag + 1]);
+    let den = a - 2.0 * b + c;
+    let shift = if den.abs() > 1e-9 { 0.5 * (a - c) / den } else { 0.0 };
+    Some((rate as f32 / (lag as f32 + shift.clamp(-0.5, 0.5)), (1.0 - b).clamp(0.0, 1.0)))
+}
+
+/// The pitch of a recording every 10 ms. Quiet frames (40 dB under the
+/// loudest, or nearly silent) are unvoiced whatever their period.
+pub fn pitch_track(samples: &[f32], rate: u32) -> Vec<PitchFrame> {
+    let hop = (LINE_HOP_SECS * rate as f64) as usize;
+    let mut frames = Vec::new();
+    let mut start = 0;
+    while start + LINE_WINDOW <= samples.len() {
+        let frame = &samples[start..start + LINE_WINDOW];
+        let rms = (frame.iter().map(|s| s * s).sum::<f32>() / LINE_WINDOW as f32).sqrt();
+        let level = 20.0 * (rms + 1e-9).log10();
+        let found = if level > -60.0 { yin(frame, rate) } else { None };
+        frames.push(PitchFrame {
+            t: (start + LINE_WINDOW / 2) as f64 / rate as f64,
+            pitch: found.map(|(f, _)| 69.0 + 12.0 * (f / 440.0).log2()),
+            clarity: found.map_or(0.0, |(_, c)| c),
+            level,
+        });
+        start += hop;
+    }
+    let loudest = frames.iter().map(|f| f.level).fold(-120.0f32, f32::max);
+    for f in &mut frames {
+        if f.level < (loudest - 40.0).max(-55.0) {
+            f.pitch = None;
+        }
+    }
+    // A median over five frames: one stray octave jump isn't a note.
+    let raw: Vec<Option<f32>> = frames.iter().map(|f| f.pitch).collect();
+    for (i, f) in frames.iter_mut().enumerate() {
+        if f.pitch.is_none() {
+            continue;
+        }
+        let mut near: Vec<f32> = raw[i.saturating_sub(2)..(i + 3).min(raw.len())].iter().flatten().copied().collect();
+        near.sort_by(f32::total_cmp);
+        f.pitch = Some(near[near.len() / 2]);
+    }
+    frames
+}
+
+/// How much of the sound is one clear pitch at a time: the share of loud
+/// frames that are voiced. A voice or a single line is most of it; chords
+/// and noise are little.
+pub fn monophony(track: &[PitchFrame]) -> f32 {
+    let loudest = track.iter().map(|f| f.level).fold(-120.0f32, f32::max);
+    let loud: Vec<&PitchFrame> = track.iter().filter(|f| f.level > loudest - 25.0).collect();
+    if loud.is_empty() {
+        return 0.0;
+    }
+    loud.iter().filter(|f| f.pitch.is_some() && f.clarity > 0.8).count() as f32 / loud.len() as f32
+}
+
+/// Notes of one line (a voice, a whistle, a single string) from its pitch
+/// track. A note holds through vibrato and scoops; a new one starts when
+/// the pitch settles a semitone or more away for 60 ms (from where it
+/// left), at a break in the sound, or at an attack in the middle of it
+/// (`onsets`: a consonant, a re-picked string). Its pitch is where it
+/// spent its time; its velocity follows its level.
+pub fn line_notes(track: &[PitchFrame], onsets: &[Onset]) -> Vec<HeardNote> {
+    let loudest = track.iter().map(|f| f.level).fold(-120.0f32, f32::max);
+    let velocity = |level: f32| (40.0 + 87.0 * ((level - (loudest - 30.0)) / 30.0).clamp(0.0, 1.0)) as u8;
+    let mut out = Vec::new();
+    // The note being sung: first frame, its frames' pitches, its peak.
+    let mut current: Option<(usize, Vec<f32>, f32)> = None;
+    let mut away = 0usize;
+    let mut next_onset = 0;
+    let close = |cur: &mut Option<(usize, Vec<f32>, f32)>, end: f64, out: &mut Vec<HeardNote>| {
+        if let Some((first, pitches, peak)) = cur.take() {
+            let start = track[first].t - LINE_HOP_SECS / 2.0;
+            let mut sorted = pitches.clone();
+            sorted.sort_by(f32::total_cmp);
+            let pitch = sorted[sorted.len() / 2].round().clamp(0.0, 127.0) as u8;
+            if end - start >= MIN_LINE_NOTE {
+                out.push(HeardNote { start, end, pitch, velocity: velocity(peak) });
+            }
+        }
+    };
+    for (i, f) in track.iter().enumerate() {
+        let edge = f.t - LINE_HOP_SECS / 2.0;
+        // An attack that is one: the sound got louder (a gliding voice
+        // makes spectral flux too, but no jump in level).
+        let louder = i >= 4 && f.level > track[i - 4..i].iter().map(|r| r.level).fold(f32::MAX, f32::min) + 4.0;
+        let attack = louder && onsets.get(next_onset).is_some_and(|o| o.t <= f.t + 0.02);
+        while onsets.get(next_onset).is_some_and(|o| o.t <= f.t) {
+            next_onset += 1;
+        }
+        let Some(p) = f.pitch else {
+            close(&mut current, edge, &mut out);
+            away = 0;
+            continue;
+        };
+        match current.as_mut() {
+            Some((first, pitches, _)) if attack && i - *first > 3 => {
+                let _ = pitches;
+                close(&mut current, edge, &mut out);
+                current = Some((i, vec![p], f.level));
+            }
+            Some((first, pitches, peak)) => {
+                let mut held: Vec<f32> = pitches.clone();
+                held.sort_by(f32::total_cmp);
+                let centre = held[held.len() / 2];
+                if (p - centre).abs() < 0.75 {
+                    pitches.push(p);
+                    *peak = peak.max(f.level);
+                    away = 0;
+                } else {
+                    away += 1;
+                    // Settled somewhere new: the new note starts where the
+                    // voice left the old one.
+                    // The last 60 ms agree on a pitch: the new note starts
+                    // where the voice reached it.
+                    let last = &track[i + 1 - SETTLE.min(away)..=i];
+                    let mut there: Vec<f32> = last.iter().filter_map(|r| r.pitch).collect();
+                    there.sort_by(f32::total_cmp);
+                    let mid = there.get(there.len() / 2).copied().unwrap_or(p);
+                    let settled = away >= SETTLE && there.len() == last.len() && there.iter().all(|q| (q - mid).abs() < 0.75);
+                    if settled {
+                        let mut from = i;
+                        while from > i + 1 - away && track[from - 1].pitch.is_some_and(|q| (q - mid).abs() < 0.75) {
+                            from -= 1;
+                        }
+                        let _ = first;
+                        close(&mut current, track[from].t - LINE_HOP_SECS / 2.0, &mut out);
+                        let recent = &track[from..=i];
+                        let pitches: Vec<f32> = recent.iter().filter_map(|r| r.pitch).collect();
+                        let peak = recent.iter().map(|r| r.level).fold(-120.0f32, f32::max);
+                        current = Some((from, pitches, peak));
+                        away = 0;
+                    } else if away >= SETTLE * 3 {
+                        // Wandering, not settling (a long slide): stop here.
+                        close(&mut current, edge, &mut out);
+                        away = 0;
+                    }
+                }
+            }
+            None => current = Some((i, vec![p], f.level)),
+        }
+    }
+    let end = track.last().map_or(0.0, |f| f.t + LINE_HOP_SECS / 2.0);
+    close(&mut current, end, &mut out);
+    out
+}
+
+/// A single line as notes: [`pitch_track`], [`onsets`], [`line_notes`].
+pub struct Line {
+    pub notes: Vec<HeardNote>,
+    /// See [`monophony`].
+    pub monophony: f32,
+}
+
+pub fn line(samples: &[f32], rate: u32) -> Line {
+    let track = pitch_track(samples, rate);
+    let ons = onsets(samples, rate);
+    Line { notes: line_notes(&track, &ons), monophony: monophony(&track) }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -768,5 +978,66 @@ pub(crate) mod tests {
             let h = s.heard.iter().find(|h| (h.t - t).abs() < 0.05).unwrap();
             assert_eq!(h.chord.map(|c| c.name(theory::Spelling::Sharps)).as_deref(), Some(*want), "{h:?}");
         }
+    }
+
+    /// A voice-like tone: harmonics falling off, vibrato, and legato from
+    /// note to note (a 60 ms scoop, no break, no attack).
+    pub fn sung(melody: &[u8], each: f64, rate: u32) -> Vec<f32> {
+        let n = ((melody.len() as f64 * each + 0.6) * rate as f64) as usize;
+        let mut out = vec![0.0f32; n];
+        let mut phase = 0.0f64;
+        let lead = 0.3;
+        for (i, s) in out.iter_mut().enumerate() {
+            let t = i as f64 / rate as f64 - lead;
+            if t < 0.0 || t >= melody.len() as f64 * each {
+                continue;
+            }
+            let k = ((t / each) as usize).min(melody.len() - 1);
+            let into = t - k as f64 * each;
+            let from = if k > 0 { melody[k - 1] as f64 } else { melody[0] as f64 };
+            let to = melody[k] as f64;
+            let glide = (into / 0.06).min(1.0);
+            let vibrato = 0.3 * (std::f64::consts::TAU * 5.5 * t).sin() * (t / 0.3).min(1.0);
+            let pitch = from + (to - from) * glide + vibrato;
+            let f = 440.0 * 2f64.powf((pitch - 69.0) / 12.0);
+            phase += std::f64::consts::TAU * f / rate as f64;
+            let fade = (t / 0.05).min(1.0) * ((melody.len() as f64 * each - t) / 0.05).min(1.0);
+            let v: f64 = (1..=6).map(|h| (phase * h as f64).sin() / (h * h) as f64).sum();
+            *s = (0.2 * fade * v) as f32;
+        }
+        out
+    }
+
+    #[test]
+    fn a_sung_line_without_attacks() {
+        let melody = [60u8, 62, 64, 65, 67, 65, 64, 62, 60];
+        let audio = sung(&melody, 0.4, RATE);
+        let l = line(&audio, RATE);
+        let got: Vec<u8> = l.notes.iter().map(|n| n.pitch).collect();
+        assert_eq!(got, melody, "{:?}", l.notes);
+        for (i, n) in l.notes.iter().enumerate() {
+            let want = 0.3 + i as f64 * 0.4;
+            assert!((n.start - want).abs() < 0.07, "note {i} at {} not {want}", n.start);
+        }
+        assert!(l.monophony > 0.8, "{}", l.monophony);
+        // Strummed chords are not a line.
+        let (strum, _) = strummed(&[G, C, D, EM], 100.0, RATE);
+        assert!(line(&strum, RATE).monophony < 0.5);
+    }
+
+    #[test]
+    fn the_same_note_twice_is_two_notes() {
+        // Sung twice with a breath between, then plucked twice.
+        let mut audio = sung(&[64], 0.5, RATE);
+        audio.extend(vec![0.0; RATE as usize / 5]);
+        audio.extend(sung(&[64], 0.5, RATE));
+        let notes = line(&audio, RATE).notes;
+        assert_eq!(notes.iter().map(|n| n.pitch).collect::<Vec<_>>(), [64, 64], "{notes:?}");
+        let mut plucked = vec![0.0f32; RATE as usize * 2];
+        pluck(&mut plucked, RATE, 0.2, 57, 0.2);
+        pluck(&mut plucked, RATE, 0.9, 57, 0.2);
+        let notes = line(&plucked, RATE).notes;
+        assert_eq!(notes.iter().map(|n| n.pitch).collect::<Vec<_>>(), [57, 57], "{notes:?}");
+        assert!((notes[1].start - 0.9).abs() < 0.05, "{notes:?}");
     }
 }

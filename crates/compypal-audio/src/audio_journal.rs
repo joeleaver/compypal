@@ -34,8 +34,10 @@ pub struct Chunk {
 pub enum Reading {
     /// Strums and their chords ([`analysis::strums`]): strummed playing.
     Strums,
-    /// Every note Basic Pitch hears: picking, melodies.
+    /// Every note Basic Pitch hears: picking, several voices at once.
     Notes,
+    /// One line ([`analysis::line`]): a voice, a whistle, single notes.
+    Line,
 }
 
 /// A recording, written down.
@@ -52,20 +54,30 @@ pub struct Transcript {
     /// As notes, when the Basic Pitch model was there to hear them.
     #[serde(default)]
     pub notes: Option<Vec<RawEvent>>,
+    /// As one line, by its pitch.
+    #[serde(default)]
+    pub line: Option<Vec<RawEvent>>,
+    /// How much of it was one clear pitch at a time, 0..1.
+    #[serde(default)]
+    pub monophony: f32,
 }
 
 impl Transcript {
     pub fn events(&self) -> &[RawEvent] {
-        match (self.reading, &self.notes) {
-            (Reading::Notes, Some(n)) => n,
+        match (self.reading, &self.notes, &self.line) {
+            (Reading::Notes, Some(n), _) => n,
+            (Reading::Line, _, Some(l)) => l,
             _ => &self.strums,
         }
     }
 }
 
-/// Writes down a recording at [`RATE`]. Strummed playing is read as
-/// strums (chords on their rhythm, cleaner than every string's note);
-/// anything else as Basic Pitch's notes when the model is there.
+/// Writes down a recording at [`RATE`], every way it can, and picks the
+/// reading that suits it: strummed playing as strums (chords on their
+/// rhythm, cleaner than every string's note); one voice or one line by
+/// its pitch (a polyphonic model hears a voice's harmonics as notes, and
+/// splits its vibrato); anything else as Basic Pitch's notes when the
+/// model is there, else as strums.
 pub fn transcribe(samples: &[f32], start: f64, model: Option<&BasicPitch>) -> Transcript {
     let strums = analysis::strums(samples, RATE);
     let shift = |ev: Vec<RawEvent>| ev.into_iter().map(|e| RawEvent { t: e.t + start, ..e }).collect::<Vec<_>>();
@@ -76,8 +88,26 @@ pub fn transcribe(samples: &[f32], start: f64, model: Option<&BasicPitch>) -> Tr
             None
         }
     });
-    let reading = if notes.is_some() && strums.chordal < 0.5 { Reading::Notes } else { Reading::Strums };
-    Transcript { start, seconds: samples.len() as f64 / RATE as f64, reading, chordal: strums.chordal, strums: shift(strums.events()), notes }
+    let line = analysis::line(samples, RATE);
+    let reading = if strums.chordal >= 0.5 {
+        Reading::Strums
+    } else if line.monophony >= 0.6 {
+        Reading::Line
+    } else if notes.is_some() {
+        Reading::Notes
+    } else {
+        Reading::Strums
+    };
+    Transcript {
+        start,
+        seconds: samples.len() as f64 / RATE as f64,
+        reading,
+        chordal: strums.chordal,
+        strums: shift(strums.events()),
+        notes,
+        line: Some(shift(analysis::notes_to_events(&line.notes))),
+        monophony: line.monophony,
+    }
 }
 
 /// The sketches in a transcribed recording, each pointing back at it.
@@ -296,6 +326,26 @@ pub fn unfinished(dir: &Path) -> Vec<Job> {
 mod tests {
     use super::*;
     use crate::analysis::tests::{C, D, EM, G, strummed};
+
+    #[test]
+    fn a_sung_melody_becomes_a_sketch() {
+        // A tune sung twice, in time at 100 BPM (a beat a note).
+        let tune = [60u8, 64, 67, 72, 71, 67, 64, 62, 60, 64, 67, 72, 71, 67, 65, 64];
+        let audio = crate::analysis::tests::sung(&tune, 0.6, RATE);
+        let t = transcribe(&audio, 2_000_000.0, None);
+        assert_eq!(t.reading, Reading::Line, "monophony {} chordal {}", t.monophony, t.chordal);
+        let sketches = sketches_of(2_000_000, &t);
+        assert_eq!(sketches.len(), 1, "{sketches:?}");
+        assert_eq!(sketches[0].notes, tune.len(), "{:?}", t.line);
+        assert!(sketches[0].tempo.is_some_and(|g| (g.bpm - 100.0).abs() < 2.0 || (g.bpm - 50.0).abs() < 1.0), "{:?}", sketches[0].tempo);
+        // With the model there, one voice is still read as one line.
+        if let Some(path) = crate::basic_pitch::model_path(None) {
+            let bp = BasicPitch::load(&path).unwrap();
+            let t = transcribe(&audio, 2_000_000.0, Some(&bp));
+            assert_eq!(t.reading, Reading::Line);
+            assert!(t.notes.is_some());
+        }
+    }
 
     #[test]
     fn strummed_guitar_becomes_a_sketch() {

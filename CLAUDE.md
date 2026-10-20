@@ -239,20 +239,25 @@ mic hears the room.
   `transcriber` then writes it down (`audio/<start>.json`, a `Transcript`)
   and files its sketches; a jam with no sketch in it isn't kept. Files cut
   short by a quit are repaired and transcribed at the next start.
-- Two readings, both kept in the transcript: `analysis::strums` (onsets
+- Three readings, all kept in the transcript: `analysis::strums` (onsets
   by spectral flux placed on the waveform; per onset the notes sounding by
   harmonic sums on a 16k FFT, tuned to the instrument; which were struck,
   by their rise; the chord via `theory::best_fit`; in strummed playing a
-  light stroke strikes everything ringing from the last strum's bass up)
-  and Basic Pitch's notes (`basic_pitch`, tract, the reference's note
+  light stroke strikes everything ringing from the last strum's bass up),
+  `analysis::line` (one voice or line: YIN pitch every 10 ms, a note held
+  through vibrato and scoops until the pitch settles a semitone away for
+  60 ms, split at breaks and at onsets where the level jumps) and Basic
+  Pitch's notes (`basic_pitch`, tract, the reference's note
   post-processing). Strummed playing (`chordal` >= 0.5) reads as strums,
-  anything else as notes when the model is there. The events go through the
+  one clear pitch at a time (`monophony` >= 0.6) as a line, anything else
+  as notes when the model is there, else strums. The Sketches view says
+  which ("read as one line"). The events go through the
   same `split_sketches` / `summarize` / `sketch_name` / `estimate_tempo`
   as MIDI.
 - The model isn't in the repo: `COMPYPAL_BASIC_PITCH`, else
   `<data dir>/models/basic-pitch.onnx` (Spotify's `nmp.onnx`, Apache-2.0).
-  Without it everything works on the strum reader, which handles strums and
-  plucked lines but not legato singing (no attacks to find).
+  Without it, strums and single lines (singing included) still work;
+  only several independent voices at once need the model.
 - A `Sketch`/`Session` with `audio: Some(AudioRef)` was heard: `start` is
   the recording's first sample in the events' clock (unix seconds for a
   sketch, seconds into the session for a session). `Journal::sketch_events`
@@ -332,7 +337,9 @@ creates projects; the agent has `list_projects` and `open_project`.
 4b. ~~Sketches~~ (done): raw playing split into ideas, one list, alternative
    lanes under music, picked per bar range in the roll, hiding and taking
    out. ~~Audio sketches~~ (done): a mic or interface, journaled, read as
-   strums or Basic Pitch notes. Follow-ups: a monophonic pitch tracker for
-   voice without the model; picking the reading per sketch in the UI.
+   strums, one line (voice) or Basic Pitch notes. Follow-ups: picking the
+   reading per sketch in the UI; trying a singing-specific model (ROSVOT)
+   or MuScriptor as an optional external transcriber, once compared on real
+   recordings.
 5. **Own synth**: a wavetable/mod-matrix synth in the spirit of Vital, to sit
    alongside the SoundFont player.

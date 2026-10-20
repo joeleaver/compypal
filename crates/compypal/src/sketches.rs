@@ -304,7 +304,16 @@ pub fn detail(store: Store, source: Source) -> Option<Detail> {
         }
         Source::Journal(_) => (jam::sketch_name(&sum), None, when(sum.start, compypal_audio::journal::now())),
     });
+    // How a recording was written down: as strums, as one line, as notes.
+    let read_as = recording_of(store, source).and_then(|(a, _, _)| store.journal?.transcript(a.file)).map(|t| match t.reading {
+        compypal_audio::audio_journal::Reading::Strums => "read as strums",
+        compypal_audio::audio_journal::Reading::Line => "read as one line",
+        compypal_audio::audio_journal::Reading::Notes => "read as notes",
+    });
     let mut chips = if audio { vec!["audio".to_string(), tempo_text(&sum)] } else { vec![tempo_text(&sum)] };
+    if let Some(r) = read_as {
+        chips.insert(1, r.to_string());
+    }
     chips.extend(sum.key.clone());
     chips.push(format!("{} notes", sum.notes));
     if sum.sustain_pedal {
