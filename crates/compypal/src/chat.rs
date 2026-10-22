@@ -146,7 +146,7 @@ pub fn new_chat(store: Store) {
 /// Switches to another agent, remembering the choice.
 fn pick(store: Store, id: String) {
     store.agent_menu.set(false);
-    crate::autosave::update_settings(|s| s.agent = Some(id.clone()));
+    crate::files::update_settings(|s| s.agent = Some(id.clone()));
     store.agent_id.set(Some(id));
     new_chat(store);
 }

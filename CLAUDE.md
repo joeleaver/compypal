@@ -305,13 +305,34 @@ mic hears the room.
 
 ## Persistence
 
-Each project is `$XDG_DATA_HOME/compypal/projects/<stem>.json`, written on
-every change (atomic rename). `settings.json` remembers the open project
-(`current`) and whether the journal is listening. The old single
-`autosave.json` is migrated into the projects folder on first launch
-(kept as `autosave.json.migrated`). Switching projects resets undo. The
-projects popover (click the project name) opens, renames, duplicates and
-creates projects; the agent has `list_projects` and `open_project`.
+A song is a file the user saves where they like: `<name>.compypal` (the
+project's JSON; `compypal_io::project_file` loads, saves atomically, lists
+and resolves paths). New songs are offered the projects folder
+(`COMPYPAL_PROJECTS`, else `~/Music/compypal`). The menu bar (`menu.rs`,
+rinch's `App::menu`, drawn in-app on Linux) has File (New, Open…, Open
+Recent…, Save, Save As…, Export, Quit), Edit, View and Transport; its items
+reach the store through `Store::current()`.
+
+- `Store::file` is the song's file (`None` until first saved) and
+  `Store::saved` what that file holds: `unsaved()` compares them, and the
+  transport shows " •" beside the name. New, Open and Quit (and the
+  window's close button, `on_close_requested`) go through `Store::guard`,
+  which asks "Save changes first?" when there's something to lose.
+- Unsaved changes are written to `recovery.json` in the data folder on
+  every edit, and brought back at the next launch, so a crash loses
+  nothing. Don't save, and saving, both clear it.
+- A song still called "Untitled" takes the name it's first saved under;
+  after that, renaming the song (Edit > Rename Song, or a click on its
+  name) leaves the file's name alone.
+- `settings.json` (data folder) remembers the open song's file, the recent
+  ones, whether the journal is listening, the agent and the audio input.
+  The old `projects/*.json` (one per project, saved on every change) are
+  moved once into the projects folder as song files; the old folder is
+  kept as `projects.migrated`.
+- The agent has `list_projects`, `open_project` (a name or a path),
+  `save_project` (a path is Save As; never a dialog) and `new_project`.
+  Open and New refuse while there are unsaved changes unless given
+  `discard: true`. Switching songs resets undo.
 
 ## Building
 

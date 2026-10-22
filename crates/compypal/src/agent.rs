@@ -115,22 +115,40 @@ impl App for StoreApp {
         compypal_audio::journal::now()
     }
 
-    fn projects(&self) -> Vec<(String, String, f64, String)> {
-        crate::autosave::list_projects()
-            .into_iter()
-            .map(|p| {
-                let what = format!("{} track(s), {} notes, {} take(s)", p.tracks, p.notes, p.sessions);
-                (p.stem, p.name, p.modified, what)
-            })
-            .collect()
+    fn projects(&self) -> Vec<compypal_io::project_file::Info> {
+        crate::files::song_files()
     }
 
-    fn current_project(&self) -> String {
-        self.0.project_file.get()
+    fn projects_dir(&self) -> Option<std::path::PathBuf> {
+        Some(crate::files::projects_dir())
     }
 
-    fn open_project(&mut self, stem: &str) -> Result<(), String> {
-        self.0.open_project(stem)
+    fn project_path(&self) -> Option<std::path::PathBuf> {
+        self.0.file.get()
+    }
+
+    fn unsaved(&self) -> bool {
+        self.0.unsaved()
+    }
+
+    fn open_project(&mut self, path: &std::path::Path) -> Result<(), String> {
+        self.0.open_path(path)
+    }
+
+    fn save_project(&mut self, path: Option<&std::path::Path>) -> Result<std::path::PathBuf, String> {
+        // Never a dialog for the agent: a song with no file goes in the
+        // projects folder, named after it.
+        let path = match (path, self.0.file.get()) {
+            (Some(p), _) => p.to_path_buf(),
+            (None, Some(f)) => f,
+            (None, None) => compypal_io::project_file::unused_path(&crate::files::projects_dir(), &self.0.project.with(|p| p.name.clone())),
+        };
+        self.0.save_to(path)
+    }
+
+    fn new_project(&mut self, name: &str) -> Result<(), String> {
+        self.0.new_project(name);
+        Ok(())
     }
 
     fn export(&mut self, format: &str) -> Result<String, String> {

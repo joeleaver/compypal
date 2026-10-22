@@ -12,6 +12,8 @@ use compypal_core::theory::{self, Chord, Spelling};
 use compypal_core::jam::{self, Sketch, TempoGuess};
 use compypal_core::{AudioRef, Id, KeySignature, MeterChange, Note, PPQ, Project, RawEvent, Session, Tick, gm};
 use serde_json::{Value, json};
+use compypal_io::project_file;
+use std::path::{Path, PathBuf};
 
 /// What the user is pointing at in the UI: a track, a figure on a track,
 /// or a range of bars across every track (possibly a named section).
@@ -75,13 +77,23 @@ pub trait App {
     fn play_audio(&mut self, audio: AudioRef, from: f64, to: f64) -> Result<(), String>;
     /// Unix seconds now.
     fn now(&self) -> f64;
-    /// Saved projects, most recent first: (file stem, name, last change in
-    /// unix seconds, a few words about what's in it). The open one is
-    /// `current_project`.
-    fn projects(&self) -> Vec<(String, String, f64, String)>;
-    fn current_project(&self) -> String;
-    /// Switches to another project. The open one is already saved.
-    fn open_project(&mut self, stem: &str) -> Result<(), String>;
+    /// Song files: the recently opened ones and those in the projects
+    /// folder, most recently changed first.
+    fn projects(&self) -> Vec<project_file::Info>;
+    /// Where relative paths and new songs go.
+    fn projects_dir(&self) -> Option<PathBuf>;
+    /// The open song's file; `None` until it's first saved.
+    fn project_path(&self) -> Option<PathBuf>;
+    /// The open song has changes its file doesn't.
+    fn unsaved(&self) -> bool;
+    /// Switches to the song in this file, dropping any unsaved changes.
+    fn open_project(&mut self, path: &Path) -> Result<(), String>;
+    /// Writes the open song to `path` (Save As: that file is the open one
+    /// afterwards), or to its own file.
+    fn save_project(&mut self, path: Option<&Path>) -> Result<PathBuf, String>;
+    /// Starts a new, unsaved song with one piano track, dropping any
+    /// unsaved changes.
+    fn new_project(&mut self, name: &str) -> Result<(), String>;
 }
 
 type ToolResult = Result<String, String>;
@@ -108,13 +120,29 @@ pub fn list() -> Value {
     json!([
         {
             "name": "list_projects",
-            "description": "The user's saved songs, most recently changed first, marking the open one. Every project autosaves.",
+            "description": "The user's song files (recently opened, and those in the projects folder), most recently changed first, marking the open one and whether it has unsaved changes.",
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
             "name": "open_project",
-            "description": "Switches the app to another project, by name or file stem from list_projects. Only do this when the user asks for a different song: it changes what they are looking at.",
-            "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}}, "required": ["project"]}
+            "description": "Opens a song file in the app, by name from list_projects or by path. Only do this when the user asks for a different song: it changes what they are looking at. Refuses while the open song has unsaved changes.",
+            "inputSchema": {"type": "object", "properties": {
+                "project": {"type": "string", "description": "A song's name, or a file path (a bare name is looked for in the projects folder)."},
+                "discard": {"type": "boolean", "description": "Throw away the open song's unsaved changes. Only when the user said so."}
+            }, "required": ["project"]}
+        },
+        {
+            "name": "save_project",
+            "description": "Saves the open song to its file. Give a path to save it as a new file instead (Save As), which is then the open one; a bare name goes in the projects folder and .compypal is added. A song never saved goes in the projects folder, named after the song, if no path is given.",
+            "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}}
+        },
+        {
+            "name": "new_project",
+            "description": "Starts a new, empty song with one piano track (not saved until save_project). Refuses while the open song has unsaved changes.",
+            "inputSchema": {"type": "object", "properties": {
+                "name": {"type": "string", "description": "The song's name. Default \"Untitled\"."},
+                "discard": {"type": "boolean", "description": "Throw away the open song's unsaved changes. Only when the user said so."}
+            }}
         },
         {
             "name": "list_sketches",
@@ -372,29 +400,18 @@ pub fn call(app: &mut dyn App, name: &str, args: &Value) -> ToolResult {
         "get_session" => get_session(app, args),
         "get_selection" => get_selection(app),
         "list_sketches" => list_sketches(app, args),
-        "list_projects" => {
-            let now = app.now();
-            let current = app.current_project();
-            let list: Vec<String> = app
-                .projects()
-                .into_iter()
-                .map(|(stem, name, modified, what)| {
-                    format!("{}{name:?} ({stem}), changed {}, {what}", if stem == current { "* " } else { "  " }, when(modified, now))
-                })
-                .collect();
-            Ok(if list.is_empty() { "No saved projects.".into() } else { format!("* is open.\n{}", list.join("\n")) })
+        "list_projects" => list_projects(app),
+        "open_project" => open_project(app, args),
+        "save_project" => {
+            let path = opt_str(args, "path").map(|p| resolve_path(app, p)).transpose()?;
+            let saved = app.save_project(path.as_deref())?;
+            Ok(format!("Saved {:?} to {}.", app.project().name, saved.display()))
         }
-        "open_project" => {
-            let want = opt_str(args, "project").ok_or("project is required")?.to_lowercase();
-            let projects = app.projects();
-            let found = projects
-                .iter()
-                .find(|(stem, name, ..)| stem.to_lowercase() == want || name.to_lowercase() == want)
-                .or_else(|| projects.iter().find(|(_, name, ..)| name.to_lowercase().contains(&want)))
-                .map(|(stem, name, ..)| (stem.clone(), name.clone()))
-                .ok_or_else(|| format!("no project matches {want:?}; see list_projects"))?;
-            app.open_project(&found.0)?;
-            Ok(format!("Opened {:?}.", found.1))
+        "new_project" => {
+            check_unsaved(app, args)?;
+            let name = opt_str(args, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Untitled");
+            app.new_project(name)?;
+            Ok(format!("Started {name:?}, with a piano track; not saved yet."))
         }
         "get_sketch" => get_sketch(app, args),
         "hear_sketch" => hear_sketch(app, args),
@@ -439,6 +456,74 @@ pub fn call(app: &mut dyn App, name: &str, args: &Value) -> ToolResult {
 
 fn opt_u32(args: &Value, key: &str) -> Option<u32> {
     args.get(key).and_then(Value::as_u64).map(|n| n as u32)
+}
+
+fn list_projects(app: &mut dyn App) -> ToolResult {
+    let now = app.now();
+    let open = app.project_path();
+    let same = |a: &Path| open.as_deref().is_some_and(|b| std::fs::canonicalize(a).ok() == std::fs::canonicalize(b).ok());
+    let mut out = Vec::new();
+    let name = app.project().name;
+    let unsaved = if app.unsaved() { ", with unsaved changes" } else { "" };
+    out.push(match &open {
+        Some(p) => format!("Open: {name:?} ({}){unsaved}.", p.display()),
+        None => format!("Open: {name:?}, never saved{unsaved}."),
+    });
+    if let Some(dir) = app.projects_dir() {
+        out.push(format!("Projects folder: {}", dir.display()));
+    }
+    let files = app.projects();
+    if files.is_empty() {
+        out.push("No song files yet.".into());
+    }
+    for f in files {
+        out.push(format!("{}{:?} {}, changed {}, {}", if same(&f.path) { "* " } else { "  " }, f.name, f.path.display(), when(f.modified, now), f.what()));
+    }
+    Ok(out.join("\n"))
+}
+
+fn open_project(app: &mut dyn App, args: &Value) -> ToolResult {
+    let want = opt_str(args, "project").ok_or("project is required")?.trim();
+    let lower = want.to_lowercase();
+    let projects = app.projects();
+    let by_name = projects
+        .iter()
+        .find(|f| f.name.to_lowercase() == lower || f.path.file_stem().is_some_and(|s| s.to_string_lossy().to_lowercase() == lower))
+        .or_else(|| projects.iter().find(|f| f.name.to_lowercase().contains(&lower)))
+        .map(|f| f.path.clone());
+    let path = match by_name {
+        Some(p) => p,
+        None => {
+            let p = resolve_path(app, want)?;
+            if !p.exists() {
+                return Err(format!("no song called {want:?} and no file {}; see list_projects", p.display()));
+            }
+            p
+        }
+    };
+    check_unsaved(app, args)?;
+    app.open_project(&path)?;
+    Ok(format!("Opened {:?} ({}).", app.project().name, path.display()))
+}
+
+/// Refuses to drop unsaved changes unless the agent said to.
+fn check_unsaved(app: &mut dyn App, args: &Value) -> Result<(), String> {
+    if app.unsaved() && !args.get("discard").and_then(Value::as_bool).unwrap_or(false) {
+        return Err(format!(
+            "{:?} has unsaved changes: save_project first, or pass discard: true if the user said to throw them away",
+            app.project().name
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_path(app: &mut dyn App, input: &str) -> Result<PathBuf, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("the path is empty".into());
+    }
+    let dir = app.projects_dir().unwrap_or_default();
+    Ok(project_file::resolve(&dir, input))
 }
 
 fn opt_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
@@ -1637,11 +1722,28 @@ pub struct MemoryApp {
     /// transcription of this recording.
     pub heard: Option<AudioRef>,
     pub clock: f64,
+    /// The song as its file has it.
+    pub saved: Project,
+    pub file: Option<PathBuf>,
+    /// The projects folder; `None` keeps the files out of reach.
+    pub dir: Option<PathBuf>,
+    pub recent: Vec<PathBuf>,
 }
 
 impl MemoryApp {
     pub fn new(project: Project) -> Self {
-        Self { project, history: Default::default(), selection: None, journal: Vec::new(), heard: None, clock: 0.0 }
+        Self {
+            saved: project.clone(),
+            project,
+            history: Default::default(),
+            selection: None,
+            journal: Vec::new(),
+            heard: None,
+            clock: 0.0,
+            file: None,
+            dir: None,
+            recent: Vec::new(),
+        }
     }
 }
 
@@ -1691,14 +1793,49 @@ impl App for MemoryApp {
     fn now(&self) -> f64 {
         self.clock
     }
-    fn projects(&self) -> Vec<(String, String, f64, String)> {
-        Vec::new()
+    fn projects(&self) -> Vec<project_file::Info> {
+        project_file::list(&self.recent, self.dir.as_deref())
     }
-    fn current_project(&self) -> String {
-        String::new()
+    fn projects_dir(&self) -> Option<PathBuf> {
+        self.dir.clone()
     }
-    fn open_project(&mut self, _: &str) -> Result<(), String> {
-        Err("no other projects here".into())
+    fn project_path(&self) -> Option<PathBuf> {
+        self.file.clone()
+    }
+    fn unsaved(&self) -> bool {
+        self.project != self.saved
+    }
+    fn open_project(&mut self, path: &Path) -> Result<(), String> {
+        let p = project_file::load(path)?;
+        self.saved = p.clone();
+        self.project = p;
+        self.history = Default::default();
+        self.file = Some(path.to_path_buf());
+        Ok(())
+    }
+    fn save_project(&mut self, path: Option<&Path>) -> Result<PathBuf, String> {
+        let path = match (path, &self.file, &self.dir) {
+            (Some(p), ..) => p.to_path_buf(),
+            (None, Some(f), _) => f.clone(),
+            (None, None, Some(dir)) => project_file::unused_path(dir, &self.project.name),
+            (None, None, None) => return Err("give a path: there's no projects folder here".into()),
+        };
+        project_file::save(&path, &self.project).map_err(|e| e.to_string())?;
+        self.saved = self.project.clone();
+        self.file = Some(path.clone());
+        if !self.recent.contains(&path) {
+            self.recent.push(path.clone());
+        }
+        Ok(path)
+    }
+    fn new_project(&mut self, name: &str) -> Result<(), String> {
+        let mut p = Project::new(name);
+        p.add_track("Piano", 0);
+        self.saved = p.clone();
+        self.project = p;
+        self.history = Default::default();
+        self.file = None;
+        Ok(())
     }
 }
 
@@ -1924,6 +2061,49 @@ mod tests {
         run(&mut app, "transform", json!({"selection": true, "transpose": 2}));
         let after = app.project.tracks[1].absolute_notes();
         assert_eq!(after.iter().filter(|n| n.pitch == 38).count(), 2, "only the two picked notes moved");
+    }
+
+    #[test]
+    fn song_files() {
+        let dir = std::env::temp_dir().join(format!("compypal-tools-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = demo();
+        app.dir = Some(dir.clone());
+        let demo_name = app.project.name.clone();
+
+        // Never saved: saved into the folder, named after the song.
+        let s = run(&mut app, "save_project", json!({}));
+        let first = dir.join(format!("{demo_name}.compypal"));
+        assert!(s.contains(&first.display().to_string()), "{s}");
+        assert!(first.exists() && !app.unsaved());
+
+        // An edit is unsaved, and keeps new/open from dropping it.
+        run(&mut app, "set_project", json!({"bpm": 99}));
+        assert!(app.unsaved());
+        let s = run(&mut app, "list_projects", json!({}));
+        assert!(s.contains("unsaved changes") && s.contains("* \""), "{s}");
+        let e = call(&mut app, "new_project", &json!({"name": "Waltz"})).unwrap_err();
+        assert!(e.contains("save_project first"), "{e}");
+
+        // Save As: a bare name lands in the folder; that file is open now.
+        run(&mut app, "save_project", json!({"path": "Faster"}));
+        assert_eq!(app.file.as_deref(), Some(dir.join("Faster.compypal").as_path()));
+        assert!(!app.unsaved());
+
+        run(&mut app, "new_project", json!({"name": "Waltz"}));
+        assert_eq!(app.project.name, "Waltz");
+        assert_eq!(app.project.tracks.len(), 1);
+        assert!(app.file.is_none());
+
+        // Open by the song's name; the unsaved Waltz is in the way first.
+        run(&mut app, "add_track", json!({"name": "Bass", "instrument": 33}));
+        assert!(call(&mut app, "open_project", &json!({"project": "faster"})).is_err());
+        let s = run(&mut app, "open_project", json!({"project": "faster", "discard": true}));
+        assert!(s.contains("Faster.compypal"), "{s}");
+        assert_eq!(app.project.tempo.bpm_at(0).round(), 99.0);
+        let e = call(&mut app, "open_project", &json!({"project": "Nope"})).unwrap_err();
+        assert!(e.contains("list_projects"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

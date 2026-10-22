@@ -1,12 +1,13 @@
 //! App-wide state. Every project edit goes through [`Store::edit`] so the
 //! UI and, later, the agent share one undo history.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use compypal_core::cleanup::{self, Quantize};
 use compypal_core::figure::{self, Figure, FigureSettings};
 use compypal_core::theory::{self, Chord, Spelling};
 use compypal_audio::input::MidiIn;
+use compypal_io::project_file;
 use compypal_audio::{Engine, Schedule, ScheduleOptions, schedule};
 use compypal_core::{Clip, History, Id, MeterChange, Note, PPQ, Project, RawEvent, Session, Tick, arrange, text};
 use rinch::prelude::*;
@@ -113,8 +114,6 @@ pub struct Store {
     /// The track menu in the Sketches view is open.
     pub sketch_menu: Signal<bool>,
     pub sketch_filter: Signal<crate::sketches::Filter>,
-    /// The export menu is open.
-    pub export_menu: Signal<bool>,
     /// Notes selected in the piano roll, absolute, on the selected track.
     pub note_sel: Signal<Vec<Note>>,
     pub note_drag: Signal<Option<NoteDrag>>,
@@ -122,12 +121,18 @@ pub struct Store {
     pub snap: Signal<Tick>,
     /// The length new notes get: the last one drawn or resized.
     pub last_len: Signal<Tick>,
-    /// The open project's file, by stem.
-    pub project_file: Signal<String>,
-    /// The projects popover is open.
-    pub projects_open: Signal<bool>,
-    pub project_list: Signal<Vec<crate::autosave::ProjectInfo>>,
+    /// The open song's file; `None` until it's first saved.
+    pub file: Signal<Option<PathBuf>>,
+    /// The song as its file has it: anything else is unsaved.
+    pub saved: Signal<Project>,
+    /// The Open Recent popover is open, listing these.
+    pub recent_open: Signal<bool>,
+    pub recent_list: Signal<Vec<project_file::Info>>,
+    /// The song-name popover is open.
+    pub rename_open: Signal<bool>,
     pub rename_draft: Signal<String>,
+    /// Asking whether to save before doing this.
+    pub confirm: Signal<Option<Pending>>,
     /// The agent panel's conversation.
     pub chat: Signal<compypal_mcp::agent::Chat>,
     pub chat_open: Signal<bool>,
@@ -221,7 +226,8 @@ impl Store {
         midi: Option<&'static MidiIn>,
         journal: Option<&'static compypal_audio::journal::Journal>,
         audio_in: Option<&'static compypal_audio::mic::AudioIn>,
-        project_file: String,
+        file: Option<PathBuf>,
+        saved: Project,
     ) -> Self {
         let first = project.tracks.first().map(|t| t.id);
         let project = Signal::new(project);
@@ -284,19 +290,21 @@ impl Store {
             sketch_at_cursor: Signal::new(false),
             sketch_menu: Signal::new(false),
             sketch_filter: Signal::new(Default::default()),
-            export_menu: Signal::new(false),
             note_sel: Signal::new(Vec::new()),
             note_drag: Signal::new(None),
             snap: Signal::new(PPQ as Tick / 4),
             last_len: Signal::new(PPQ as Tick / 2),
-            project_file: Signal::new(project_file),
-            projects_open: Signal::new(false),
-            project_list: Signal::new(Vec::new()),
+            file: Signal::new(file),
+            saved: Signal::new(saved),
+            recent_open: Signal::new(false),
+            recent_list: Signal::new(Vec::new()),
+            rename_open: Signal::new(false),
             rename_draft: Signal::new(String::new()),
+            confirm: Signal::new(None),
             chat: Signal::new(Default::default()),
             chat_open: Signal::new(false),
             chat_draft: Signal::new(String::new()),
-            agent_id: Signal::new(crate::autosave::load_settings().agent),
+            agent_id: Signal::new(crate::files::load_settings().agent),
             agent_menu: Signal::new(false),
         }
     }
@@ -458,7 +466,7 @@ impl Store {
         let on = !j.listening();
         j.set_listening(on);
         self.listening.set(on);
-        crate::autosave::update_settings(|s| s.listening = on);
+        crate::files::update_settings(|s| s.listening = on);
         self.status.set(if on {
             "Listening: everything you play is kept, split into sketches (the Sketches tab)".into()
         } else {
@@ -472,7 +480,9 @@ impl Store {
         self.editing.get().is_some()
             || self.instrument_edit.get().is_some()
             || self.section_edit.get()
-            || self.projects_open.get()
+            || self.recent_open.get()
+            || self.rename_open.get()
+            || self.confirm.get().is_some()
             || crate::chat::composer_focused()
     }
 
@@ -598,20 +608,57 @@ impl Store {
         }
     }
 
-    // --- projects ----------------------------------------------------------------
+    // --- song files ------------------------------------------------------------
 
-    pub fn toggle_projects(self) {
-        let open = !self.projects_open.get();
-        if open {
-            self.project_list.set(crate::autosave::list_projects());
-            self.rename_draft.set(self.project.with(|p| p.name.clone()));
-        }
-        self.projects_open.set(open);
+    /// The song has changes its file doesn't.
+    pub fn unsaved(self) -> bool {
+        let saved = self.saved.get();
+        self.project.with(|p| *p != saved)
     }
 
-    /// Switches to `project`, stored as `stem`: the old one is already
-    /// saved, and undo starts afresh for the new one.
-    fn switch_to(self, project: Project, stem: String) {
+    /// Does `action`, first asking whether to save unsaved changes.
+    pub fn guard(self, action: Pending) {
+        if self.unsaved() {
+            self.recent_open.set(false);
+            self.confirm.set(Some(action));
+        } else {
+            self.run_pending(action);
+        }
+    }
+
+    /// The answer to "save changes first?": save, don't, or (`None`) cancel.
+    pub fn answer_confirm(self, save: Option<bool>) {
+        let Some(action) = self.confirm.get() else { return };
+        self.confirm.set(None);
+        match save {
+            None => {}
+            Some(true) => {
+                if self.save().is_ok() {
+                    self.run_pending(action);
+                }
+            }
+            Some(false) => self.run_pending(action),
+        }
+    }
+
+    fn run_pending(self, action: Pending) {
+        match action {
+            Pending::New => self.new_project("Untitled"),
+            Pending::Open(path) => {
+                if let Err(e) = self.open_path(&path) {
+                    self.status.set(e);
+                }
+            }
+            Pending::Quit => {
+                // Changes the user chose not to keep aren't recovered.
+                crate::files::clear_recovery();
+                rinch::windows::close_current_window();
+            }
+        }
+    }
+
+    /// Switches to `project`, from `file`; undo starts afresh.
+    fn switch_to(self, project: Project, file: Option<PathBuf>) {
         if self.is_recording() {
             self.stop_recording();
         }
@@ -623,69 +670,126 @@ impl Store {
         self.note_sel.set(Vec::new());
         self.bar_sel.set(None);
         self.cursor.set(0);
-        self.project_file.set(stem.clone());
+        crate::files::remember_open(file.as_deref());
+        self.file.set(file);
         let name = project.name.clone();
         let first = project.tracks.first().map(|t| t.id);
+        self.saved.set(project.clone());
         self.project.set(project);
         self.history.set(History::default());
         if let Some(id) = first {
             self.select_track(id);
         }
-        crate::autosave::update_settings(|s| s.current = Some(stem));
-        self.projects_open.set(false);
+        self.recent_open.set(false);
+        self.rename_open.set(false);
         self.status.set(format!("Opened {name}"));
     }
 
-    pub fn open_project(self, stem: &str) -> Result<(), String> {
-        if stem == self.project_file.get() {
-            self.projects_open.set(false);
-            return Ok(());
-        }
-        let p = crate::autosave::load_project(stem).ok_or_else(|| format!("can't open project {stem:?}"))?;
-        self.switch_to(p, stem.to_string());
+    /// Opens the song in `path`, dropping unsaved changes (see `guard`).
+    pub fn open_path(self, path: &Path) -> Result<(), String> {
+        let p = project_file::load(path)?;
+        self.switch_to(p, Some(path.to_path_buf()));
         Ok(())
     }
 
-    /// A new, empty project with a piano track, in a file of its own.
-    pub fn new_project(self) {
-        let names = crate::autosave::list_projects();
-        let name = (1..)
-            .map(|i| if i == 1 { "Untitled".to_string() } else { format!("Untitled {i}") })
-            .find(|n| !names.iter().any(|p| &p.name == n))
-            .unwrap();
-        let mut p = Project::new(name.clone());
-        p.add_track("Piano", 0);
-        let stem = crate::autosave::unique_stem(&name);
-        let _ = crate::autosave::save_project(&stem, &p);
-        self.switch_to(p, stem);
+    /// File > Open: picks a song file, then opens it.
+    pub fn open_dialog(self) {
+        let dir = self.dialog_dir();
+        if let Some(path) = rinch::dialogs::open_file()
+            .set_title("Open song")
+            .set_directory(&dir)
+            .add_filter("compypal songs", &[project_file::EXT])
+            .pick_file()
+        {
+            self.guard(Pending::Open(path));
+        }
     }
 
-    /// Renames the project, and its file to match.
+    /// Where the file dialogs start: beside the open song, else the
+    /// projects folder.
+    fn dialog_dir(self) -> PathBuf {
+        let dir = self.file.get().and_then(|f| f.parent().map(Path::to_path_buf)).unwrap_or_else(crate::files::projects_dir);
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// A new song with a piano track, not saved anywhere yet.
+    pub fn new_project(self, name: &str) {
+        let mut p = Project::new(name);
+        p.add_track("Piano", 0);
+        self.switch_to(p, None);
+        self.status.set(format!("New song: {name}"));
+    }
+
+    /// Saves to the song's file, or asks where if it has none.
+    pub fn save(self) -> Result<PathBuf, String> {
+        match self.file.get() {
+            Some(path) => self.save_to(path),
+            None => self.save_as(),
+        }
+    }
+
+    /// Asks where, then saves there; that file is the song's from now on.
+    pub fn save_as(self) -> Result<PathBuf, String> {
+        let name = project_file::file_stem(&self.project.with(|p| p.name.clone()));
+        let path = rinch::dialogs::save_file()
+            .set_title("Save song")
+            .set_directory(self.dialog_dir())
+            .set_file_name(format!("{name}.{}", project_file::EXT))
+            .add_filter("compypal songs", &[project_file::EXT])
+            .save()
+            .ok_or("Not saved")?;
+        self.save_to(project_file::with_ext(path))
+    }
+
+    pub fn save_to(self, path: PathBuf) -> Result<PathBuf, String> {
+        // A song still called "Untitled" takes the name it's saved under.
+        if self.project.with(|p| is_untitled(&p.name))
+            && let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().into_owned())
+        {
+            self.project.update(|p| p.name = stem);
+        }
+        let p = self.project.get();
+        if let Err(e) = project_file::save(&path, &p) {
+            let e = format!("Couldn't save {}: {e}", path.display());
+            self.status.set(e.clone());
+            return Err(e);
+        }
+        crate::files::remember_open(Some(&path));
+        self.saved.set(p);
+        self.file.set(Some(path.clone()));
+        self.status.set(format!("Saved {}", path.display()));
+        Ok(path)
+    }
+
+    /// File > Open Recent.
+    pub fn toggle_recent(self) {
+        let open = !self.recent_open.get();
+        if open {
+            self.recent_list.set(crate::files::song_files());
+            self.rename_open.set(false);
+        }
+        self.recent_open.set(open);
+    }
+
+    /// Edit > Rename song (and a click on its name).
+    pub fn toggle_rename(self) {
+        let open = !self.rename_open.get();
+        if open {
+            self.rename_draft.set(self.project.with(|p| p.name.clone()));
+            self.recent_open.set(false);
+        }
+        self.rename_open.set(open);
+    }
+
+    /// Renames the song. Its file keeps its name, as files do.
     pub fn rename_project(self, name: &str) {
         let name = name.trim();
+        self.rename_open.set(false);
         if name.is_empty() || self.project.with(|p| p.name == name) {
             return;
         }
-        let old = self.project_file.get();
-        let stem = crate::autosave::unique_stem(name);
-        if crate::autosave::move_project(&old, &stem).is_err() {
-            self.status.set("Couldn't rename the project file".into());
-            return;
-        }
-        self.project_file.set(stem.clone());
-        crate::autosave::update_settings(|s| s.current = Some(stem));
-        self.edit("rename project", |p| p.name = name.to_string());
-        self.project_list.set(crate::autosave::list_projects());
-    }
-
-    /// Saves a copy under a new name and switches to it.
-    pub fn duplicate_project(self) {
-        let mut p = self.project.get();
-        p.name = format!("{} copy", p.name);
-        let stem = crate::autosave::unique_stem(&p.name);
-        if crate::autosave::save_project(&stem, &p).is_ok() {
-            self.switch_to(p, stem);
-        }
+        self.edit("rename song", |p| p.name = name.to_string());
     }
 
     /// Selects a track, and plays live input through its instrument.
@@ -762,14 +866,14 @@ impl Store {
         if self.audio_device.get().as_deref() == Some(id) {
             a.disconnect();
             self.audio_device.set(None);
-            crate::autosave::update_settings(|s| s.audio_in = None);
+            crate::files::update_settings(|s| s.audio_in = None);
             self.status.set("Audio input off".into());
             return;
         }
         match a.connect(id) {
             Ok(()) => {
                 self.audio_device.set(Some(id.to_string()));
-                crate::autosave::update_settings(|s| s.audio_in = Some(id.to_string()));
+                crate::files::update_settings(|s| s.audio_in = Some(id.to_string()));
                 self.status.set(if self.listening.get() {
                     format!("Hearing {name}: what you play is kept as sketches")
                 } else {
@@ -1595,6 +1699,35 @@ fn write_export(name: &str, ext: &str, bytes: &[u8]) -> Result<PathBuf, String> 
     std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
     std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
     Ok(path)
+}
+
+/// "Untitled", "Untitled 2", …: a name nobody gave the song.
+fn is_untitled(name: &str) -> bool {
+    name.strip_prefix("Untitled").is_some_and(|rest| rest.is_empty() || rest.trim_start().parse::<u32>().is_ok())
+}
+
+/// Something that would lose unsaved changes, waiting on "save first?".
+#[derive(Clone, Debug, PartialEq)]
+pub enum Pending {
+    New,
+    Open(PathBuf),
+    Quit,
+}
+
+thread_local! {
+    static CURRENT: std::cell::Cell<Option<Store>> = const { std::cell::Cell::new(None) };
+}
+
+impl Store {
+    /// The app's store, for the menu bar and the window's close button,
+    /// which are wired up outside any component.
+    pub fn current() -> Option<Store> {
+        CURRENT.with(std::cell::Cell::get)
+    }
+
+    pub fn make_current(self) {
+        CURRENT.with(|c| c.set(Some(self)));
+    }
 }
 
 pub const ROW: f64 = 12.0;

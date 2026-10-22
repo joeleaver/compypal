@@ -1,8 +1,9 @@
 //! compypal: a MIDI composer and arranger built to work alongside an agent.
 
 mod agent;
-mod autosave;
 mod chat;
+mod files;
+mod menu;
 mod sketches;
 mod store;
 
@@ -78,11 +79,21 @@ fn Transport() -> NodeHandle {
             div { class: "project-anchor",
                 span {
                     class: "project-name",
-                    onclick: move || store.toggle_projects(),
-                    {|| format!("{} ▾", store.project.with(|p| p.name.clone()))}
+                    title: "Rename the song",
+                    onclick: move || store.toggle_rename(),
+                    {|| format!("{}{}", store.project.with(|p| p.name.clone()), if store.unsaved() { " •" } else { "" })}
                 }
-                if store.projects_open.get() {
-                    ProjectsPanel {}
+                span { class: "project-file",
+                    {|| match store.file.get() {
+                        Some(f) => f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                        None => "not saved yet".into(),
+                    }}
+                }
+                if store.rename_open.get() {
+                    SongNamer {}
+                }
+                if store.recent_open.get() {
+                    RecentPanel {}
                 }
             }
             div { class: "view-switch",
@@ -175,13 +186,6 @@ fn Transport() -> NodeHandle {
                 "Redo"
             }
             div { class: "divider" }
-            div { class: "agent-pick-anchor",
-                Button { size: "xs", variant: "default", onclick: move || store.export_menu.update(|o| *o = !*o), "Export ▾" }
-                if store.export_menu.get() {
-                    ExportMenu {}
-                }
-            }
-            div { class: "divider" }
             Button { size: "xs",
                 variant: {|| if store.chat_open.get() { "filled" } else { "light" }},
                 onclick: move || chat::toggle(store),
@@ -190,62 +194,6 @@ fn Transport() -> NodeHandle {
             }
         }
     }
-}
-
-/// Where the song can go: a MIDI file or ABC notation.
-#[component]
-fn ExportMenu() -> NodeHandle {
-    let store = use_store::<Store>();
-    let root = rsx! {
-        div { class: "agent-menu export-menu",
-            div { class: "agent-row",
-                onclick: move || {
-                    store.export_menu.set(false);
-                    let _ = store.export_midi();
-                },
-                div { class: "track-name", "MIDI file" }
-                div { class: "track-detail", "For a DAW or notation program" }
-            }
-            div { class: "agent-row",
-                onclick: move || {
-                    store.export_menu.set(false);
-                    let _ = store.export_abc();
-                },
-                div { class: "track-name", "ABC notation" }
-                div { class: "track-detail", "Text sheet music" }
-            }
-            div { class: "agent-row",
-                onclick: move || {
-                    store.export_menu.set(false);
-                    store.export_audio("mp3");
-                },
-                div { class: "track-name", "MP3" }
-                div { class: "track-detail", "The song as you hear it, to share" }
-            }
-            div { class: "agent-row",
-                onclick: move || {
-                    store.export_menu.set(false);
-                    store.export_audio("wav");
-                },
-                div { class: "track-name", "WAV" }
-                div { class: "track-detail", "The same, uncompressed" }
-            }
-        }
-    };
-    overlay_dismiss::arm_keys_while_open(
-        __scope,
-        &root,
-        Rc::new(|| true),
-        Rc::new(move |k: &rinch::core::KeyEventData| {
-            if k.key == "Escape" {
-                store.export_menu.set(false);
-                return true;
-            }
-            false
-        }),
-        Rc::new(move || store.export_menu.set(false)),
-    );
-    root
 }
 
 #[component]
@@ -870,68 +818,22 @@ fn SectionNamer() -> NodeHandle {
     root
 }
 
-/// The projects popover: open one, or rename, duplicate or start anew.
+/// The song's name (Edit > Rename Song, or a click on it).
 #[component]
-fn ProjectsPanel() -> NodeHandle {
+fn SongNamer() -> NodeHandle {
     let store = use_store::<Store>();
     let input = rsx! {
         input {
             class: "chord-input",
-            placeholder: "Project name",
+            placeholder: "Song name",
             value: {|| store.rename_draft.get()},
             oninput: move |v: String| store.rename_draft.set(v),
         }
     };
-    let now = compypal_audio::journal::now();
-    let rows: Vec<ProjectRow> = store
-        .project_list
-        .get()
-        .into_iter()
-        .enumerate()
-        .map(|(index, p)| ProjectRow {
-            index,
-            current: p.stem == store.project_file.get(),
-            name: p.name.clone(),
-            detail: format!(
-                "{} · {} track(s) · {} notes{}",
-                compypal_mcp::tools::when(p.modified, now),
-                p.tracks,
-                p.notes,
-                if p.sessions > 0 { format!(" · {} take(s)", p.sessions) } else { String::new() }
-            ),
-        })
-        .collect();
     let root = rsx! {
         div { class: "projects-panel",
-            div { class: "rename-row",
-                {input.clone()}
-                Button { size: "xs", variant: "light",
-                    onclick: move || store.rename_project(&store.rename_draft.get()),
-                    "Rename"
-                }
-            }
-            div { class: "project-actions",
-                Button { size: "xs", variant: "light", onclick: move || store.new_project(), "New project" }
-                Button { size: "xs", variant: "default", onclick: move || store.duplicate_project(), "Duplicate" }
-            }
-            div { class: "project-list",
-                for row in rows.clone() {
-                    div {
-                        key: row.index,
-                        class: {if row.current { "project-row current" } else { "project-row" }},
-                        onclick: move || {
-                            let stem = store.project_list.with(|l| l.get(row.index).map(|p| p.stem.clone()));
-                            if let Some(stem) = stem
-                                && let Err(e) = store.open_project(&stem)
-                            {
-                                store.status.set(e);
-                            }
-                        },
-                        div { class: "track-name", {row.name.clone()} }
-                        div { class: "track-detail", {row.detail.clone()} }
-                    }
-                }
-            }
+            {input.clone()}
+            div { class: "editor-hint", "Enter rename · Esc cancel" }
         }
     };
     overlay_dismiss::arm_keys_while_open(
@@ -944,14 +846,94 @@ fn ProjectsPanel() -> NodeHandle {
                 true
             }
             "Escape" => {
-                store.projects_open.set(false);
+                store.rename_open.set(false);
                 true
             }
             _ => false,
         }),
-        Rc::new(move || store.projects_open.set(false)),
+        Rc::new(move || store.rename_open.set(false)),
+    );
+    input.focus();
+    root
+}
+
+/// File > Open Recent: the recent songs and the projects folder's.
+#[component]
+fn RecentPanel() -> NodeHandle {
+    let store = use_store::<Store>();
+    let now = compypal_audio::journal::now();
+    let open = store.file.get();
+    let rows: Vec<ProjectRow> = store
+        .recent_list
+        .get()
+        .into_iter()
+        .enumerate()
+        .map(|(index, p)| ProjectRow {
+            index,
+            current: open.as_ref() == Some(&p.path),
+            name: p.name.clone(),
+            detail: format!("{} · {} · {}", compypal_mcp::tools::when(p.modified, now), p.what(), short_path(&p.path)),
+        })
+        .collect();
+    let empty = rows.is_empty();
+    let root = rsx! {
+        div { class: "projects-panel",
+            div { class: "project-list",
+                if empty {
+                    div { class: "track-detail", "No songs saved yet. File > Save As puts one in a folder you choose." }
+                }
+                for row in rows.clone() {
+                    div {
+                        key: row.index,
+                        class: {if row.current { "project-row current" } else { "project-row" }},
+                        onclick: move || {
+                            let path = store.recent_list.with(|l| l.get(row.index).map(|p| p.path.clone()));
+                            store.recent_open.set(false);
+                            if let Some(path) = path
+                                && store.file.get().as_ref() != Some(&path)
+                            {
+                                store.guard(store::Pending::Open(path));
+                            }
+                        },
+                        div { class: "track-name", {row.name.clone()} }
+                        div { class: "track-detail", {row.detail.clone()} }
+                    }
+                }
+            }
+            div { class: "project-actions",
+                Button { size: "xs", variant: "default",
+                    onclick: move || {
+                        store.recent_open.set(false);
+                        store.open_dialog();
+                    },
+                    "Open other…"
+                }
+            }
+        }
+    };
+    overlay_dismiss::arm_keys_while_open(
+        __scope,
+        &root,
+        Rc::new(|| true),
+        Rc::new(move |k: &rinch::core::KeyEventData| {
+            if k.key == "Escape" {
+                store.recent_open.set(false);
+                return true;
+            }
+            false
+        }),
+        Rc::new(move || store.recent_open.set(false)),
     );
     root
+}
+
+/// `~/Music/compypal/Song.compypal` rather than the whole home path.
+fn short_path(path: &std::path::Path) -> String {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -960,6 +942,50 @@ struct ProjectRow {
     current: bool,
     name: String,
     detail: String,
+}
+
+/// "Save changes first?", before New, Open or Quit would lose them.
+#[component]
+fn ConfirmSave() -> NodeHandle {
+    let store = use_store::<Store>();
+    let name = store.project.with(|p| p.name.clone());
+    let doing = match store.confirm.get() {
+        Some(store::Pending::Quit) => "quitting",
+        Some(store::Pending::New) => "starting a new song",
+        _ => "opening another song",
+    };
+    let root = rsx! {
+        div { class: "confirm-backdrop",
+            div { class: "confirm-box",
+                div { class: "confirm-title", {format!("Save changes to “{name}” before {doing}?")} }
+                div { class: "track-detail", "Your changes are lost if you don't save them." }
+                div { class: "confirm-actions",
+                    Button { size: "xs", variant: "default", onclick: move || store.answer_confirm(Some(false)), "Don't save" }
+                    div { class: "spacer" }
+                    Button { size: "xs", variant: "default", onclick: move || store.answer_confirm(None), "Cancel" }
+                    Button { size: "xs", variant: "filled", onclick: move || store.answer_confirm(Some(true)), "Save" }
+                }
+            }
+        }
+    };
+    overlay_dismiss::arm_keys_while_open(
+        __scope,
+        &root,
+        Rc::new(|| true),
+        Rc::new(move |k: &rinch::core::KeyEventData| match k.key.as_str() {
+            "Enter" => {
+                store.answer_confirm(Some(true));
+                true
+            }
+            "Escape" => {
+                store.answer_confirm(None);
+                true
+            }
+            _ => false,
+        }),
+        Rc::new(|| {}),
+    );
+    root
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1184,9 +1210,9 @@ fn app() -> NodeHandle {
     };
     // The journal lives as long as the app; MIDI input holds a handle too.
     let journal: Option<&'static std::sync::Arc<compypal_audio::journal::Journal>> =
-        match autosave::journal_dir().map(compypal_audio::journal::Journal::open) {
+        match files::journal_dir().map(compypal_audio::journal::Journal::open) {
             Some(Ok(j)) => {
-                j.set_listening(autosave::load_settings().listening);
+                j.set_listening(files::load_settings().listening);
                 Some(Box::leak(Box::new(j)))
             }
             Some(Err(e)) => {
@@ -1208,13 +1234,17 @@ fn app() -> NodeHandle {
     // one is picked (or named in COMPYPAL_AUDIO_IN): a mic hears the room.
     let audio_in: &'static compypal_audio::mic::AudioIn = Box::leak(Box::new(compypal_audio::mic::AudioIn::new(journal.cloned())));
     audio_in.keep_open();
-    let (project, stem) = autosave::open_initial();
-    let store = create_store(Store::new(project, engine, Some(midi), journal.map(|j| &**j), Some(audio_in), stem));
+    let opened = files::open_initial();
+    let store = create_store(Store::new(opened.project, engine, Some(midi), journal.map(|j| &**j), Some(audio_in), opened.file, opened.saved));
+    store.make_current();
+    if let Some(note) = opened.note {
+        store.status.set(note);
+    }
     {
         let (devices, device) = (store.audio_devices, store.audio_device);
         std::thread::spawn(move || {
             devices.send(compypal_audio::mic::devices());
-            if let Some(id) = compypal_audio::mic::default_device(autosave::load_settings().audio_in.as_deref()) {
+            if let Some(id) = compypal_audio::mic::default_device(files::load_settings().audio_in.as_deref()) {
                 match audio_in.connect(&id) {
                     Ok(()) => {
                         eprintln!("audio input: {id}");
@@ -1272,12 +1302,16 @@ fn app() -> NodeHandle {
         });
     }
 
-    // Every change is saved, so a take is never lost to a crash or a quit.
+    // Unsaved changes are kept aside on every edit, so a take is never
+    // lost to a crash: the next launch brings them back.
     rinch::core::Effect::new(move || {
-        let stem = untracked(|| store.project_file.get());
+        let file = store.file.get();
+        let saved = store.saved.get();
         store.project.with(|p| {
-            if let Err(e) = autosave::save_project(&stem, p) {
-                eprintln!("autosave failed: {e}");
+            if *p != saved {
+                files::write_recovery(file.as_deref(), p);
+            } else {
+                files::clear_recovery();
             }
         });
     });
@@ -1332,11 +1366,6 @@ fn app() -> NodeHandle {
 
     // Space plays and stops, unless someone is typing.
     rinch::core::set_keyboard_interceptor(move |k| {
-        // Ctrl+L opens the agent panel from anywhere, and closes it.
-        if k.is_down() && (k.ctrl || k.meta) && k.key.eq_ignore_ascii_case("l") {
-            chat::toggle(store);
-            return true;
-        }
         // Escape stops the agent wherever the focus is.
         if k.is_down() && k.key == "Escape" && store.chat.with(|c| c.busy()) {
             chat::stop(store);
@@ -1382,6 +1411,9 @@ fn app() -> NodeHandle {
                     AgentPanel {}
                 }
             }
+            if store.confirm.get().is_some() {
+                ConfirmSave {}
+            }
             div { class: "statusbar",
                 span { {|| store.status.get()} }
                 span { class: "right-status",
@@ -1408,6 +1440,18 @@ fn main() {
         return;
     }
     App::new(app)
+        .window_props(WindowProps {
+            // The window's close button asks to save first, like File > Quit.
+            on_close_requested: Some(std::sync::Arc::new(|| match store::Store::current() {
+                Some(s) if s.unsaved() => {
+                    s.guard(store::Pending::Quit);
+                    false
+                }
+                _ => true,
+            })),
+            ..Default::default()
+        })
+        .menu(menu::bar())
         .title("compypal")
         .size(1280, 800)
         .theme(ThemeProviderProps {
