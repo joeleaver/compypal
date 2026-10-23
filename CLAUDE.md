@@ -87,6 +87,14 @@ It has a chord and a shape (block, arpeggio, run, melody, note, mixed).
   range as a green band. An event exactly on a loop's end belongs after it.
 - Rolls and the arranger follow the playhead a page at a time, and when
   stopped keep the cursor in view.
+- Zoom: View > Zoom In/Out/Fit Song (Ctrl+= / Ctrl+- / Ctrl+0) and the
+  toolbars' − Fit + go through `Store::zoom(ZoomReq)`, a numbered request
+  that whichever view is on screen applies to its own scroller
+  (`zoom_horizontally`), keeping the middle of the view put. The roll's
+  rows zoom too (`row_h`, Taller/Shorter Rows), so roll geometry comes from
+  `Roll::row`, never a constant. The middle button drags to pan
+  (`pan_drag`). rinch gives apps no wheel events, so Ctrl+wheel zoom and
+  Shift+wheel pan need a rinch change first.
 - `compypal-audio` and `rustysynth` build at opt-level 3 even in dev;
   unoptimized, the synth can't keep up with the callback.
 - `cargo run -p compypal-audio --example play_demo` checks the device
@@ -111,6 +119,13 @@ It has a chord and a shape (block, arpeggio, run, melody, note, mixed).
   scroller, so the grid never re-lays itself out under the pointer.
 - Picked notes are a `Selection` with `notes`; tools given `selection: true`
   touch exactly those notes.
+
+## Settings
+
+Devices are picked in Edit > Settings… (Ctrl+,, `settings.rs`), not in
+the main view: an Audio tab (output, and the input heard for a guitar or a
+voice, with a level meter) and a MIDI tab (the keyboard). The status bar
+says what's connected; a click there opens the right tab.
 
 ## Recording
 
@@ -238,7 +253,7 @@ playing (not take, jam or session).
 
 ## Audio sketches (a guitar, a voice)
 
-For instruments with no MIDI: an audio input (sidebar "Audio input", one
+For instruments with no MIDI: an audio input (Settings > Audio, one
 row per card plus "System input"; `COMPYPAL_AUDIO_IN` or the remembered
 `settings.json` `audio_in`) is heard while Listen is on. Off by default: a
 mic hears the room.
@@ -376,6 +391,12 @@ reach the store through `Store::current()`.
   Build the input as its own node and call `.focus()` on it.
 - Keyboard handling for a popup: `overlay_dismiss::arm_keys_while_open`
   (it gets keys only while focus is inside the owner).
+
+## Design notes
+
+- `docs/design/sketches-and-tracks.md`: user stories and a proposed model
+  for sketches, parts, tracks and versions (one Rec, one library, one
+  vocabulary), with the decisions it needs. A proposal, not built yet.
 
 ## Roadmap
 

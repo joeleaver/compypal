@@ -7,7 +7,7 @@
 
 use rinch::menu::{Menu, MenuItem};
 
-use crate::store::{Pending, Store, View};
+use crate::store::{Pending, Store, View, ZoomReq};
 
 /// An item that runs `f` on the store.
 fn item(label: &str, f: impl Fn(Store) + 'static) -> MenuItem {
@@ -56,11 +56,19 @@ pub fn bar() -> Vec<(&'static str, Menu)> {
         .item(item("Redo", |s| s.redo()).shortcut("Ctrl+Shift+Z"))
         .separator()
         .item(item("Rename Song…", |s| s.toggle_rename()))
-        .item(item("Add Track", |s| s.add_track()));
+        .item(item("Add Track", |s| s.add_track()))
+        .separator()
+        .item(item("Settings…", |s| crate::settings::open(s, crate::settings::Tab::Audio)).shortcut("Ctrl+,"));
     let view = Menu::new()
         .item(item("Sketches", |s| s.view.set(View::Sketches)).shortcut("Ctrl+1"))
         .item(item("Arrange", |s| s.view.set(View::Arrange)).shortcut("Ctrl+2"))
         .item(item("Edit", |s| s.view.set(View::Edit)).shortcut("Ctrl+3"))
+        .separator()
+        .item(item("Zoom In", |s| s.zoom(ZoomReq::In)).shortcut("Ctrl+="))
+        .item(item("Zoom Out", |s| s.zoom(ZoomReq::Out)).shortcut("Ctrl+-"))
+        .item(item("Fit Song", |s| s.zoom(ZoomReq::Fit)).shortcut("Ctrl+0"))
+        .item(item("Taller Rows", |s| s.zoom(ZoomReq::Taller)).shortcut("Ctrl+Shift+="))
+        .item(item("Shorter Rows", |s| s.zoom(ZoomReq::Shorter)).shortcut("Ctrl+Shift+-"))
         .separator()
         .item(item("All Tracks", |s| s.stacked.update(|v| *v = !*v)))
         .item(item("What Was Played", |s| s.show_raw.update(|v| *v = !*v)))

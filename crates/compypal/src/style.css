@@ -449,6 +449,21 @@
     border: 1px solid var(--rinch-color-dark-4);
 }
 .confirm-title { font-weight: 600; margin-bottom: 6px; }
+.settings-box {
+    width: 520px;
+    padding: 16px;
+    border-radius: 8px;
+    background: var(--rinch-color-dark-6);
+    border: 1px solid var(--rinch-color-dark-4);
+}
+.settings-head { display: flex; gap: 6px; align-items: center; margin-bottom: 10px; }
+.settings-body { height: 340px; overflow-y: auto; }
+.settings-section { margin: 12px 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--rinch-color-dimmed); }
+.settings-note { margin-bottom: 6px; font-size: 12px; color: var(--rinch-color-dimmed); }
+.device-status { display: inline-block; cursor: pointer; color: var(--rinch-color-dimmed); }
+.device-status:hover { color: var(--rinch-color-text); }
+.mini-meter { display: inline-block; width: 40px; height: 4px; margin-left: 6px; border-radius: 2px; background: var(--rinch-color-dark-5); overflow: hidden; vertical-align: middle; }
+.mini-meter-fill { display: inline-block; height: 4px; background: var(--rinch-color-green-6); vertical-align: top; }
 .confirm-actions { display: flex; gap: 6px; margin-top: 14px; }
 
 /* The agent panel: Claude Code inside the app. */
@@ -772,3 +787,7 @@
     color: var(--rinch-color-orange-4);
     border: 1px solid var(--rinch-color-orange-8);
 }
+
+/* Zoom buttons, grouped at the right of a view's toolbar. */
+.zoom-group { display: flex; gap: 2px; align-items: center; margin-left: 8px; }
+.zoom-label { font-size: 11px; color: var(--rinch-color-dimmed); margin-right: 4px; }

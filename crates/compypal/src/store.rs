@@ -41,6 +41,10 @@ pub struct Store {
     pub show_raw: Signal<bool>,
     /// Horizontal zoom in pixels per quarter note.
     pub zoom: Signal<f64>,
+    /// The piano roll's row height, pixels.
+    pub row_h: Signal<f64>,
+    /// The latest zoom asked for, and its number.
+    pub zoom_req: Signal<(u64, ZoomReq)>,
     pub status: Signal<String>,
     /// Figures on the selected track, re-derived whenever notes change.
     pub figures: Memo<Vec<Figure>>,
@@ -133,6 +137,9 @@ pub struct Store {
     pub rename_draft: Signal<String>,
     /// Asking whether to save before doing this.
     pub confirm: Signal<Option<Pending>>,
+    /// The Settings dialog is open, on this tab.
+    pub settings_open: Signal<bool>,
+    pub settings_tab: Signal<crate::settings::Tab>,
     /// The agent panel's conversation.
     pub chat: Signal<compypal_mcp::agent::Chat>,
     pub chat_open: Signal<bool>,
@@ -246,6 +253,8 @@ impl Store {
             selected_track,
             show_raw: Signal::new(true),
             zoom: Signal::new(96.0),
+            row_h: Signal::new(ROW),
+            zoom_req: Signal::new((0, ZoomReq::In)),
             status: Signal::new(String::new()),
             figures,
             editing: Signal::new(None),
@@ -301,6 +310,8 @@ impl Store {
             rename_open: Signal::new(false),
             rename_draft: Signal::new(String::new()),
             confirm: Signal::new(None),
+            settings_open: Signal::new(false),
+            settings_tab: Signal::new(Default::default()),
             chat: Signal::new(Default::default()),
             chat_open: Signal::new(false),
             chat_draft: Signal::new(String::new()),
@@ -346,7 +357,7 @@ impl Store {
         let track = self.selected_track.get()?;
         let roll = self.roll();
         let tick = x / roll.px;
-        let row = (y / ROW).floor();
+        let row = (y / roll.row).floor();
         if row < 0.0 {
             return None;
         }
@@ -390,7 +401,7 @@ impl Store {
         let px = self.roll().px;
         drag.dt = self.snap_delta(dx / px);
         if drag.mode == DragMode::Move {
-            drag.dp = -(dy / ROW).round() as i32;
+            drag.dp = -(dy / self.row_h.get()).round() as i32;
         }
         self.note_drag.set(Some(drag.clone()));
     }
@@ -483,6 +494,7 @@ impl Store {
             || self.recent_open.get()
             || self.rename_open.get()
             || self.confirm.get().is_some()
+            || self.settings_open.get()
             || crate::chat::composer_focused()
     }
 
@@ -609,6 +621,15 @@ impl Store {
     }
 
     // --- song files ------------------------------------------------------------
+
+    /// Zoom in or out, fit the song, or change the roll's row height: the
+    /// view on screen applies it.
+    pub fn zoom(self, req: ZoomReq) {
+        self.zoom_req.update(|(n, r)| {
+            *n += 1;
+            *r = req;
+        });
+    }
 
     /// The song has changes its file doesn't.
     pub fn unsaved(self) -> bool {
@@ -1614,7 +1635,7 @@ impl Store {
                             .map(|n| {
                                 let (left, top, width) =
                                     (n.start as f64 * px, (hi - n.pitch) as f64 * STACK_ROW, (n.duration as f64 * px).max(2.0));
-                                RollNote { key: format!("{left}:{top}:{width}:{}", n.velocity), left, top, width, velocity: n.velocity, selected: false }
+                                RollNote { key: format!("{left}:{top}:{width}:{}", n.velocity), left, top, width, height: STACK_ROW, velocity: n.velocity, selected: false }
                             })
                             .collect(),
                         c_lines: (lo..=hi).filter(|p| p % 12 == 0).map(|p| (hi - p) as f64 * STACK_ROW).collect(),
@@ -1659,7 +1680,8 @@ impl Store {
         });
         let sel = self.note_sel.get();
         let drag = self.note_drag.get();
-        self.project.with(|p| Roll::build(p, selected, zoom, show_raw, live.as_ref(), &sel, drag.as_ref()))
+        let row = self.row_h.get();
+        self.project.with(|p| Roll::build(p, selected, zoom, row, show_raw, live.as_ref(), &sel, drag.as_ref()))
     }
 }
 
@@ -1730,7 +1752,25 @@ impl Store {
     }
 }
 
+/// The piano roll's row height to start with, and how far it zooms.
 pub const ROW: f64 = 12.0;
+pub const ROW_RANGE: (f64, f64) = (6.0, 28.0);
+/// Horizontal zoom ranges, pixels per quarter note.
+pub const ZOOM_RANGE: (f64, f64) = (4.0, 400.0);
+pub const ARR_ZOOM_RANGE: (f64, f64) = (2.0, 120.0);
+
+/// A zoom asked for from the View menu or a toolbar, numbered so a view
+/// applies each one once. Each view applies it to its own scroller.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ZoomReq {
+    In,
+    Out,
+    /// The whole song across the view.
+    Fit,
+    /// The piano roll's rows.
+    Taller,
+    Shorter,
+}
 /// Height of one row in the roll's take lanes.
 pub const LANE_ROW: f64 = 20.0;
 
@@ -1774,6 +1814,8 @@ pub struct RollNote {
     pub left: f64,
     pub top: f64,
     pub width: f64,
+    /// Drawn height: a row, less a gap.
+    pub height: f64,
     pub velocity: u8,
     pub selected: bool,
 }
@@ -1783,6 +1825,7 @@ pub struct RollRow {
     pub key: String,
     pub pitch: u8,
     pub top: f64,
+    pub height: f64,
     pub black: bool,
     pub label: String,
 }
@@ -1810,14 +1853,18 @@ pub struct Roll {
     /// Pixels per tick, and the pitch of the top row: for turning a click
     /// into a time and a pitch.
     pub px: f64,
+    /// Row height in pixels.
+    pub row: f64,
     pub top_pitch: u8,
 }
 
 impl Roll {
+    #[allow(clippy::too_many_arguments)]
     fn build(
         p: &Project,
         track: Option<Id>,
         zoom: f64,
+        row: f64,
         show_raw: bool,
         live: Option<&Session>,
         selected: &[Note],
@@ -1875,13 +1922,14 @@ impl Roll {
         // so a note that moves must get a new key.
         let place = |n: &Note, tag: &str| {
             let (left, top, width) =
-                (n.start as f64 * px, (hi - n.pitch) as f64 * ROW, (n.duration as f64 * px).max(2.0));
+                (n.start as f64 * px, (hi - n.pitch) as f64 * row, (n.duration as f64 * px).max(2.0));
             let selected = tag == "n" && highlight.contains(n);
             RollNote {
-                key: format!("{tag}{left}:{top}:{width}:{}:{selected}", n.velocity),
+                key: format!("{tag}{left}:{top}:{width}:{row}:{}:{selected}", n.velocity),
                 left,
                 top,
                 width,
+                height: row - 2.0,
                 velocity: n.velocity,
                 selected,
             }
@@ -1897,11 +1945,11 @@ impl Roll {
 
         Self {
             width: end as f64 * px,
-            height: (hi - lo + 1) as f64 * ROW,
+            height: (hi - lo + 1) as f64 * row,
             rows: (lo..=hi)
                 .rev()
                 .map(|pitch| {
-                    let top = (hi - pitch) as f64 * ROW;
+                    let top = (hi - pitch) as f64 * row;
                     let label = if t.is_drums() {
                         compypal_core::gm::drum_name(pitch).unwrap_or("").to_string()
                     } else if pitch % 12 == 0 {
@@ -1910,9 +1958,10 @@ impl Roll {
                         String::new()
                     };
                     RollRow {
-                        key: format!("{pitch}:{top}:{label}"),
+                        key: format!("{pitch}:{top}:{row}:{label}"),
                         pitch,
                         top,
+                        height: row,
                         black: matches!(pitch % 12, 1 | 3 | 6 | 8 | 10),
                         label,
                     }
@@ -1924,6 +1973,7 @@ impl Roll {
             muted: t.muted_notes().iter().map(|n| place(n, "m")).collect(),
             live: live.iter().map(|n| place(n, "l")).collect(),
             px,
+            row,
             top_pitch: hi,
         }
     }

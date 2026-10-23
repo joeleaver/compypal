@@ -4,6 +4,7 @@ mod agent;
 mod chat;
 mod files;
 mod menu;
+mod settings;
 mod sketches;
 mod store;
 
@@ -12,9 +13,10 @@ use std::rc::Rc;
 use compypal_core::cleanup::grid_ticks;
 use compypal_core::{Id, Project, gm};
 use chat::AgentPanel;
+use settings::SettingsDialog;
 use sketches::SketchesView;
 use rinch::prelude::*;
-use store::{ARR_ROW, LANE_ROW, ROW, Slot, Store, View};
+use store::{ARR_ROW, ARR_ZOOM_RANGE, LANE_ROW, ROW_RANGE, Slot, Store, View, ZOOM_RANGE, ZoomReq};
 
 /// Width of the key labels down the left of the roll.
 const KEYS: f64 = 64.0;
@@ -49,26 +51,6 @@ fn track_rows(p: &Project) -> Vec<TrackRow> {
             }
         })
         .collect()
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct PortRow {
-    index: usize,
-    name: String,
-}
-
-fn port_rows() -> Vec<PortRow> {
-    compypal_audio::input::ports().into_iter().enumerate().map(|(index, name)| PortRow { index, name }).collect()
-}
-
-/// "KeyLab mkII 49:KeyLab mkII 49 MIDI 32:0" reads better as
-/// "KeyLab mkII 49 MIDI": ALSA names are "client:port id:id".
-fn short_port_name(name: &str) -> String {
-    let port = name.split_once(':').map_or(name, |(_, p)| p);
-    match port.rsplit_once(' ') {
-        Some((p, ids)) if ids.contains(':') => p.to_string(),
-        _ => port.to_string(),
-    }
 }
 
 #[component]
@@ -236,42 +218,6 @@ fn Sidebar() -> NodeHandle {
                     }
                 }
             }
-            div { class: "sidebar-heading", "MIDI input" }
-            for port in port_rows() {
-                div {
-                    key: port.index,
-                    class: {
-                        let i = port.index;
-                        move || if store.midi_port_index() == Some(i) { "port-row selected" } else { "port-row" }
-                    },
-                    onclick: {
-                        let i = port.index;
-                        move || store.toggle_port(i)
-                    },
-                    {short_port_name(&port.name)}
-                }
-            }
-            div { class: "sidebar-heading", "Audio input" }
-            for (i, name) in store.audio_devices.get().into_iter().map(|d| d.name).enumerate() {
-                div {
-                    key: i,
-                    class: move || if store.audio_device_index() == Some(i) { "port-row selected" } else { "port-row" },
-                    onclick: move || store.toggle_audio_in(i),
-                    {name}
-                }
-            }
-            if store.audio_device.get().is_some() {
-                div { class: "level-meter",
-                    div { class: "level-fill",
-                        style: {|| {
-                            // -80 dB to 0 dB across the meter: a quiet room
-                            // shows a sliver, so you can see it's alive.
-                            let db = 20.0 * (store.audio_level.get() + 1e-6).log10();
-                            format!("width: {:.0}%;", ((db + 80.0) / 80.0 * 100.0).clamp(0.0, 100.0))
-                        }}
-                    }
-                }
-            }
         }
     }
 }
@@ -280,6 +226,10 @@ fn Sidebar() -> NodeHandle {
 fn PianoRoll() -> NodeHandle {
     let store = use_store::<Store>();
     let roll = Memo::new(move || store.roll());
+    // The two scrollers, for panning with the middle button: filled in once
+    // both exist.
+    let scrollers: Rc<std::cell::RefCell<Option<(NodeHandle, NodeHandle)>>> = Rc::default();
+    let pan = scrollers.clone();
     // Only the grid scrolls vertically; the chord lane and ruler stay put.
     let viewport = rsx! {
         div { class: "grid-viewport",
@@ -288,11 +238,19 @@ fn PianoRoll() -> NodeHandle {
                 style: {|| format!("height: {}px;", roll.get().height)},
                 // One handler for the whole grid: it hit-tests notes itself,
                 // so nothing depends on how presses bubble.
-                onmousedown: move || grid_press(store),
+                onmousedown: move || {
+                    if get_click_context().button == MouseButton::Middle {
+                        if let Some((h, v)) = pan.borrow().clone() {
+                            pan_drag(h, Some(v));
+                        }
+                        return;
+                    }
+                    grid_press(store)
+                },
                 for row in roll.get().rows {
                     div { key: row.key.clone(),
                         class: {if row.black { "row black" } else { "row" }},
-                        style: {format!("top: {}px; height: {ROW}px;", row.top)},
+                        style: {format!("top: {}px; height: {}px;", row.top, row.height)},
                         span { class: "key-label", {row.label.clone()} }
                     }
                 }
@@ -304,7 +262,7 @@ fn PianoRoll() -> NodeHandle {
                 for n in roll.get().notes {
                     div { key: n.key.clone(), class: {if n.selected { "note selected" } else { "note" }},
                         style: {format!("left: {}px; top: {}px; width: {}px; height: {}px; opacity: {:.2};",
-                            n.left + 64.0, n.top + 1.0, n.width, ROW - 2.0, 0.45 + n.velocity as f64 / 127.0 * 0.55)},
+                            n.left + 64.0, n.top + 1.0, n.width, n.height, 0.45 + n.velocity as f64 / 127.0 * 0.55)},
                     }
                 }
                 div {
@@ -324,19 +282,19 @@ fn PianoRoll() -> NodeHandle {
                 for n in roll.get().live {
                     div { key: n.key.clone(), class: "note live",
                         style: {format!("left: {}px; top: {}px; width: {}px; height: {}px;",
-                            n.left + KEYS, n.top + 1.0, n.width, ROW - 2.0)},
+                            n.left + KEYS, n.top + 1.0, n.width, n.height)},
                     }
                 }
                 for n in roll.get().muted {
                     div { key: n.key.clone(), class: "note muted",
                         style: {format!("left: {}px; top: {}px; width: {}px; height: {}px;",
-                            n.left + KEYS, n.top + 1.0, n.width, ROW - 2.0)},
+                            n.left + KEYS, n.top + 1.0, n.width, n.height)},
                     }
                 }
                 for n in roll.get().raw {
                     div { key: n.key.clone(), class: "note raw",
                         style: {format!("left: {}px; top: {}px; width: {}px; height: {}px;",
-                            n.left + 64.0, n.top + 1.0, n.width, ROW - 2.0)},
+                            n.left + 64.0, n.top + 1.0, n.width, n.height)},
                     }
                 }
             }
@@ -381,6 +339,9 @@ fn PianoRoll() -> NodeHandle {
         }
     };
     follow_playhead(&root, store, move || store.zoom.get() / compypal_core::PPQ as f64, KEYS);
+    zoom_horizontally(&root, store, store.zoom, ZOOM_RANGE, KEYS);
+    zoom_rows(&viewport, store);
+    *scrollers.borrow_mut() = Some((root.clone(), viewport.clone()));
     // Bring the selected track's notes into view when it changes.
     {
         let viewport = viewport.clone();
@@ -391,7 +352,7 @@ fn PianoRoll() -> NodeHandle {
             // After layout, so the viewport knows its height.
             set_timeout(0, move || {
                 let h = viewport.client_height();
-                let y = (top.saturating_sub(center)) as f64 * ROW - h / 2.0;
+                let y = (top.saturating_sub(center)) as f64 * untracked(|| store.row_h.get()) - h / 2.0;
                 viewport.set_scroll_top(y.max(0.0));
             });
         });
@@ -444,8 +405,19 @@ fn PianoRoll() -> NodeHandle {
                     onclick: move || store.show_raw.update(|v| *v = !*v),
                     "Show raw take"
                 }
-                Button { size: "xs", variant: "default", onclick: move || store.zoom.update(|z| *z = (*z / 1.5).max(8.0)), "−" }
-                Button { size: "xs", variant: "default", onclick: move || store.zoom.update(|z| *z = (*z * 1.5).min(400.0)), "+" }
+                div { class: "spacer" }
+                div { class: "zoom-group",
+                    Button { size: "xs", variant: "default", onclick: move || store.zoom(ZoomReq::Out), "−" }
+                    Button { size: "xs", variant: "default", onclick: move || store.zoom(ZoomReq::Fit), "Fit" }
+                    Button { size: "xs", variant: "default", onclick: move || store.zoom(ZoomReq::In), "+" }
+                }
+                if !store.stacked.get() {
+                    div { class: "zoom-group",
+                        span { class: "zoom-label", "Rows" }
+                        Button { size: "xs", variant: "default", onclick: move || store.zoom(ZoomReq::Shorter), "−" }
+                        Button { size: "xs", variant: "default", onclick: move || store.zoom(ZoomReq::Taller), "+" }
+                    }
+                }
             }
             if store.stacked.get() {
                 StackedRolls {}
@@ -552,6 +524,7 @@ fn StackedRolls() -> NodeHandle {
             }
         }
     };
+    zoom_horizontally(&root, store, store.zoom, ZOOM_RANGE, KEYS);
     follow_playhead(&root, store, move || store.zoom.get() / compypal_core::PPQ as f64, KEYS);
     root
 }
@@ -568,7 +541,7 @@ fn grid_press(store: Store) {
     let y = (c.mouse_y - c.element_y) as f64;
     if x < 0.0 {
         let roll = store.roll();
-        let pitch = (roll.top_pitch as i32 - (y / ROW).floor() as i32).clamp(0, 127) as u8;
+        let pitch = (roll.top_pitch as i32 - (y / roll.row).floor() as i32).clamp(0, 127) as u8;
         if let Some(t) = store.selected_track.get() {
             let q = compypal_core::PPQ as u64;
             store.audition(t, &[compypal_core::Note { pitch, velocity: 100, start: 0, duration: q }]);
@@ -597,6 +570,81 @@ fn loop_band(store: Store, px_per_tick: f64, offset: f64) -> String {
     }
 }
 
+/// Applies the View menu's and toolbars' zooms to a view that scrolls
+/// sideways (`offset` pixels of labels before the music): In and Out keep
+/// the middle of what's shown where it is, Fit shows the whole song. A view
+/// not on screen leaves the request alone.
+fn zoom_horizontally(scroller: &NodeHandle, store: Store, zoom: Signal<f64>, (lo, hi): (f64, f64), offset: f64) {
+    let scroller = scroller.clone();
+    let seen = std::cell::Cell::new(untracked(|| store.zoom_req.get().0));
+    rinch::core::Effect::new(move || {
+        let (n, req) = store.zoom_req.get();
+        if n == seen.get() || !matches!(req, ZoomReq::In | ZoomReq::Out | ZoomReq::Fit) {
+            return;
+        }
+        let width = scroller.client_width();
+        if width <= offset {
+            return;
+        }
+        seen.set(n);
+        let old = untracked(|| zoom.get());
+        // In quarter notes from the song's start.
+        let middle = (scroller.scroll_left() + width / 2.0 - offset) / old;
+        let new = match req {
+            ZoomReq::In => old * 1.5,
+            ZoomReq::Out => old / 1.5,
+            _ => {
+                let end = untracked(|| store.project.with(|p| p.end_tick())).max(compypal_core::PPQ as u64 * 4);
+                (width - offset - 16.0) / (end as f64 / compypal_core::PPQ as f64)
+            }
+        }
+        .clamp(lo, hi);
+        zoom.set(new);
+        let left = if req == ZoomReq::Fit { 0.0 } else { (middle * new + offset - width / 2.0).max(0.0) };
+        let scroller = scroller.clone();
+        // After the new width is laid out.
+        set_timeout(0, move || scroller.set_scroll_left(left));
+    });
+}
+
+/// Taller or shorter rows in the piano roll, keeping the middle pitch put.
+fn zoom_rows(viewport: &NodeHandle, store: Store) {
+    let viewport = viewport.clone();
+    let seen = std::cell::Cell::new(untracked(|| store.zoom_req.get().0));
+    rinch::core::Effect::new(move || {
+        let (n, req) = store.zoom_req.get();
+        if n == seen.get() || !matches!(req, ZoomReq::Taller | ZoomReq::Shorter) {
+            return;
+        }
+        let height = viewport.client_height();
+        if height <= 0.0 {
+            return;
+        }
+        seen.set(n);
+        let old = untracked(|| store.row_h.get());
+        let middle = (viewport.scroll_top() + height / 2.0) / old;
+        let new = if req == ZoomReq::Taller { old * 1.25 } else { old / 1.25 }.clamp(ROW_RANGE.0, ROW_RANGE.1).round();
+        store.row_h.set(new);
+        let viewport = viewport.clone();
+        set_timeout(0, move || viewport.set_scroll_top((middle * new - height / 2.0).max(0.0)));
+    });
+}
+
+/// Pans by dragging with the middle button: `h` sideways, `v` up and down.
+fn pan_drag(h: NodeHandle, v: Option<NodeHandle>) {
+    let c = get_click_context();
+    let (sx, sy) = (c.mouse_x, c.mouse_y);
+    let (left, top) = (h.scroll_left(), v.as_ref().map_or(0.0, NodeHandle::scroll_top));
+    Drag::absolute()
+        .on_move(move |mx, my| {
+            h.set_scroll_left((left - (mx - sx) as f64).max(0.0));
+            if let Some(v) = &v {
+                v.set_scroll_top((top - (my - sy) as f64).max(0.0));
+            }
+        })
+        .start();
+}
+
 /// Keeps the playhead in view while playing, scrolling a page at a time.
 fn follow_playhead(scroller: &NodeHandle, store: Store, px_per_tick: impl Fn() -> f64 + 'static, offset: f64) {
     let scroller = scroller.clone();
@@ -621,8 +669,18 @@ fn follow_playhead(scroller: &NodeHandle, store: Store, px_per_tick: impl Fn() -
 fn Arranger() -> NodeHandle {
     let store = use_store::<Store>();
     let arr = Memo::new(move || store.arrangement());
+    // For panning with the middle button, as in the roll.
+    let scroller: Rc<std::cell::RefCell<Option<NodeHandle>>> = Rc::default();
+    let pan = scroller.clone();
     let timeline = rsx! {
         div { class: "arr-scroll",
+            onmousedown: move || {
+                if get_click_context().button == MouseButton::Middle
+                    && let Some(h) = pan.borrow().clone()
+                {
+                    pan_drag(h, None);
+                }
+            },
             div { class: "arr", style: {|| format!("width: {}px;", arr.get().width)},
                 div { class: "arr-sections",
                     for sec in arr.get().sections {
@@ -720,11 +778,16 @@ fn Arranger() -> NodeHandle {
         }
     };
     follow_playhead(&timeline, store, move || arr.get().px, 0.0);
+    zoom_horizontally(&timeline, store, store.arr_zoom, ARR_ZOOM_RANGE, 0.0);
+    *scroller.borrow_mut() = Some(timeline.clone());
     rsx! {
         div { class: "arranger",
             div { class: "arr-toolbar",
-                Button { size: "xs", variant: "default", onclick: move || store.arr_zoom.update(|z| *z = (*z / 1.5).max(4.0)), "−" }
-                Button { size: "xs", variant: "default", onclick: move || store.arr_zoom.update(|z| *z = (*z * 1.5).min(120.0)), "+" }
+                div { class: "zoom-group",
+                    Button { size: "xs", variant: "default", onclick: move || store.zoom(ZoomReq::Out), "−" }
+                    Button { size: "xs", variant: "default", onclick: move || store.zoom(ZoomReq::Fit), "Fit" }
+                    Button { size: "xs", variant: "default", onclick: move || store.zoom(ZoomReq::In), "+" }
+                }
                 {|| match store.bar_sel.get() {
                     Some((a, b)) if a == b => format!("Bar {a}"),
                     Some((a, b)) => format!("Bars {a}–{b}"),
@@ -1411,12 +1474,41 @@ fn app() -> NodeHandle {
                     AgentPanel {}
                 }
             }
+            if store.settings_open.get() {
+                SettingsDialog {}
+            }
             if store.confirm.get().is_some() {
                 ConfirmSave {}
             }
             div { class: "statusbar",
                 span { {|| store.status.get()} }
                 span { class: "right-status",
+                    // What's plugged in; a click picks something else.
+                    span { class: "device-status",
+                        onclick: move || settings::open(store, settings::Tab::Midi),
+                        {|| match store.midi_port.get() {
+                            Some(p) => format!("MIDI: {}", settings::short_port_name(&p)),
+                            None => "MIDI: none".into(),
+                        }}
+                    }
+                    if store.audio_device.get().is_some() {
+                        span { class: "device-status",
+                            onclick: move || settings::open(store, settings::Tab::Audio),
+                            {|| {
+                                let i = store.audio_device_index();
+                                let name = store.audio_devices.with(|d| i.and_then(|i| d.get(i)).map(|d| d.name.clone())).unwrap_or_default();
+                                format!("In: {name}")
+                            }}
+                            span { class: "mini-meter",
+                                span { class: "mini-meter-fill",
+                                    style: {|| {
+                                        let db = 20.0 * (store.audio_level.get() + 1e-6).log10();
+                                        format!("width: {:.0}%;", ((db + 80.0) / 80.0 * 100.0).clamp(0.0, 100.0))
+                                    }}
+                                }
+                            }
+                        }
+                    }
                     span { class: {|| if store.agents.get() > 0 { "agent-status on" } else { "agent-status" }},
                         {|| agent::status_text(store.agents.get())}
                     }
