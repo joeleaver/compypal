@@ -35,13 +35,23 @@ with a built-in synth; export MIDI and ABC.
 - Laying music over music (recording, adding a sketch) never mixes it in:
   `Track::add_over` cuts the clips underneath at its edges and mutes the
   covered parts, kept as alternatives, each remembering what muted it
-  (`muted_by`); `Track::prefer` (`use_sketch`, "Use this one", a click in
-  the roll's Takes lanes) switches, per bar range. `Project::take_out`
+  (`muted_by`): versions, in the UI. `Track::prefer` (`use_version`,
+  "Use this one", a click in the roll's Versions lanes) switches, per bar
+  range. `Project::take_out`
   removes a sketch's clips and brings back exactly what they muted.
   `Track::absolute_notes` is what's heard; `muted_notes` is what's under
   it (dashed in the roll, hatched in the arranger, listed as lanes above
   the roll). A split clip keeps `source_offset`, its place in its take, so
-  `Clip::refill` (Tidy, `clean_take`) refills only its window.
+  `Clip::refill` (Tidy, `clean_part`) refills only its window.
+- Words (the same in the UI, the agent's tools and here): a **sketch** is
+  playing as played (a `Session` in a song is a song sketch, a copy of
+  it); a **part** is music on a track (clips); a **version** is a part
+  under another. Not take, jam or session in anything the user or the
+  agent reads. `docs/design/sketches-and-tracks.md` has the reasoning.
+- Track headers in Arrange (the sidebar is only in Edit): name,
+  instrument, M, S and a level in dB (`volume` as MIDI CC7, GM's
+  40·log10 curve, ±1.5 dB a click). `schedule::build` leaves out muted
+  tracks and, while any is soloed, unsoloed ones; export follows.
 
 ## Figures
 
@@ -133,6 +143,11 @@ says what's connected; a click there opens the right tab.
   substring) or else the first port that isn't a DAW/loopback port. Its
   callback timestamps with `Instant`, monitors through the engine on the
   selected track's channel, and appends to the running take.
+- Rec files what's played into the journal too, listening or not
+  (`Journal::set_recording`, `keeping()`), so every recording is a sketch
+  in the library; the song sketch remembers when (`Session::played_at`),
+  and the library knows it as the song's by that span
+  (`Session::overlaps`).
 - Rec plays one bar of count-in, then the song from the cursor with an
   open end (`Schedule::length = INFINITY`). The session records
   `downbeat_offset` (the count-in) and `start_tick` (the cursor), which is
@@ -149,11 +164,18 @@ says what's connected; a click there opens the right tab.
   records when position zero of a Play is heard (`Engine::heard_zero`),
   and `stop_recording` shifts the take by the difference (~56 ms here).
   MIDI input latency itself (~1 ms over USB) is not corrected.
-- **Free** (next to Rec): no click, no count-in, nothing playing. On stop
+- **Rec with Click off** ("Rec free"; it was a Free button): no click,
+  no count-in, nothing playing. On stop
   the pulse is found (`jam::estimate_tempo`, refined by a least-squares
   line through the eighths so long takes don't drift off the grid) and the
   take is laid on the song's grid by its own beats at the cursor's bar
   (`jam::to_session`, as `add_sketch` does). An empty song takes the tempo.
+- With an audio input chosen, Rec records it too (no MIDI keyboard
+  needed). If no MIDI was played, `stop_recording` cuts the journal's
+  recording at once (`Journal::cut_audio`) and waits (`pending_audio`)
+  for it to be written down; `resolve_audio_take` then makes the
+  transcription the take, the song sketch keeping the recording
+  (`audio`). It gives up after 90 s.
 - Not yet: the KeyLab's DAW-port transport buttons.
 
 ## Agent (MCP)
@@ -241,12 +263,14 @@ playing (not take, jam or session).
   added to the song on a chosen track at the end or at the cursor. A song's
   sketch can be taken out (it stays a sketch) or, unused, removed; a
   journal sketch can be hidden (`journal/hidden.json`; the playing stays,
-  and the agent doesn't see it). Filters: All, Not in the song, Hidden.
+  and the agent doesn't see it). Filters: All, In this song, Not in the
+  song, Hidden.
 - Added sketches are sessions with `own_tempo`: imported by their own pulse
   (beats, not seconds), so they sit on the song's grid at any song tempo.
 - Agent: `list_sketches`, `get_sketch` (chord timeline in mm:ss, activity
   map), `hear_sketch`, `add_sketch` (a stretch, re-timed on that stretch),
-  `use_sketch`.
+  `use_version`; for song sketches `get_playing` and `clean_part` (the old
+  names `get_session`, `clean_take`, `use_sketch` still answer).
 - To test without disturbing your own journal, run with
   `XDG_DATA_HOME=/some/tmp` and the `fake_keys` example (`fake_keys 12 3 4`
   plays three ideas a step apart with 4 s pauses: three sketches).
@@ -394,9 +418,10 @@ reach the store through `Store::current()`.
 
 ## Design notes
 
-- `docs/design/sketches-and-tracks.md`: user stories and a proposed model
-  for sketches, parts, tracks and versions (one Rec, one library, one
-  vocabulary), with the decisions it needs. A proposal, not built yet.
+- `docs/design/sketches-and-tracks.md`: user stories and the model for
+  sketches, parts, tracks and versions (one Rec, one library, one
+  vocabulary), the decisions taken, and what's built. Audio tracks (a song
+  playing a recording) are the next step there.
 
 ## Roadmap
 

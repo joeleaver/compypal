@@ -1,6 +1,7 @@
 # Playing, sketches and tracks: a plan
 
-Status: proposal, for review. Nothing here is built yet.
+Status: decided on 23 Oct 2026; phases 1–4 built, phase 5 (audio tracks)
+later. See "Decisions" and "What was built" at the end.
 
 compypal grew three ways to capture playing (Rec, Free, Listen), two kinds
 of input (MIDI, audio) and two places raw playing lives (the journal and
@@ -140,7 +141,7 @@ And one relation:
   `get_sketch` (a sketch in this song), `use_sketch` becomes
   `use_version`, and names like "Jam 09:13" become the sketch's own name.
 
-## Decisions to make
+## Questions that needed deciding
 
 1. **Can a song play audio?** Either (a) audio is always transcribed into
    notes and the recording is only for reference, as today, or (b) a track
@@ -184,3 +185,36 @@ Each phase leaves the app working and is one commit or a few.
 
 Not in this plan: the synth (roadmap 5), mixing beyond a level per track,
 and editing audio itself (cutting a recording other than by bars).
+
+## Decisions
+
+Taken on 23 Oct 2026:
+
+1. **Audio in the song**: notes now, audio tracks later. Audio is
+   transcribed; the recording stays with the song sketch, one click away.
+2. **Song files are self-contained**: a song keeps a copy of each sketch it
+   uses, and knows it in the library by when it was played.
+3. **Free folds into Rec**: Rec with Click off records in free time.
+4. **Versions per bar range**, as before.
+5. **Mute, solo and level** in this work, in Arrange's track headers.
+6. **Listen stays off by default.**
+
+## What was built
+
+- Phase 1: the UI says Versions and "Show as played"; recordings are named
+  by their music or "Recording N"; the agent has `get_playing`,
+  `clean_part` and `use_version` (old names kept as aliases), and its
+  instructions describe sketches, parts and versions.
+- Phase 2: Rec files its playing into the library whether or not Listen is
+  on; a song sketch remembers when it was played (`played_at`), and the
+  library recognises it by that span, even split in two. Filter "In this
+  song".
+- Phase 3: the Free button is gone (Rec with Click off, shown as "Rec
+  free"); with an audio input chosen, Rec records it and, if no MIDI was
+  played, the part is the transcription, ready a few seconds after Rec
+  stops. Repeated Rec over the same bars adds versions, as laying over
+  always did.
+- Phase 4: Arrange has track headers (name, instrument, M, S, level in
+  dB); the sidebar is only in Edit.
+- Not done: version counts drawn on parts in the arranger (versions show
+  as hatching there, and as lanes in Edit); phase 5.
