@@ -420,7 +420,7 @@ fn show_in_song(store: Store, session: Id) {
 fn ask(store: Store, source: Source, name: &str) {
     let about = match source {
         Source::Journal(id) => format!("About the sketch \"{name}\" (sketch {id}): "),
-        Source::Session(_) => format!("About \"{name}\", the take in this song: "),
+        Source::Session(_) => format!("About \"{name}\", a sketch in this song: "),
     };
     store.chat_draft.set(about);
     if !store.chat_open.get() {

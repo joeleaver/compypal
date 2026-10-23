@@ -169,7 +169,7 @@ pub fn list() -> Value {
         },
         {
             "name": "add_sketch",
-            "description": "Adds a sketch (or seconds from..to of it) to the song as a session and a clip, on the beat grid its tempo implies. Then get_session, clean_take and get_figures work on it like anything recorded. If the song is empty, it adopts the sketch's tempo.",
+            "description": "Adds a sketch (or seconds from..to of it) to the song: the song keeps a copy of the playing and gets a part made from it, on the beat grid its tempo implies. Then get_playing, clean_part and get_figures work on it like anything recorded. If the song is empty, it adopts the sketch's tempo.",
             "inputSchema": {"type": "object", "properties": {
                 "sketch": sketch_ref, "from": secs("Seconds into the sketch."), "to": secs("Seconds into the sketch."),
                 "bpm": {"type": "number", "description": "Override the tempo guess."},
@@ -179,11 +179,11 @@ pub fn list() -> Value {
             }}
         },
         {
-            "name": "use_sketch",
-            "description": "Makes a sketch (a session of the song, by id or name from get_project) the one heard where it sits; whatever else is on its track there is muted, not lost. For choosing between takes of the same bars.",
+            "name": "use_version",
+            "description": "Makes one version heard where it sits: the part made from this song sketch (by id or name from get_project). Whatever else is on its track there becomes a version in its turn: muted, not lost. For choosing between versions of the same bars.",
             "inputSchema": {"type": "object", "properties": {
-                "session": {"type": ["string", "integer"]}
-            }, "required": ["session"]}
+                "sketch": {"type": ["string", "integer"], "description": "A song sketch's name or id, from get_project."}
+            }, "required": ["sketch"]}
         },
         {
             "name": "get_selection",
@@ -192,7 +192,7 @@ pub fn list() -> Value {
         },
         {
             "name": "get_project",
-            "description": "Overview of the project: tempo, meter, key, tracks (with instruments and note counts), recorded sessions, sections, and what the user has selected. Start here.",
+            "description": "Overview of the song: tempo, meter, key, tracks (with instruments, mute/solo/level and note counts), the sketches it holds (the playing its parts were made from), sections, and what the user has selected. Start here.",
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
@@ -210,17 +210,17 @@ pub fn list() -> Value {
             "inputSchema": {"type": "object", "properties": {"track": track, "section": section, "selection": selection}}
         },
         {
-            "name": "get_session",
-            "description": "A raw recorded take, exactly as played: timing against the grid (mean deviation, whether the player sits ahead or behind, measured swing), suspected mistakes (ghost notes, grazed keys, double strikes), and the notes. Use this before clean_take.",
+            "name": "get_playing",
+            "description": "A song sketch exactly as played (what a part was made from, recorded or added): timing against the grid (mean deviation, whether the player sits ahead or behind, measured swing), suspected mistakes (ghost notes, grazed keys, double strikes), and the notes. Use this before clean_part.",
             "inputSchema": {"type": "object", "properties": {
-                "session": {"type": ["string", "integer"], "description": "Session name or id. Defaults to the latest."}
+                "sketch": {"type": ["string", "integer"], "description": "A song sketch's name or id, from get_project. Defaults to the latest."}
             }}
         },
         {
-            "name": "clean_take",
-            "description": "Rebuilds the clip(s) made from a session, starting again from the raw take each time, so it is safe to retry with different settings. Steps run in this order: remove_quiet, remove_short, merge_double_strikes, quantize, fix_overlaps. Keep the player's intent: prefer partial strength and a window over hard quantizing, and check get_session's timing first. Reports what changed and the timing afterwards.",
+            "name": "clean_part",
+            "description": "Rebuilds the part(s) made from a song sketch, starting again from the playing each time, so it is safe to retry with different settings. Steps run in this order: remove_quiet, remove_short, merge_double_strikes, quantize, fix_overlaps. Keep the player's intent: prefer partial strength and a window over hard quantizing, and check get_playing's timing first. Reports what changed and the timing afterwards.",
             "inputSchema": {"type": "object", "properties": {
-                "session": {"type": ["string", "integer"]},
+                "sketch": {"type": ["string", "integer"], "description": "A song sketch's name or id. Defaults to the latest."},
                 "remove_quiet": {"type": "integer", "description": "Drop notes softer than this velocity (ghosts are often < 25)."},
                 "remove_short": {"type": "string", "description": "Drop notes shorter than this note value, e.g. 1/64."},
                 "merge_double_strikes": {"type": "string", "description": "Merge repeats of a pitch starting within this note value, e.g. 1/32."},
@@ -397,7 +397,8 @@ pub fn call(app: &mut dyn App, name: &str, args: &Value) -> ToolResult {
         "get_project" => get_project(app),
         "get_notes" => get_notes(app, args),
         "get_figures" => get_figures(app, args),
-        "get_session" => get_session(app, args),
+        // The old names stay callable for agents that learned them.
+        "get_playing" | "get_session" => get_session(app, args),
         "get_selection" => get_selection(app),
         "list_sketches" => list_sketches(app, args),
         "list_projects" => list_projects(app),
@@ -416,8 +417,8 @@ pub fn call(app: &mut dyn App, name: &str, args: &Value) -> ToolResult {
         "get_sketch" => get_sketch(app, args),
         "hear_sketch" => hear_sketch(app, args),
         "add_sketch" => add_sketch(app, args),
-        "use_sketch" => use_sketch(app, args),
-        "clean_take" => clean_take(app, args),
+        "use_version" | "use_sketch" => use_sketch(app, args),
+        "clean_part" | "clean_take" => clean_take(app, args),
         "set_notes" => set_notes(app, args),
         "transform" => transform(app, args),
         "set_chord" => set_chord(app, args),
@@ -603,7 +604,9 @@ fn find_section<'a>(p: &'a Project, name: &str) -> Result<&'a compypal_core::Sec
         })
 }
 
-fn find_session(p: &Project, v: Option<&Value>) -> Result<Session, String> {
+/// A song sketch, by the `sketch` argument (`session`, its old name, too).
+fn find_session(p: &Project, args: &Value) -> Result<Session, String> {
+    let v = args.get("sketch").or_else(|| args.get("session"));
     let found = match v {
         None | Some(Value::Null) => p.sessions.last(),
         Some(v) => v
@@ -616,7 +619,7 @@ fn find_session(p: &Project, v: Option<&Value>) -> Result<Session, String> {
     };
     found.cloned().ok_or_else(|| {
         let names: Vec<String> = p.sessions.iter().map(|s| format!("{:?} ({})", s.name, s.id)).collect();
-        format!("no such session; sessions are {}", if names.is_empty() { "none".into() } else { names.join(", ") })
+        format!("no such sketch in the song; it holds {}", if names.is_empty() { "none".into() } else { names.join(", ") })
     })
 }
 
@@ -702,7 +705,7 @@ fn get_project(app: &mut dyn App) -> ToolResult {
             if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join(", ")) }
         ));
     }
-    out.push_str("\nSessions (raw takes):\n");
+    out.push_str("\nSketches in the song (the playing its parts were made from):\n");
     if p.sessions.is_empty() {
         out.push_str("  none\n");
     }
@@ -713,7 +716,7 @@ fn get_project(app: &mut dyn App) -> ToolResult {
             .filter(|t| t.clips.iter().any(|c| c.source_session == Some(s.id)))
             .map(|t| {
                 let heard = t.clips.iter().any(|c| c.source_session == Some(s.id) && !c.muted);
-                if heard { format!("{:?}", t.name) } else { format!("{:?} (muted: something else is heard there; use_sketch brings it back)", t.name) }
+                if heard { format!("{:?}", t.name) } else { format!("{:?} (muted: another version is heard there; use_version brings it back)", t.name) }
             })
             .collect();
         out.push_str(&format!(
@@ -1029,7 +1032,7 @@ fn add_sketch(app: &mut dyn App, args: &Value) -> ToolResult {
     })?;
     let (first, last, notes, track) = placed;
     Ok(format!(
-        "Added {}–{} of sketch {} as session {label:?}: {notes} notes on track {track:?}, bars {first}-{last}, {}.{} It's as played; get_session and clean_take work on it now.",
+        "Added {}–{} of sketch {} to the song as {label:?}: {notes} notes on track {track:?}, bars {first}-{last}, {}.{} It's as played; get_playing and clean_part work on it now.",
         mmss(from - j.start),
         mmss(to.min(j.end) - j.start),
         j.id,
@@ -1037,7 +1040,7 @@ fn add_sketch(app: &mut dyn App, args: &Value) -> ToolResult {
             Some(t) => format!("at {:.1} BPM (confidence {:.2})", t.bpm, t.confidence),
             None => "in free time (no steady beat found), at the song's tempo".into(),
         },
-        if muted > 0 { " What was already on the track there is muted, kept as an alternative (use_sketch switches back)." } else { "" }
+        if muted > 0 { " What was already on the track there is muted, kept as a version (use_version switches back)." } else { "" }
     ))
 }
 
@@ -1089,7 +1092,7 @@ pub fn selection_text(p: &Project, sel: &Selection) -> String {
 
 fn use_sketch(app: &mut dyn App, args: &Value) -> ToolResult {
     let p = app.project();
-    let s = find_session(&p, args.get("session"))?;
+    let s = find_session(&p, args)?;
     let clips: Vec<Id> = p.tracks.iter().flat_map(|t| &t.clips).filter(|c| c.source_session == Some(s.id)).map(|c| c.id).collect();
     if clips.is_empty() {
         return Err(format!("{:?} isn't in the song; add it first", s.name));
@@ -1104,7 +1107,7 @@ fn use_sketch(app: &mut dyn App, args: &Value) -> ToolResult {
 
 fn get_session(app: &mut dyn App, args: &Value) -> ToolResult {
     let p = app.project();
-    let s = find_session(&p, args.get("session"))?;
+    let s = find_session(&p, args)?;
     let imported = cleanup::import_session(&s, &p.tempo, true);
     let shift = s.start_tick as i64 - (imported.pickup_bars as u64 * s.meter.ticks_per_bar()) as i64;
     let mut notes = imported.notes;
@@ -1183,7 +1186,7 @@ fn get_session(app: &mut dyn App, args: &Value) -> ToolResult {
 
 fn clean_take(app: &mut dyn App, args: &Value) -> ToolResult {
     let p = app.project();
-    let s = find_session(&p, args.get("session"))?;
+    let s = find_session(&p, args)?;
     let sustain = args.get("sustain").and_then(Value::as_bool).unwrap_or(true);
     let quiet = args.get("remove_quiet").and_then(Value::as_u64).map(|v| v as u8);
     let short = duration_arg(args, "remove_short")?;
@@ -1878,7 +1881,7 @@ mod tests {
     #[test]
     fn session_report_finds_the_planted_mistakes() {
         let mut app = demo();
-        let s = run(&mut app, "get_session", json!({}));
+        let s = run(&mut app, "get_playing", json!({}));
         assert!(s.contains("Suspected mistakes (3)"), "{s}");
         assert!(s.contains("C#4 vel 22"), "{s}");
     }
@@ -1886,11 +1889,11 @@ mod tests {
     #[test]
     fn session_report_compares_the_pulse_with_the_click() {
         let mut app = demo();
-        let s = run(&mut app, "get_session", json!({}));
+        let s = run(&mut app, "get_playing", json!({}));
         assert!(s.contains("steady with the 100 BPM click"), "{s}");
         // The same playing against a faster click drifts.
         app.project.sessions[0].click_bpm = Some(120.0);
-        let s = run(&mut app, "get_session", json!({}));
+        let s = run(&mut app, "get_playing", json!({}));
         assert!(s.contains("played at about 100 BPM against a 120 BPM click (slower)"), "{s}");
     }
 
@@ -2026,7 +2029,7 @@ mod tests {
         assert_eq!(app.project.tempo.bpm_at(0), 92.0);
         let figs = run(&mut app, "get_figures", json!({}));
         assert!(figs.contains("Am (vi)") && figs.contains("G (V)"), "{figs}");
-        let s = run(&mut app, "get_session", json!({}));
+        let s = run(&mut app, "get_playing", json!({}));
         assert!(s.contains("32 notes"), "{s}");
     }
 

@@ -12,10 +12,12 @@ pub trait Dispatch: Send + Sync + 'static {
     }
 }
 
-const INSTRUCTIONS: &str = "compypal is a MIDI composer. The user plays ideas into it from a \
-controller; each take is kept raw as a session and laid down as a clip. Your job is usually to \
-clean takes up without losing what the player meant, and to help compose and arrange. Read \
-before writing: get_project, then get_session or get_figures. Positions are bar.beat.tick \
+const INSTRUCTIONS: &str = "compypal is a MIDI composer. The user plays ideas into it (a \
+keyboard, or a voice or guitar written down as notes). Everything played is a sketch, kept as \
+played; a song holds copies of the sketches it uses, and its tracks hold parts made from them. \
+Laying a part over another keeps the old one as a version. Your job is usually to clean parts \
+up without losing what the player meant, and to help compose and arrange. Read before \
+writing: get_project, then get_playing or get_figures. Positions are bar.beat.tick \
 (one-based, 960 ticks per beat); pitches are names like C4 (= MIDI 60). Every edit is undoable, \
 and play/audition let the user hear changes. Prefer musical units (figures, chords) over \
 note-by-note edits when you can.";

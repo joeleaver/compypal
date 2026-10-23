@@ -71,7 +71,7 @@ pub fn bar() -> Vec<(&'static str, Menu)> {
         .item(item("Shorter Rows", |s| s.zoom(ZoomReq::Shorter)).shortcut("Ctrl+Shift+-"))
         .separator()
         .item(item("All Tracks", |s| s.stacked.update(|v| *v = !*v)))
-        .item(item("What Was Played", |s| s.show_raw.update(|v| *v = !*v)))
+        .item(item("Show As Played", |s| s.show_raw.update(|v| *v = !*v)))
         .separator()
         .item(item("Agent", crate::chat::toggle).shortcut("Ctrl+L"));
     let transport = Menu::new()

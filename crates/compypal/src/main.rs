@@ -403,7 +403,7 @@ fn PianoRoll() -> NodeHandle {
                 Button { size: "xs",
                     variant: {|| if store.show_raw.get() { "filled" } else { "default" }},
                     onclick: move || store.show_raw.update(|v| *v = !*v),
-                    "Show raw take"
+                    "Show as played"
                 }
                 div { class: "spacer" }
                 div { class: "zoom-group",
@@ -1125,7 +1125,7 @@ fn TakeLanes() -> NodeHandle {
                 0 => "display: none;".to_string(),
                 rows => format!("height: {}px;", rows as f64 * LANE_ROW + 4.0),
             }},
-            div { class: "lane-label", "Takes" }
+            div { class: "lane-label", "Versions" }
             for b in lanes.get().0 {
                 div {
                     key: b.key.clone(),

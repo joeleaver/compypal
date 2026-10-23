@@ -336,7 +336,7 @@ pub fn dot_class(store: Store) -> String {
 }
 
 const STARTERS: [&str; 4] = [
-    "Clean up my last take",
+    "Clean up what I just recorded",
     "What are the chords here?",
     "Write a bass line under this",
     "What did I play today?",

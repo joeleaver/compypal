@@ -983,7 +983,7 @@ impl Store {
                 p.tempo = compypal_core::TempoMap::constant(t.bpm.round());
             }
             let id = p.alloc_id();
-            let name = compypal_core::jam::summarize(&events).map_or_else(|| format!("Take {}", p.sessions.len() + 1), |s| compypal_core::jam::sketch_name(&s));
+            let name = compypal_core::jam::summarize(&events).map_or_else(|| format!("Recording {}", p.sessions.len() + 1), |s| compypal_core::jam::sketch_name(&s));
             let meter = p.meter_at(rec.start_tick);
             let mut session = compypal_core::jam::to_session(&events, 0.0, end, id, name.clone(), tempo.as_ref(), meter, rec.start_tick);
             session.recorded_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -1028,7 +1028,7 @@ impl Store {
         let mut summary = String::new();
         self.edit("record", |p| {
             let id = p.alloc_id();
-            let name = compypal_core::jam::summarize(&events).map_or_else(|| format!("Take {}", p.sessions.len() + 1), |s| compypal_core::jam::sketch_name(&s));
+            let name = compypal_core::jam::summarize(&events).map_or_else(|| format!("Recording {}", p.sessions.len() + 1), |s| compypal_core::jam::sketch_name(&s));
             let session = rec.session(id, name.clone(), events);
             let notes = lay_take(p, rec.track, &session, rec.start_tick, &name);
             summary = format!("{name}: {notes} notes");
@@ -1130,7 +1130,7 @@ impl Store {
         self.edit(&format!("use {name}"), |p| {
             p.prefer_clip(clip);
         });
-        self.status.set(format!("{name:?} is heard there now; the other take is kept, muted"));
+        self.status.set(format!("{name:?} is heard there now; the other version is kept, muted"));
     }
 
     /// Makes `session`'s clips the ones heard where they sit.
@@ -1148,7 +1148,7 @@ impl Store {
     /// Re-derives every clip made from `session` with the default cleanup.
     pub fn tidy_session(self, session: Id) {
         let mut report = cleanup::TidyReport::default();
-        self.edit("tidy take", |p| {
+        self.edit("tidy", |p| {
             let Some(s) = p.session(session).cloned() else { return };
             let fresh = cleanup::import_session(&s, &p.tempo, true);
             for t in &mut p.tracks {
