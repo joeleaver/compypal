@@ -723,7 +723,7 @@ fn Arranger() -> NodeHandle {
                     for row in arr.get().rows {
                         div {
                             key: row.key.clone(),
-                            class: {if row.muted { "arr-row muted" } else { "arr-row" }},
+                            class: {if row.silent { "arr-row muted" } else { "arr-row" }},
                             style: {format!("height: {ARR_ROW}px;")},
                             for clip in row.clips.clone() {
                                 div {
@@ -828,8 +828,58 @@ fn Arranger() -> NodeHandle {
                                 let id = row.track;
                                 move || store.select_track(id)
                             },
-                            div { class: "track-name", {row.name.clone()} }
-                            div { class: "track-detail", {row.instrument.clone()} }
+                            div { class: if row.silent { "arr-head-name silent" } else { "arr-head-name" },
+                                span { class: "track-name", {row.name.clone()} }
+                                span {
+                                    class: "instrument-link track-detail",
+                                    onclick: {
+                                        let id = row.track;
+                                        move || {
+                                            store.instrument_draft.set(String::new());
+                                            store.instrument_edit.set(Some(id));
+                                        }
+                                    },
+                                    {row.instrument.clone()}
+                                }
+                            }
+                            div { class: "arr-head-controls",
+                                span {
+                                    class: if row.muted { "head-toggle on mute" } else { "head-toggle" },
+                                    onclick: {
+                                        let id = row.track;
+                                        move || store.toggle_mute(id)
+                                    },
+                                    "M"
+                                }
+                                span {
+                                    class: if row.solo { "head-toggle on solo" } else { "head-toggle" },
+                                    onclick: {
+                                        let id = row.track;
+                                        move || store.toggle_solo(id)
+                                    },
+                                    "S"
+                                }
+                                span {
+                                    class: "head-toggle",
+                                    onclick: {
+                                        let id = row.track;
+                                        move || store.nudge_level(id, -1.5)
+                                    },
+                                    "−"
+                                }
+                                span { class: "head-level", {store::level_text(row.volume)} }
+                                span {
+                                    class: "head-toggle",
+                                    onclick: {
+                                        let id = row.track;
+                                        move || store.nudge_level(id, 1.5)
+                                    },
+                                    "+"
+                                }
+                            }
+                            if store.instrument_edit.get() == Some(row.track) {
+                                InstrumentPicker {}
+                            }
                         }
                     }
                 }
@@ -1469,8 +1519,9 @@ fn app() -> NodeHandle {
             style { {CSS} }
             Transport {}
             div { class: "main",
-                // Sketches have their own list; the tracks are for the song.
-                if store.view.get() != View::Sketches {
+                // The track list is for editing; Arrange has its own track
+                // headers, and Sketches its own list.
+                if store.view.get() == View::Edit {
                     Sidebar {}
                 }
                 match store.view.get() {

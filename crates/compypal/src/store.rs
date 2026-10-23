@@ -620,6 +620,36 @@ impl Store {
         self.project.with(|p| Arrangement::build(p, px))
     }
 
+    /// Mutes or unmutes a track (undoable, like any edit to the song).
+    pub fn toggle_mute(self, track: Id) {
+        self.edit("mute", |p| {
+            if let Some(t) = p.track_mut(track) {
+                t.muted = !t.muted;
+            }
+        });
+    }
+
+    /// Solos a track, or stops soloing it: while any track is soloed, only
+    /// soloed tracks are heard.
+    pub fn toggle_solo(self, track: Id) {
+        self.edit("solo", |p| {
+            if let Some(t) = p.track_mut(track) {
+                t.solo = !t.solo;
+            }
+        });
+    }
+
+    /// Turns a track up or down by `db`, as MIDI volume (General MIDI's
+    /// curve: 40·log10(v/127) dB).
+    pub fn nudge_level(self, track: Id, db: f64) {
+        self.edit("level", |p| {
+            if let Some(t) = p.track_mut(track) {
+                let v = (t.volume.max(1) as f64 * 10f64.powf(db / 40.0)).round();
+                t.volume = v.clamp(0.0, 127.0) as u8;
+            }
+        });
+    }
+
     /// Adds a piano track and selects it, ready to record into.
     pub fn add_track(self) {
         let mut id = None;
@@ -1812,6 +1842,15 @@ fn write_export(name: &str, ext: &str, bytes: &[u8]) -> Result<PathBuf, String> 
     Ok(path)
 }
 
+/// A track's level as text: dB against the usual MIDI volume of 100.
+pub fn level_text(volume: u8) -> String {
+    if volume == 0 {
+        return "−∞ dB".into();
+    }
+    let db = 40.0 * (volume as f64 / 100.0).log10();
+    if db.abs() < 0.05 { "0 dB".into() } else { format!("{db:+.1} dB").replace('-', "−") }
+}
+
 /// "Untitled", "Untitled 2", …: a name nobody gave the song.
 fn is_untitled(name: &str) -> bool {
     name.strip_prefix("Untitled").is_some_and(|rest| rest.is_empty() || rest.trim_start().parse::<u32>().is_ok())
@@ -2068,7 +2107,7 @@ impl Roll {
     }
 }
 
-pub const ARR_ROW: f64 = 44.0;
+pub const ARR_ROW: f64 = 50.0;
 pub const STACK_ROW: f64 = 5.0;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2111,6 +2150,11 @@ pub struct ArrRow {
     pub name: String,
     pub instrument: String,
     pub muted: bool,
+    pub solo: bool,
+    /// Silent: muted, or another track is soloed.
+    pub silent: bool,
+    /// Level, as MIDI volume (100 is the usual).
+    pub volume: u8,
     pub clips: Vec<ArrClip>,
     pub notes: Vec<ArrNote>,
 }
@@ -2159,6 +2203,7 @@ impl Arrangement {
                 }
             })
             .collect();
+        let soloing = p.tracks.iter().any(|t| t.solo);
         let rows = p
             .tracks
             .iter()
@@ -2170,11 +2215,14 @@ impl Arrangement {
                 let instrument =
                     if t.is_drums() { "Drums".to_string() } else { compypal_core::gm::program_name(t.program).to_string() };
                 ArrRow {
-                    key: format!("{}:{}:{}:{}:{}", t.id, t.name, instrument, t.muted, notes.len()),
+                    key: format!("{}:{}:{}:{}:{}:{}:{}:{}", t.id, t.name, instrument, t.muted, t.solo, soloing, t.volume, notes.len()),
                     track: t.id,
                     name: t.name.clone(),
                     instrument,
                     muted: t.muted,
+                    solo: t.solo,
+                    silent: t.muted || (soloing && !t.solo),
+                    volume: t.volume,
                     clips: t
                         .clips
                         .iter()
