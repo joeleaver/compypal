@@ -69,9 +69,8 @@ pub struct Store {
     /// The connected input port.
     pub midi_port: Signal<Option<String>>,
     pub recording: Signal<Option<Recording>>,
-    /// Rec records in free time: no click, no count-in, the tempo found
-    /// from the playing afterwards.
-    pub free_rec: Signal<bool>,
+    /// A Rec heard only audio: waiting for the journal to write it down.
+    pub pending_audio: Signal<Option<PendingAudio>>,
     /// The running take so far, for drawing as it's played.
     pub live_take: Signal<Vec<RawEvent>>,
     /// Engine time minus song time: nonzero while recording, where the
@@ -202,6 +201,8 @@ pub struct Recording {
     pub meter: MeterChange,
     /// When the take's clock started: Rec, not the first click heard.
     pub started: std::time::Instant,
+    /// The same moment in unix seconds, the journal's clock.
+    pub started_unix: f64,
     /// No click and no count-in: the tempo comes from the playing.
     pub free: bool,
 }
@@ -222,8 +223,19 @@ impl Recording {
             own_tempo: false,
             events,
             audio: None,
+            played_at: Some(self.started_unix),
         }
     }
+}
+
+/// A Rec that heard audio and no MIDI, waiting for the journal to write
+/// down what was played between `zero` and `to` (unix seconds).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingAudio {
+    pub rec: Recording,
+    /// The take's time zero: Rec, or the first click heard.
+    pub zero: f64,
+    pub to: f64,
 }
 
 impl Store {
@@ -274,7 +286,7 @@ impl Store {
             midi_port: Signal::new(midi.and_then(|m| m.connected())),
             recording: Signal::new(None),
             live_take: Signal::new(Vec::new()),
-            free_rec: Signal::new(false),
+            pending_audio: Signal::new(None),
             play_offset: Signal::new(0.0),
             selection: Signal::new(None),
             agents: Signal::new(0),
@@ -918,17 +930,19 @@ impl Store {
     /// count-in, then the song plays (with the click, if on) while
     /// everything played on the controller is captured.
     pub fn record(self) {
-        let Some(midi) = self.midi.filter(|m| m.connected().is_some()) else {
-            self.status.set("Connect a MIDI input to record".into());
+        let Some(midi) = self.midi else { return };
+        if midi.connected().is_none() && self.audio_device.get().is_none() {
+            self.status.set("Nothing to record from: pick a MIDI or audio input in Settings".into());
             return;
-        };
+        }
         let Some(track) = self.selected_track.get() else { return };
-        if self.free_rec.get() {
+        // With the click off, Rec is in free time: nothing to play along to.
+        if !self.metronome.get() {
             self.record_free(track, midi);
             return;
         }
         let Some(engine) = self.engine else {
-            self.status.set("Recording to the click needs audio output; try Free".into());
+            self.status.set("Recording to the click needs audio output; turn Click off to record in free time".into());
             return;
         };
         engine.stop();
@@ -944,13 +958,23 @@ impl Store {
         take.length = f64::INFINITY;
         let lead = meter.numerator as f64 * beat;
         self.monitor_selected();
-        let started = std::time::Instant::now();
+        let (started, started_unix) = self.start_keeping();
         midi.start_take(started);
         engine.play(take, 0.0, compypal_audio::Looping::Off);
         self.play_offset.set(lead - from);
         self.playhead.set(Some(0.0));
-        self.recording.set(Some(Recording { track, start_tick, lead, bpm, meter, started, free: false }));
+        self.recording.set(Some(Recording { track, start_tick, lead, bpm, meter, started, started_unix, free: false }));
         self.status.set("Recording… (Space or Rec to stop)".into());
+    }
+
+    /// A take's clock starts now. What's played (and heard, with an audio
+    /// input chosen) goes into the sketch library too, listening or not.
+    fn start_keeping(self) -> (std::time::Instant, f64) {
+        if let Some(j) = self.journal {
+            j.set_recording(true);
+        }
+        self.pending_audio.set(None);
+        (std::time::Instant::now(), compypal_audio::journal::now())
     }
 
     /// Starts a take in free time: no click, no count-in, nothing playing.
@@ -965,15 +989,15 @@ impl Store {
             (start, p.tempo.bpm_at(start), p.meter_at(start))
         });
         self.monitor_selected();
-        let started = std::time::Instant::now();
+        let (started, started_unix) = self.start_keeping();
         midi.start_take(started);
-        self.recording.set(Some(Recording { track, start_tick, lead: 0.0, bpm, meter, started, free: true }));
+        self.recording.set(Some(Recording { track, start_tick, lead: 0.0, bpm, meter, started, started_unix, free: true }));
         self.status.set("Recording in free time: no click, play at your own pace (Space or Rec to stop)".into());
     }
 
     /// Keeps a free-time take: finds its pulse, and lays it on the song's
     /// grid by its own beats. An empty song takes the take's tempo.
-    fn keep_free_take(self, rec: Recording, events: Vec<RawEvent>) {
+    fn keep_free_take(self, rec: Recording, events: Vec<RawEvent>, audio: Option<compypal_core::AudioRef>) {
         let tempo = compypal_core::jam::estimate_tempo(&compypal_core::jam::onsets(&events)).filter(|t| t.confidence >= 0.3);
         let end = events.last().map_or(0.0, |e| e.t);
         let mut summary = String::new();
@@ -987,6 +1011,8 @@ impl Store {
             let meter = p.meter_at(rec.start_tick);
             let mut session = compypal_core::jam::to_session(&events, 0.0, end, id, name.clone(), tempo.as_ref(), meter, rec.start_tick);
             session.recorded_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            session.played_at = Some(rec.started_unix);
+            session.audio = audio;
             let notes = lay_take(p, rec.track, &session, rec.start_tick, &name);
             p.sessions.push(session);
             summary = match tempo {
@@ -1005,38 +1031,101 @@ impl Store {
         if let Some(e) = self.engine {
             e.stop();
         }
+        if let Some(j) = self.journal {
+            j.set_recording(false);
+        }
         self.playhead.set(None);
         self.play_offset.set(0.0);
         self.recording.set(None);
         self.live_take.set(Vec::new());
         let mut events = self.midi.map(|m| m.finish_take()).unwrap_or_default();
-        if !events.iter().any(|e| matches!(e.msg, compypal_core::RawMsg::NoteOn { .. })) {
-            self.status.set("Nothing recorded".into());
-            return;
-        }
-        if rec.free {
-            self.keep_free_take(rec, events);
-            return;
-        }
         // The take's clock started at Rec, but the first click came out of
         // the speakers later (a buffer or two, plus the device's latency),
         // and you played to what you heard. Time the take from there.
-        let late = self.engine.and_then(|e| e.heard_zero()).map_or(0.0, |h| h.saturating_duration_since(rec.started).as_secs_f64());
+        let late = if rec.free {
+            0.0
+        } else {
+            self.engine.and_then(|e| e.heard_zero()).map_or(0.0, |h| h.saturating_duration_since(rec.started).as_secs_f64())
+        };
+        let zero = rec.started_unix + late;
+        let audio_in = self.audio_device.get().is_some().then_some(self.journal).flatten();
+        if let Some(j) = audio_in {
+            // Its sound is written down now, not after the usual quiet.
+            j.cut_audio();
+        }
+        if !events.iter().any(|e| matches!(e.msg, compypal_core::RawMsg::NoteOn { .. })) {
+            match audio_in {
+                Some(_) => {
+                    // Only the audio input played: its notes come from the
+                    // journal once it has written them down.
+                    self.pending_audio.set(Some(PendingAudio { rec, zero, to: compypal_audio::journal::now() }));
+                    self.status.set("Writing down what you played…".into());
+                    set_timeout(90_000, move || {
+                        if self.pending_audio.get().is_some_and(|p| p.zero == zero) {
+                            self.pending_audio.set(None);
+                            self.status.set("Nothing was heard from the audio input".into());
+                        }
+                    });
+                }
+                None => self.status.set("Nothing recorded".into()),
+            }
+            return;
+        }
         for e in &mut events {
             e.t -= late;
+        }
+        self.keep_take(rec, events, zero, None);
+    }
+
+    /// When the journal has written down a Rec that only heard audio, its
+    /// notes become the take: a song sketch that remembers the recording,
+    /// and a part on the track. Called as the journal's sketches change.
+    pub fn resolve_audio_take(self, played: &[crate::sketches::Played]) {
+        let Some(pend) = self.pending_audio.get() else { return };
+        let Some(j) = self.journal else { return };
+        let heard: Vec<&compypal_core::jam::Sketch> =
+            played.iter().map(|p| &p.sketch).filter(|s| s.audio.is_some() && s.start < pend.to + 1.0 && s.end > pend.zero - 1.0).collect();
+        // Still being written down (or not even started).
+        if heard.is_empty() || heard.iter().any(|s| s.notes == 0) {
+            return;
+        }
+        let mut events: Vec<RawEvent> = heard
+            .iter()
+            .flat_map(|s| j.sketch_events(s, pend.zero, pend.to))
+            .map(|e| RawEvent { t: e.t - pend.zero, ..e })
+            .collect();
+        events.sort_by(|a, b| a.t.total_cmp(&b.t));
+        self.pending_audio.set(None);
+        if !events.iter().any(|e| matches!(e.msg, compypal_core::RawMsg::NoteOn { .. })) {
+            self.status.set("Heard something, but no notes in it".into());
+            return;
+        }
+        let audio = heard[0].audio.map(|a| compypal_core::AudioRef { file: a.file, start: a.start - pend.zero });
+        self.keep_take(pend.rec, events, pend.zero, audio);
+    }
+
+    /// Keeps a take, timed from `zero`: the song keeps a copy of the
+    /// playing (a song sketch) and the track gets a part made from it, as
+    /// played. Over music already there, that becomes a version.
+    fn keep_take(self, rec: Recording, events: Vec<RawEvent>, zero: f64, audio: Option<compypal_core::AudioRef>) {
+        if rec.free {
+            self.keep_free_take(rec, events, audio);
+            return;
         }
         let mut summary = String::new();
         self.edit("record", |p| {
             let id = p.alloc_id();
             let name = compypal_core::jam::summarize(&events).map_or_else(|| format!("Recording {}", p.sessions.len() + 1), |s| compypal_core::jam::sketch_name(&s));
-            let session = rec.session(id, name.clone(), events);
+            let mut session = rec.session(id, name.clone(), events);
+            session.played_at = Some(zero);
+            session.audio = audio;
             let notes = lay_take(p, rec.track, &session, rec.start_tick, &name);
             summary = format!("{name}: {notes} notes");
             p.sessions.push(session);
         });
         self.status.set(format!(
             "Recorded {summary} (timed {:.0} ms after Rec, when the first click was heard). It's in Sketches too; tidy it there, or ask the agent.",
-            late * 1000.0
+            (zero - rec.started_unix) * 1000.0
         ));
     }
 

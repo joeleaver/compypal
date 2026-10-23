@@ -251,7 +251,7 @@ where
                     mono.push(s);
                 }
                 level.store(peak.to_bits(), Ordering::Relaxed);
-                if let Some(j) = journal.as_ref().filter(|j| j.listening()) {
+                if let Some(j) = journal.as_ref().filter(|j| j.keeping()) {
                     let mut out = Vec::with_capacity(mono.len() * RATE as usize / rate as usize + 2);
                     resampler.push(&mono, &mut out);
                     let first = now - mono.len() as f64 / rate as f64;

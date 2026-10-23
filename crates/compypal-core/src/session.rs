@@ -35,6 +35,10 @@ pub struct Session {
     /// were transcribed from, kept as it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<AudioRef>,
+    /// When its time zero was, in unix seconds: where it sits in the
+    /// sketch library (the journal). Older songs don't have it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub played_at: Option<f64>,
 }
 
 /// A recording in the journal's audio folder, for sketches played on an
@@ -104,6 +108,26 @@ const SUSTAIN: u8 = 64;
 impl Session {
     pub fn duration(&self) -> f64 {
         self.events.last().map_or(0.0, |e| e.t)
+    }
+
+    /// When it was played, in unix seconds. Without `played_at` (an older
+    /// song) `recorded_at` was the start of an added sketch but the end of
+    /// a recording, so the span covers both readings.
+    pub fn played_span(&self) -> (f64, f64) {
+        let len = self.duration();
+        match self.played_at {
+            Some(t) => (t, t + len),
+            None => {
+                let at = self.recorded_at as f64;
+                (at - len - 2.0, at + len + 1.0)
+            }
+        }
+    }
+
+    /// Whether this is the same playing as `from..to` in the library.
+    pub fn overlaps(&self, from: f64, to: f64) -> bool {
+        let (a, b) = self.played_span();
+        a.max(from) < b.min(to)
     }
 
     /// Pairs note-ons with note-offs. A key struck again while still down
@@ -204,6 +228,7 @@ mod tests {
             own_tempo: false,
             events,
             audio: None,
+            played_at: None,
         }
     }
 

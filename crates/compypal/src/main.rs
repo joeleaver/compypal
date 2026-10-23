@@ -113,13 +113,12 @@ fn Transport() -> NodeHandle {
                 variant: {|| if store.is_recording() { "filled" } else { "light" }},
                 disabled: store.midi.is_none(),
                 onclick: move || if store.is_recording() { store.stop_recording() } else { store.record() },
-                {|| if store.is_recording() { "■ Stop rec" } else { "● Rec" }}
-            }
-            Button { size: "xs",
-                variant: {|| if store.free_rec.get() { "filled" } else { "default" }},
-                disabled: {|| store.is_recording()},
-                onclick: move || store.free_rec.update(|f| *f = !*f),
-                "Free"
+                // With Click off, Rec is in free time; say so before it starts.
+                {|| match (store.is_recording(), store.metronome.get()) {
+                    (true, _) => "■ Stop rec",
+                    (false, true) => "● Rec",
+                    (false, false) => "● Rec free",
+                }}
             }
             Button { size: "xs",
                 variant: {|| if store.looping.get() { "filled" } else { "default" }},
@@ -1364,6 +1363,15 @@ fn app() -> NodeHandle {
             }
         });
     }
+
+    // A Rec that only heard audio becomes a take once the journal has
+    // written it down.
+    rinch::core::Effect::new(move || {
+        let played = store.played.get();
+        if untracked(|| store.pending_audio.get()).is_some() {
+            store.resolve_audio_take(&played);
+        }
+    });
 
     // Unsaved changes are kept aside on every edit, so a take is never
     // lost to a crash: the next launch brings them back.

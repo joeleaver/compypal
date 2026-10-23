@@ -41,6 +41,7 @@ pub struct Played {
 pub enum Filter {
     #[default]
     All,
+    InSong,
     NotInSong,
     Hidden,
 }
@@ -154,12 +155,9 @@ pub fn items(p: &Project, played: &[Played], now: f64, filter: Filter) -> Vec<It
     }
     for j in played {
         let s = &j.sketch;
-        // Recorded (or added) into the song already: the session stands for it.
-        let taken = p.sessions.iter().any(|x| {
-            let at = x.recorded_at as f64;
-            at >= s.start - 3.0 && at <= s.end + 1.0
-        });
-        if taken {
+        // The same playing as one of the song's sketches (recorded into it,
+        // or added): the song's copy stands for it.
+        if p.sessions.iter().any(|x| x.overlaps(s.start, s.end)) {
             continue;
         }
         // A recording not yet written down.
@@ -206,6 +204,7 @@ pub fn items(p: &Project, played: &[Played], now: f64, filter: Filter) -> Vec<It
     out.sort_by(|a, b| b.0.total_cmp(&a.0));
     out.retain(|(_, i)| match filter {
         Filter::All => !i.hidden,
+        Filter::InSong => matches!(i.source, Source::Session(_)),
         Filter::NotInSong => !i.hidden && i.in_song.is_none(),
         Filter::Hidden => i.hidden,
     });
@@ -462,7 +461,7 @@ pub fn SketchesView() -> NodeHandle {
         div { class: "sketches",
             div { class: "sketch-list",
                 div { class: "sketch-filters",
-                    for (f, label) in [(Filter::All, "All"), (Filter::NotInSong, "Not in the song"), (Filter::Hidden, "Hidden")] {
+                    for (f, label) in [(Filter::All, "All"), (Filter::InSong, "In this song"), (Filter::NotInSong, "Not in the song"), (Filter::Hidden, "Hidden")] {
                         span { key: label,
                             class: {move || if store.sketch_filter.get() == f { "sketch-filter on" } else { "sketch-filter" }},
                             onclick: move || {
@@ -701,8 +700,10 @@ mod tests {
             downbeat_offset: 0.0,
             start_tick: 0,
             own_tempo: false,
-            events: ev,
+            events: ev.clone(),
             audio: None,
+            // An older song: no `played_at`, `recorded_at` stands in.
+            played_at: None,
         });
         let list = items(&p, &played, at + 60.0, Filter::All);
         assert_eq!(list.len(), 1, "{list:?}");
@@ -714,5 +715,48 @@ mod tests {
         assert_eq!(items(&Project::new("Empty"), &gone, at + 60.0, Filter::Hidden).len(), 1);
         assert_eq!(list[0].source, Source::Session(id));
         assert_ne!(list[0].name, "Take 1", "named by its music");
+        assert_eq!(items(&p, &played, at + 60.0, Filter::InSong).len(), 1);
+    }
+
+    #[test]
+    fn a_long_recording_split_into_sketches_is_one_song_sketch() {
+        // A Rec of 20 s with a pause in the middle: the library splits it
+        // in two, and both halves are the song's.
+        let mut p = Project::new("Song");
+        let half = |from: f64| -> Vec<RawEvent> {
+            (0..16)
+                .flat_map(|i| {
+                    let t = from + i as f64 * 0.3;
+                    [
+                        RawEvent { t, channel: 0, msg: RawMsg::NoteOn { pitch: 60 + (i % 4) as u8 * 4, velocity: 90 } },
+                        RawEvent { t: t + 0.2, channel: 0, msg: RawMsg::NoteOff { pitch: 60 + (i % 4) as u8 * 4 } },
+                    ]
+                })
+                .collect()
+        };
+        let ev: Vec<RawEvent> = half(0.0).into_iter().chain(half(12.0)).collect();
+        let at = 1_800_000_000.0;
+        let sketch = |from: f64| {
+            let heard: Vec<RawEvent> = half(from).iter().map(|e| RawEvent { t: e.t + at, ..*e }).collect();
+            Played { sketch: jam::summarize(&heard).unwrap(), live: false, hidden: false, thumb: thumb(&heard) }
+        };
+        let played = vec![sketch(12.0), sketch(0.0)];
+        let id = p.alloc_id();
+        p.sessions.push(Session {
+            id,
+            name: "Recording 1".into(),
+            recorded_at: (at + 20.0) as u64,
+            click_bpm: Some(100.0),
+            meter: MeterChange::default_four(),
+            downbeat_offset: 0.0,
+            start_tick: 0,
+            own_tempo: false,
+            events: ev,
+            audio: None,
+            played_at: Some(at),
+        });
+        let list = items(&p, &played, at + 60.0, Filter::All);
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(list[0].source, Source::Session(id));
     }
 }

@@ -55,6 +55,9 @@ pub struct State {
 pub struct Journal {
     dir: PathBuf,
     listening: AtomicBool,
+    /// A Rec is running: what's played is kept even when not listening,
+    /// so every recording is a sketch in the library.
+    recording: AtomicBool,
     tx: Mutex<Sender<RawEvent>>,
     audio_tx: Mutex<Sender<Chunk>>,
     state: Arc<Mutex<State>>,
@@ -95,7 +98,7 @@ impl Journal {
         std::thread::Builder::new()
             .name("compypal-transcribe".into())
             .spawn(move || audio_journal::transcriber(audio2, index_path, jobs_rx, state2, model))?;
-        Ok(Arc::new(Self { dir, listening: AtomicBool::new(false), tx: Mutex::new(tx), audio_tx: Mutex::new(audio_tx), state }))
+        Ok(Arc::new(Self { dir, listening: AtomicBool::new(false), recording: AtomicBool::new(false), tx: Mutex::new(tx), audio_tx: Mutex::new(audio_tx), state }))
     }
 
     pub fn set_listening(&self, on: bool) {
@@ -106,9 +109,25 @@ impl Journal {
         self.listening.load(Ordering::Relaxed)
     }
 
+    /// Keeps what's played while a Rec runs, listening or not.
+    pub fn set_recording(&self, on: bool) {
+        self.recording.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether what's played now is kept: listening, or recording.
+    pub fn keeping(&self) -> bool {
+        self.listening() || self.recording.load(Ordering::Relaxed)
+    }
+
+    /// Ends the recording being heard now, without waiting for quiet: a
+    /// Rec has stopped, and its sound should be written down at once.
+    pub fn cut_audio(&self) {
+        let _ = self.audio_tx.lock().unwrap().send(Chunk { t: now(), samples: Vec::new(), cut: true });
+    }
+
     /// Records one event, stamped now. Cheap enough for the MIDI callback.
     pub fn log(&self, channel: u8, msg: RawMsg) {
-        if self.listening() {
+        if self.keeping() {
             let _ = self.tx.lock().unwrap().send(RawEvent { t: now(), channel, msg });
         }
     }
@@ -116,8 +135,8 @@ impl Journal {
     /// Records audio heard from the input, `t` the unix time of its first
     /// sample, at [`crate::analysis::RATE`].
     pub fn log_audio(&self, t: f64, samples: Vec<f32>) {
-        if self.listening() {
-            let _ = self.audio_tx.lock().unwrap().send(Chunk { t, samples });
+        if self.keeping() {
+            let _ = self.audio_tx.lock().unwrap().send(Chunk { t, samples, cut: false });
         }
     }
 
@@ -361,6 +380,41 @@ mod tests {
         assert!(Journal::open(dir.clone()).unwrap().is_hidden(id), "remembered");
         j.set_hidden(id, false).unwrap();
         assert!(!j.is_hidden(id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rec_keeps_its_audio_and_cuts_it_at_once() {
+        use crate::analysis::RATE;
+        use crate::analysis::tests::{C, D, EM, G, strummed};
+        let dir = std::env::temp_dir().join(format!("compypal-journal-rec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let j = Journal::open(dir.clone()).unwrap();
+        let (audio, _) = strummed(&[G, C, D, EM, G, C, D, EM], 100.0, RATE);
+        let send = |t0: f64| {
+            for (i, block) in audio.chunks(1024).enumerate() {
+                j.log_audio(t0 + (i * 1024) as f64 / RATE as f64, block.to_vec());
+            }
+        };
+        // Not listening, not recording: nothing is kept.
+        send(now() - 120.0);
+        // A Rec, listening off: kept, and cut when it stops, with no quiet
+        // after it to end it.
+        j.set_recording(true);
+        assert!(j.keeping() && !j.listening());
+        send(now() - 60.0);
+        j.set_recording(false);
+        j.cut_audio();
+        let mut found = Vec::new();
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            found = j.sketches().into_iter().filter(|(s, _)| s.notes > 0).collect();
+            if !found.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(jam::sketch_name(&found[0].0), "G C D Em loop");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

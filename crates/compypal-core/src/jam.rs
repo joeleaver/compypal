@@ -452,6 +452,7 @@ pub fn to_session(
         id,
         name,
         recorded_at: from as u64,
+        played_at: Some(from),
         click_bpm: tempo.map(|t| t.bpm),
         meter,
         downbeat_offset: downbeat.max(0.0),

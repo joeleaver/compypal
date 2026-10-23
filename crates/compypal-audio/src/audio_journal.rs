@@ -26,6 +26,8 @@ use crate::wav::{self, WavWriter};
 pub struct Chunk {
     pub t: f64,
     pub samples: Vec<f32>,
+    /// End the recording here (a Rec stopped), quiet or not.
+    pub cut: bool,
 }
 
 /// Which transcription stands for a recording.
@@ -176,6 +178,11 @@ pub fn writer(dir: PathBuf, rx: Receiver<Chunk>, state: Arc<Mutex<State>>, jobs:
     let mut last_heard = Instant::now();
     loop {
         match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(chunk) if chunk.cut => {
+                close(&dir, &mut jam, &state, &jobs);
+                hop.clear();
+                preroll.clear();
+            }
             Ok(chunk) => {
                 last_heard = Instant::now();
                 if (chunk.t - expect).abs() > 1.0 {

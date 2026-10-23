@@ -77,14 +77,9 @@ pub fn bar() -> Vec<(&'static str, Menu)> {
     let transport = Menu::new()
         .item(item("Play / Stop  (Space)", |s| s.toggle_play()))
         .item(item("Record", |s| if s.is_recording() { s.stop_recording() } else { s.record() }))
-        .item(item("Free Time", |s| {
-            if !s.is_recording() {
-                s.free_rec.update(|f| *f = !*f);
-            }
-        }))
         .separator()
         .item(item("Loop", |s| s.toggle_looping()))
-        .item(item("Click", |s| s.metronome.update(|m| *m = !*m)))
+        .item(item("Click (off: Rec in free time)", |s| s.metronome.update(|m| *m = !*m)))
         .item(item("Listen", |s| s.toggle_listening()));
     vec![("File", file), ("Edit", edit), ("View", view), ("Transport", transport)]
 }
